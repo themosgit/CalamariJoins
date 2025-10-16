@@ -1,4 +1,9 @@
-#include <hardware.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+    #include <hardware_darwin.h>
+#else
+    #include <hardware.h>
+#endif
+
 #include <plan.h>
 #include <table.h>
 
