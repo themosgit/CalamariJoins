@@ -7,6 +7,7 @@
 #include <plan.h>
 #include <table.h>
 #include <robinhood.h>
+#include <cuckoo.h> // Soon
 
 namespace Contest {
 
