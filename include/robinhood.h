@@ -28,6 +28,7 @@ public:
         size_t p = hash(key) % size;
         size_t vpsl = 0;
         Key k = key;
+        size_t steps = 0;
         std::vector<size_t> v{idx};
         while(table[p].has_value()){
             if(table[p]->key == key){
@@ -41,6 +42,10 @@ public:
             }
             p = (p+1) % size;
             vpsl++;
+            steps++;
+            if(steps >= size){
+                throw std::runtime_error("RobinHoodTable is full");
+            }
         }
         table[p] = Entry<Key>{k,vpsl,v};
     }
