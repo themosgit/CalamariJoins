@@ -42,6 +42,10 @@
             echo "CompileFlags:" > $CLANGD_FILE
             echo "  Add:" >> $CLANGD_FILE
             echo "    - -std=$CPP_STANDARD" >> $CLANGD_FILE
+            OS=$(uname -s); ARCH=$(uname -m)
+            if [[ "$OS" == "Darwin" && "$ARCH" == "arm64" ]]; then
+                echo "    - -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX14.sdk" >> $CLANGD_FILE
+            fi
 
             while IFS= read -r PATH_ENTRY; do
                 CLEAN_PATH=$(echo "$PATH_ENTRY" | sed -E 's/includ$|include$/include/')
