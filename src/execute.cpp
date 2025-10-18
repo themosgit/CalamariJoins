@@ -7,7 +7,7 @@
 #include <plan.h>
 #include <table.h>
 #include <robinhood.h>
-#include <cuckoo.h> // Soon
+#include <cuckoo.h>
 
 namespace Contest {
 
@@ -26,7 +26,9 @@ struct JoinAlgorithm {
     template <class T>
     auto run() {
         namespace views = ranges::views;
-        RobinHoodTable<T> hash_table(std::max(left.size(),right.size())*2);
+        
+        // RobinHoodTable<T> hash_table(std::max(left.size(),right.size())*2);
+        CuckooTable<T> hash_table(std::max(left.size(),right.size())*2);
         if (build_left) {
             for (auto&& [idx, record]: left | views::enumerate) {
                 std::visit(
