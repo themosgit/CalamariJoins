@@ -61,7 +61,7 @@ private:
          * see execute_hash_join for further details and the vector is there
          * to allow for buckets on collisions*/
         size_t build_size= build.size();
-        build_size = build_size ? build_size : 1;//handle empty
+        build_size = build_size ? build_size : 1;//handle empty table
         size_t power_of_2 = 1;
         while(power_of_2 * 0.60 < build_size){
             power_of_2 <<= 1;
@@ -82,6 +82,7 @@ private:
                     if constexpr (std::is_same_v<Tk, T>) {
                         /*if the key is not found in the hash table place insert it*/
                         hash_table.insert(key,idx);
+                    /*exception for missmatching key types T and Tk*/
                     } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
                         throw std::runtime_error("wrong type of field on build");
                     }
@@ -104,8 +105,12 @@ private:
                     /*if the are the same continue else throw exception */
                     if constexpr (std::is_same_v<Tk, T>) {
                         /*get index from the hash table*/
-                        if(auto found = hash_table.search(key)){
-                            for (auto build_idx: **found) {
+                        auto result = hash_table.search(key);
+                        /*if the key is not found exit the lambda*/
+                        if (!result.has_value()) return;
+                        /*because of linear probing we iterate
+                         * through the vector*/
+                        for (auto build_idx: **result) {
                             /*swap left and right if the have
                              * been swapped on function call 
                              * this is done to provide a valid result*/
@@ -114,7 +119,6 @@ private:
                                 case false: construct_result(probe_record, build[build_idx]); break;
                             }
                         }
-                    }
                     /*just an exception for missmatching Tk and T types*/
                     } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
                         throw std::runtime_error("wrong type of field on probe");

@@ -25,7 +25,7 @@ public:
     RobinHoodTable(size_t s) : size(s), table(s){}
 
     void insert(const Key& key, size_t idx){
-        size_t p = hash(key) % size;
+        size_t p = hash(key) & (size-1);
         size_t vpsl = 0;
         Key k = key;
         std::vector<size_t> v{idx};
@@ -41,14 +41,14 @@ public:
                 std::swap(v,table[p]->indices);
                 std::swap(vpsl,table[p]->psl);
             }
-            p = (p+1) % size;
+            p = (p+1) & (size-1);
             vpsl++;
         }
         table[p] = Entry<Key>{k,vpsl,std::move(v)};
     }
 
     std::optional<std::vector<size_t>*>search(const Key& key){
-        size_t p = hash(key) % size;
+        size_t p = hash(key) & (size-1);
         size_t vpsl = 0;
         while(table[p].has_value()){
             if(table[p]->key == key){
@@ -57,7 +57,7 @@ public:
             if(vpsl > table[p]->psl){
                 return std::nullopt;
             }
-            p = (p + 1) % size;
+            p = (p + 1) & (size-1);
             vpsl++;
         }
         return std::nullopt;
