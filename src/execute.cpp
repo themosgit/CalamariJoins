@@ -43,7 +43,7 @@ struct JoinAlgorithm {
 public:
     template <class T>
     auto run() {
-        const size_t HASH_TABLE_THRESHOLD = 2;
+        const size_t HASH_TABLE_THRESHOLD = 4;
         if (build.size() < HASH_TABLE_THRESHOLD) {
             nested_loop_join<T>();
         } else {
