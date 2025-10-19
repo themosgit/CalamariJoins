@@ -5,30 +5,39 @@
 #include <functional>
 #include <memory>
 
+/*
+Robin hood hashing algorithm: the idea behind this hashing algorithm is
+to keep the psl(probe sequence lenght) as low as possible.
+Psl is the distance from key's ideal position to actual position.
+on collision if new key has higher psl than existing key,they swap positions
+this keeps the variance low and search fast
+
+
+*/
+
+
 template <typename Key>
 
 struct Entry
 {
     Key key;
     size_t psl;
-    std::unique_ptr<std::vector<size_t>> indices; //try
+    std::unique_ptr<std::vector<size_t>> indices; //pointer in vector
     Entry() : psl(0) , indices(nullptr){}
-    Entry(Key k, size_t p, std::unique_ptr<std::vector<size_t>>idx)
-        : key(k),psl(p), indices(std::move(idx)) {}
+    Entry(Key k, size_t p, std::unique_ptr<std::vector<size_t>>idx) //constructor with key,psl +unique_ptr
+        : key(k),psl(p), indices(std::move(idx)) {} //then initialize
 };
 
 template <typename Key>
 class RobinHoodTable
 {
 private:
-    std::vector<std::optional<Entry<Key>>> table;
+    std::vector<std::optional<Entry<Key>>> table; //allows empty slots without wasting memory
     size_t size;
-    size_t num_swaps = 0; 
-    size_t num_inserts = 0;
     size_t hash(const Key &key) const
     {
-        size_t h =  std::hash<Key>{}(key);
-        h ^= h >> 33;
+        size_t h =  std::hash<Key>{}(key); //hash mixing with MurmurHash3 finalizer for better distribution
+        h ^= h >> 33; //
         h *= 0xff51afd7ed558ccdULL;
         h ^= h >> 33;
         h *= 0xc4ceb9fe1a85ec53ULL;
@@ -45,7 +54,7 @@ public:
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
         Key k = key;
-        auto v = std::make_unique<std::vector<size_t>>();
+        auto v = std::make_unique<std::vector<size_t>>();//heap alloc
         v->push_back(idx);
         // check if the key already exists
         while (table[p].has_value())
@@ -58,7 +67,6 @@ public:
             // if entry has smaller psl swap
             if (vpsl > table[p]->psl)
             {
-                num_swaps++;
                 std::swap(k, table[p]->key);
                 std::swap(v, table[p]->indices);
                 std::swap(vpsl, table[p]->psl);
