@@ -1,3 +1,5 @@
+#include <type_traits>
+#include <vector>
 #if defined(__APPLE__) && defined(__aarch64__)
     #include <hardware_darwin.h>
 #else
@@ -6,7 +8,7 @@
 
 #include <plan.h>
 #include <table.h>
-#include <iostream>
+#include <hopscotch.h>
 
 namespace Contest {
 
@@ -14,21 +16,8 @@ using ExecuteResult = std::vector<std::vector<Data>>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
-/*this is teh modified join algorithm most of the logic consistent
- * with the old implementation while improving on some obvious shortcomings
- * the left and right tables have been changed to build and probe
- * build is the table that we will hash this table is chosen to be the 
- * smaller of the two while probe is the table that we will then iterate
- * through and query our hash table on matching data the logic for chosing
- * the proper table to build or probe can be found in the execute_hash_join
- * function further down this file results is where we return our resutlts
- * build_col and probe_col are the columns in our tables from which we fetch
- * the join keys basically the relation and swap tells us whether they have
- * been swapped from the normal left for build right for probe to left for
- * probe left for build this info had to be done because the result expects
- * for the left table results to be first then the right table no matter their
- * size for which we swap them for to optimise our algorithm*/
-
+/*join algorithm refactored for build table and probe table
+ *swap is previous built left maintains valid result format*/
 struct JoinAlgorithm {
     ExecuteResult&                                   build;
     ExecuteResult&                                   probe;
@@ -38,11 +27,11 @@ struct JoinAlgorithm {
     const std::vector<std::tuple<size_t, DataType>>& output_attrs;
 
 /* new function that calls nested_loop_join
- * to prevent creating hash tables for small tables
- * adjust hash table threshold for tests*/
+ * to prevent creating hash tables for small tables*/
 public:
     template <class T>
     auto run() {
+        /* 4 was chosen as an optimal value from tests*/
         const size_t HASH_TABLE_THRESHOLD = 4;
         if (build.size() < HASH_TABLE_THRESHOLD) {
             nested_loop_join<T>();
@@ -52,108 +41,67 @@ public:
     }
 
 private: 
-    /* our beloved hash join function changed ALOT but NOT ENOUGH!!!*/
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-        /* the deafault unordered map hash table T is for the datatype key
-         * see execute_hash_join for further details and the vector is there
-         * to allow for buckets on collisions*/
-        std::unordered_map<T, std::vector<size_t>> hash_table;
+        HopscotchHashTable<std::vector<size_t>> hash_table(build.size()/0.8);
 
-        /*build hash table with the smaller table
-         * iterate through table with record, idx is
-         * created by views::enumerate as an index*/
+        /*build hash table from build table*/
         for (auto&& [idx, record]: build | views::enumerate) {
-            std::visit(
-                /* lambda function is called on the hash table and idx
-                 *key is the join key extracted from record[build_col] down there*/
-                [&hash_table, idx = idx](const auto& key) {
-                    /*checks whether the type we called the function
-                     * with T and the key in the column match Tk*/
-                    using Tk = std::decay_t<decltype(key)>;
-                    if constexpr (std::is_same_v<Tk, T>) {
-                        /*if the key is not found in the hash table place insert it*/
-                        if (auto itr = hash_table.find(key); itr == hash_table.end()) {
-                            hash_table.emplace(key, std::vector<size_t>(1, idx));
-                        /*if the key is found in the hash table place it in the collison bucket*/
-                        } else {
-                            itr->second.push_back(idx);
-                        } 
-                    /*exception for missmatching key types T and Tk*/
-                    } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
-                        throw std::runtime_error("wrong type of field on build");
-                    }
-                },
-                /*this is where the lambda extracts the key from*/
-                record[build_col]
-            );
+            std::visit([&hash_table, idx = idx](const auto& key_val) {
+                using Tk = std::decay_t<decltype(key_val)>;
+                if constexpr (not std::is_same_v<Tk, std::monostate>) {
+                    HashKey key(key_val);
+                    if (std::vector<size_t>* indices_ptr = hash_table.find(key)) {
+                        indices_ptr->push_back(idx);
+                    } else {
+                        hash_table.insert(key, std::vector<size_t>(1, idx));
+                    } 
+                } else {
+                    throw std::runtime_error("wrong type of field on build");
+                }
+            },
+            record[build_col]);
         }
-        /*probe larger table while doing
-         *lookups on the prebuild hash table*/
+        /*probe larger probe table*/ 
         for (auto& probe_record: probe) {
-            std::visit(
-                /*lambda function that captures all values by reference
-                 * !!READ ABOUT LAMBDAS take the data variant of the key as a 
-                 * parameter thats why it is iterated on in probe record */
-                [&](const auto& key) {
-                    /*check whether the key datatype which the run fucntion was called T
-                     * matches the key datatype used in the probe table Tk*/
-                    using Tk = std::decay_t<decltype(key)>;
-                    /*if the are the same continue else throw exception */
-                    if constexpr (std::is_same_v<Tk, T>) {
-                        /*get index from the hash table*/
-                        auto itr = hash_table.find(key);
-                        /*if the key is not found exit the lambda*/
-                        if (itr == hash_table.end()) 
-                            return;
-                        /*because of linear probing we iterate
-                         * through the vector*/
-                        for (auto build_idx: itr->second) {
-                            /*swap left and right if the have
-                             * been swapped on function call 
-                             * this is done to provide a valid result*/
-                            switch(swap) {
-                                case true: construct_result(build[build_idx], probe_record); break;
-                                case false: construct_result(probe_record, build[build_idx]); break;
-                            }
+            std::visit([&](const auto& key_val) {
+                using Tk = std::decay_t<decltype(key_val)>;
+                if constexpr (not std::is_same_v<Tk, std::monostate>) {
+                    HashKey key(key_val);
+                    std::vector<size_t> build_indices;
+                    if (hash_table.lookup(key, build_indices)) {
+                        for (auto build_idx : build_indices) {
+                             swap ? construct_result(build[build_idx], probe_record) :
+                                   construct_result(probe_record, build[build_idx]);
                         }
-                    /*just an exception for missmatching Tk and T types*/
-                    } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
-                        throw std::runtime_error("wrong type of field on probe");
                     }
-                },
+                } else {
+                    throw std::runtime_error("wrong type of field on probe");
+                }
+            },
             probe_record[probe_col]);
         }
     }
 
-    /*this is used for a nested loop join
-     * we do nested loop joins when the
-     * build table is of size 1
-     * NOTE i dont like this piece
-     * of code it will for sure be
-     * changed in the future lil bro is nested to infinity
-     * take this easy function as test to see if you
-     * have understood anything at all */
    template <class T>
     void nested_loop_join() {
+        for (auto& build_record: build) {
         for (auto& probe_record: probe) {
-            for (auto& build_record: build) {
-                std::visit([&](const auto& build_key) {
-                    std::visit([&](const auto& probe_key) {
-                        using Tb = std::decay_t<decltype(build_key)>;
-                        using Tp = std::decay_t<decltype(probe_key)>;
-                        if constexpr (std::is_same_v<Tb, T> && std::is_same_v<Tp, T>) {
-                            if (build_key == probe_key) {
-                                switch(swap) {
-                                    case true: construct_result(build_record, probe_record); break;
-                                    case false: construct_result(probe_record, build_record); break;
-                                }
-                            }
-                        }
-                    }, probe_record[probe_col]);
-                }, build_record[build_col]);
-            }
+            std::visit([&](const auto& build_key, const auto& probe_key) {
+                using Tb = std::decay_t<decltype(build_key)>;
+                using Tp = std::decay_t<decltype(probe_key)>;
+                if constexpr (std::is_same_v<Tb, T> && std::is_same_v<Tp, T>) {
+                    if (build_key == probe_key) {
+                        swap ? construct_result(build_record, probe_record) :
+                               construct_result(probe_record, build_record);
+                    }
+                } else if constexpr (not std::is_same_v<Tb, std::monostate>
+                                  || not std::is_same_v<Tp, std::monostate>) {
+                    throw std::runtime_error("wrong type of field on probe");
+                }
+            }, build_record[build_col], probe_record[probe_col]);
+        }
         }
     }
 
@@ -161,10 +109,8 @@ private:
      * its relevant for constructing a valid result*/
     void construct_result(const std::vector<Data>& left_record, 
         const std::vector<Data>& right_record) {
-
         std::vector<Data> new_record;
         new_record.reserve(output_attrs.size());
-        
         for (auto [col_idx, _]: output_attrs) {
             if (col_idx < left_record.size()) {
                 new_record.emplace_back(left_record[col_idx]);
@@ -193,8 +139,7 @@ ExecuteResult execute_hash_join(const Plan&          plan,
     auto                           right       = execute_impl(plan, right_idx);
     std::vector<std::vector<Data>> results;
 
-    /*this is not the most readable piece of code but it works
-     *it chooses which table will be built and which will be
+    /*it chooses which table will be built and which will be
      *be probed the smaller one is chosen to be built to minimize
      *hash table size */
     bool determine_build_left = (left.size() < right.size()) ? true : false;
@@ -209,8 +154,6 @@ ExecuteResult execute_hash_join(const Plan&          plan,
     .swap          = determine_build_left,
     .output_attrs  = output_attrs};
 
-    /* here we call the algorithm with the proper T type 
-     * this is the type that will then be checked with Tk*/
     if (determine_build_left) {
         switch (std::get<1>(left_types[join.left_attr])) {
         case DataType::INT32:   join_algorithm.run<int32_t>(); break;
@@ -226,7 +169,6 @@ ExecuteResult execute_hash_join(const Plan&          plan,
         case DataType::VARCHAR: join_algorithm.run<std::string>(); break;
         }
     }
-
     return results;
 }
 
@@ -236,7 +178,7 @@ ExecuteResult execute_scan(const Plan&               plan,
     const ScanNode&                                  scan,
     const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
     auto                           table_id = scan.base_table_id;
-    auto&                          input    = plan.inputs[table_id];
+auto&                          input    = plan.inputs[table_id];
     return Table::copy_scan(input, output_attrs);
 }
 
