@@ -2,6 +2,7 @@
 
 #include <table.h>
 #include <plan.h>
+#include <robinhood.h>
 
 void sort(std::vector<std::vector<Data>>& table) {
     std::sort(table.begin(), table.end());
