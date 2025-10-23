@@ -1,5 +1,5 @@
 #include <type_traits>
-#include <vector>
+#include <variant>
 #if defined(__APPLE__) && defined(__aarch64__)
     #include <hardware_darwin.h>
 #else
@@ -44,39 +44,32 @@ private:
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-        HopscotchHashTable<std::vector<size_t>> hash_table(build.size()/0.8);
-
+        HopscotchHashTable<T> hash_table(build.size()/0.75);
         /*build hash table from build table*/
         for (auto&& [idx, record]: build | views::enumerate) {
-            std::visit([&hash_table, idx = idx](const auto& key_val) {
-                using Tk = std::decay_t<decltype(key_val)>;
-                if constexpr (not std::is_same_v<Tk, std::monostate>) {
-                    HashKey key(key_val);
-                    if (std::vector<size_t>* indices_ptr = hash_table.find(key)) {
-                        indices_ptr->push_back(idx);
-                    } else {
-                        hash_table.insert(key, std::vector<size_t>(1, idx));
-                    } 
-                } else {
+            std::visit([&hash_table, idx = idx](const auto& key) {
+                using Tk = std::decay_t<decltype(key)>;
+                if constexpr (std::is_same_v<Tk, T>) {
+                    hash_table.insert(key, idx);
+                } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
                     throw std::runtime_error("wrong type of field on build");
                 }
             },
             record[build_col]);
         }
+        int max_collisions = -1;
         /*probe larger probe table*/ 
         for (auto& probe_record: probe) {
-            std::visit([&](const auto& key_val) {
-                using Tk = std::decay_t<decltype(key_val)>;
-                if constexpr (not std::is_same_v<Tk, std::monostate>) {
-                    HashKey key(key_val);
-                    std::vector<size_t> build_indices;
-                    if (hash_table.lookup(key, build_indices)) {
-                        for (auto build_idx : build_indices) {
-                             swap ? construct_result(build[build_idx], probe_record) :
-                                   construct_result(probe_record, build[build_idx]);
-                        }
+            std::visit([&](const auto& key) {
+                using Tk = std::decay_t<decltype(key)>;
+                if constexpr (std::is_same_v<Tk, T>) {
+                    auto indices = hash_table.find(key);
+                    if (indices == nullptr) return;
+                    for (auto build_idx : *indices) {
+                        swap ? construct_result(build[build_idx], probe_record) :
+                               construct_result(probe_record, build[build_idx]);
                     }
-                } else {
+                } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
                     throw std::runtime_error("wrong type of field on probe");
                 }
             },
