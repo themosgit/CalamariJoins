@@ -44,7 +44,7 @@ private:
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-        HopscotchHashTable<T> hash_table(build.size()/0.75);
+        HopscotchHashTable<T> hash_table(build.size()/0.20);
         /*build hash table from build table*/
         for (auto&& [idx, record]: build | views::enumerate) {
             std::visit([&hash_table, idx = idx](const auto& key) {
@@ -66,7 +66,7 @@ private:
                     auto indices = hash_table.find(key);
                     if (indices == nullptr) return;
                     for (auto build_idx : *indices) {
-                        swap ? construct_result(build[build_idx], probe_record) :
+                        swap ? construct_result(build[build_idx], probe_record):
                                construct_result(probe_record, build[build_idx]);
                     }
                 } else if constexpr (not std::is_same_v<Tk, std::monostate>) {

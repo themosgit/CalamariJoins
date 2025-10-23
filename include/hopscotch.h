@@ -14,9 +14,7 @@
 template <typename Key, typename Hash = std::hash<Key>>
 class HopscotchHashTable {
 private:
-    /* neighborhood size - single cacheline */
     static constexpr size_t H = 64;
-    /*neighborhood mask*/
     static constexpr uint64_t EMPTY_MASK = 0;
     
     struct Bucket {
@@ -33,7 +31,7 @@ private:
     };
 
     /*optimized hash function for int32_t keys*/
-    uint32_t murmur3_fmix32(uint32_t h) const {
+    static inline uint32_t murmur3_fmix32(uint32_t h) noexcept {
         h ^= h >> 16;
         h *= 0x85ebca6b;
         h ^= h >> 13;
@@ -43,7 +41,7 @@ private:
     }
 
     /*  ultra complicated hash expanding to 64 bit */
-    size_t hash_int32(int32_t key) const {
+    static inline size_t hash_int32(int32_t key) noexcept {
         uint32_t h = static_cast<uint32_t>(key);
         
         h = murmur3_fmix32(h);
@@ -62,12 +60,10 @@ private:
         return h64;
     }
     
-    size_t hash_key(const Key& key) const {
-        if constexpr (std::is_same_v<Key, int32_t>) {
+    inline size_t hash_key(const Key& key) const noexcept {
+        if constexpr (std::is_same_v<Key, int32_t>)
             return hash_int32(key);
-       } else { 
-            size_t h = hasher(key);
-        }
+        return hasher(key);
     }
     
     std::vector<Bucket> table;
@@ -76,19 +72,19 @@ private:
     Hash hasher;
     
     /*find free bucket within max distance from ideal position*/
-    size_t find_free_bucket(size_t start_idx) {
+    inline size_t find_free_bucket(size_t start_idx) const noexcept {
         for (size_t i = 0; i < capacity; ++i) {
             size_t idx = (start_idx + i) % capacity;
             if (!table[idx].occupied) {
                 return idx;
             }
         }
-        return capacity; /*No free bucket found*/
+        return capacity; /*no free bucket found*/
     }
     
-    /* Move items to get a free bucket within H positions*/
+    /* get a free bucket within H positions*/
     bool relocate(size_t &free_idx, size_t target_idx) {
-        const size_t MAX_DEPTH = 128;
+        static constexpr size_t MAX_DEPTH = 128;
         
         for (size_t depth = 0; depth < MAX_DEPTH; ++depth) {
             size_t dist = (free_idx + capacity - target_idx) % capacity;
@@ -136,7 +132,7 @@ private:
 public:
     explicit HopscotchHashTable(size_t size, const Hash& hash = Hash()) 
         : capacity(0), hasher(hash) {
-        size_t PRIME_SIZES[] = {
+        static constexpr size_t PRIME_SIZES[] = {
             53ul, 97ul, 193ul, 389ul, 769ul, 1543ul, 3079ul, 6151ul,
             12289ul, 24593ul, 49157ul, 98317ul, 196613ul, 393241ul,
             786433ul, 1572869ul, 3145739ul, 6291469ul, 12582917ul,
@@ -193,7 +189,7 @@ public:
             if (!relocate(free_idx, base_idx)) {
                 throw std::runtime_error("Failed to relocate item within neighborhood");
             }
-            /* recalculate distance after relocation */
+            /*recalculate distance after relocation */
             dist = (free_idx + capacity - base_idx) % capacity;
         }
         
@@ -208,7 +204,7 @@ public:
         table[base_idx].hop_info |= (1ULL << dist);
     }
     
-    const std::vector<size_t>* find(const Key& key) const {
+    inline const std::vector<size_t>* find(const Key& key) const noexcept{
         size_t hash_val = hash_key(key);
         size_t base_idx = hash_val % capacity;
         /* find the value based on the bitmap */
