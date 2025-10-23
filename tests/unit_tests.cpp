@@ -487,3 +487,27 @@ TEST_CASE("Negative keys", "[join]") {
     Contest::destroy_context(context);
     REQUIRE(result.num_rows == 5);
 }
+TEST_CASE("Sparse keys", "[join]") {
+    Plan plan;
+    plan.new_scan_node(0, {{0, DataType::INT64}});
+    plan.new_scan_node(1, {{0, DataType::INT64}});
+    plan.new_join_node(true, 0, 1, 0, 0, {{0, DataType::INT64}, {1, DataType::INT64}});
+    std::vector<std::vector<Data>> data{
+        {(int64_t)1},
+        {(int64_t)1000},
+        {(int64_t)1000000},
+        {(int64_t)1000000000LL},
+        {(int64_t)1000000000000LL},
+    };
+    std::vector<DataType> types{DataType::INT64};
+    Table table(std::move(data), std::move(types));
+    ColumnarTable input1 = table.to_columnar();
+    ColumnarTable input2 = table.to_columnar();
+    plan.inputs.emplace_back(std::move(input1));
+    plan.inputs.emplace_back(std::move(input2));
+    plan.root = 2;
+    auto* context = Contest::build_context();
+    auto result = Contest::execute(plan, context);
+    Contest::destroy_context(context);
+    REQUIRE(result.num_rows == 5);
+}
