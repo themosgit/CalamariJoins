@@ -19,15 +19,39 @@ private:
     static constexpr uint64_t EMPTY_MASK = 0;
 
     struct Bucket {
-        /* bit mask of the bucket*/
-        uint64_t bitmask;
+        /* bit mask of the bucket
+         * + occupied state*/
+        uint64_t internal_bitmask;
         /* vector containing same key idx*/
-        llvm::SmallVector<size_t, 2> indices;
+        llvm::SmallVector<size_t, 1> indices;
         /* key corresponding to bucket */
         Key key;
-        bool occupied;
-        
-        Bucket() : bitmask(EMPTY_MASK), occupied(false) {}
+
+        Bucket() : internal_bitmask(EMPTY_MASK){}
+
+        inline bool occupied() const noexcept {
+            return internal_bitmask & (1ULL << 63);
+        }
+
+        inline void set_occupied(bool occuppied) noexcept {
+            if(occuppied)
+                internal_bitmask |= (1ULL << 63);
+            else
+                internal_bitmask &= ~(1ULL << 63);
+        }
+
+        inline uint64_t bitmask() const noexcept {
+            return internal_bitmask & 0x7FFFFFFFFFFFFFFFULL;
+        }
+
+        inline void set_bitmask(size_t pos) noexcept {
+            internal_bitmask |= (1ULL << pos);
+        }
+
+        inline void clear_bitmask(size_t pos) noexcept {
+            internal_bitmask &= ~(1ULL << pos);
+        }
+
     }__attribute__((aligned(64)));
 
     std::vector<Bucket> table;
@@ -81,7 +105,7 @@ private:
     inline size_t find_free_bucket(size_t start_idx) const noexcept {
         for (size_t i = 0; i < capacity; ++i) {
             size_t idx = (start_idx + i) & (capacity - 1);
-            if (!table[idx].occupied) {
+            if (!table[idx].occupied()) {
                 return idx;
             }
         }
@@ -106,11 +130,11 @@ private:
             for (size_t offset = 1; offset < H && !found; ++offset) {
                 size_t check_index = (free_index + capacity - offset) & (capacity - 1);
                 
-                if (!table[check_index].occupied) continue;
+                if (!table[check_index].occupied()) continue;
                 
-                uint64_t bitmask = table[check_index].bitmask;
+                uint64_t bitmask = table[check_index].bitmask();
                 
-                for (size_t j = H - 1; j > 0 && !found; --j) {
+                for (size_t j = H - 1; j > 0 && !found; --j){
                     /* check its bitmap position */
                     if (bitmask & (1ULL << j)) {
                         size_t item_idx = (check_index + j) & (capacity - 1);
@@ -120,11 +144,11 @@ private:
                         * be done move the items */
                         if (new_dist < H && item_idx != free_index) {
                             table[free_index] = std::move(table[item_idx]);
-                            table[item_idx].occupied = false;
-                            table[item_idx].bitmask = EMPTY_MASK;
-                            /* clears and sets proper bit map positions */ 
-                            table[check_index].bitmask &= ~(1ULL << j);
-                            table[check_index].bitmask |= (1ULL << new_dist);
+                            table[item_idx].set_occupied(false);
+                            table[item_idx].internal_bitmask = EMPTY_MASK;
+                            /* clears and sets proper bit map positions */
+                            table[check_index].clear_bitmask(j);
+                            table[check_index].set_bitmask(new_dist);
                             
                             free_index = item_idx;
                             found = true;
@@ -164,12 +188,12 @@ public:
         size_t base_index = hash_val & (capacity - 1);
         
         /* check if key has already been inserted*/ 
-        uint64_t bitmask = table[base_index].bitmask;
+        uint64_t bitmask = table[base_index].bitmask();
         uint64_t temp_mask = bitmask;
         while (temp_mask) {
             size_t i = __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
-            if (table[check_index].occupied && table[check_index].key == key) {
+            if (table[check_index].occupied() && table[check_index].key == key) {
                 /* key found add value to vector */ 
                 table[check_index].indices.emplace_back(idx);
                 return;
@@ -203,31 +227,56 @@ public:
         /* update table entries with proper data */ 
         table[free_index].key = key;
         table[free_index].indices.emplace_back(idx);
-        table[free_index].occupied = true;
-        table[base_index].bitmask |= (1ULL << dist);
+        table[free_index].set_occupied(true);
+        table[base_index].set_bitmask(dist);
     }
-    
-    inline const llvm::SmallVector<size_t, 2>* find(const Key& key) const noexcept{
+
+
+    /* struct to return pointers
+     * avoids inderections */
+    struct IndexSpan {
+        const size_t *data;
+        size_t size;
+
+        /* support iterators */
+        const size_t *begin() const {
+            return data; 
+        }
+        const size_t *end() const {
+            return data + size;
+        }
+    };
+   
+    inline IndexSpan find(const Key& key) const noexcept{
         size_t hash_val = hash_key(key);
         size_t base_index = hash_val & (capacity - 1);
 
         __builtin_prefetch(&table[base_index], 0 , 3);
         /* find the value based on the bitmap */
-        uint64_t bitmask = table[base_index].bitmask;
+        uint64_t bitmask = table[base_index].bitmask();
         if (bitmask == 0)
-            return nullptr;
+            return {nullptr, 0};
 
         /* bit scanning */
         while (bitmask) {
             size_t i = __builtin_ctzll(bitmask);
             size_t check_index = (base_index + i) & (capacity - 1);
-            if (table[check_index].occupied && table[check_index].key == key) {
-                return &table[check_index].indices;
+            if (table[check_index].occupied() && table[check_index].key == key) {
+                return {
+                    table[check_index].indices.data(),
+                    table[check_index].indices.size()
+                };
             }
             /* clear bit */
             bitmask &= (bitmask - 1);
         }
-       return nullptr;
+       return {nullptr, 0};
+    }
+
+    inline void prefetch(const Key& key) const noexcept {
+        size_t hash_val = hash_key(key);
+        size_t base_index = hash_val & (capacity - 1);
+        __builtin_prefetch(&table[base_index], 0, 3);
     }
 
 
@@ -235,14 +284,14 @@ public:
      * in the hash table useful for tricky debugging */
     void diagnostic() {
         for (size_t i = 0; i < capacity; i++) {
-            if (table[i].occupied) {
+            if (table[i].occupied()) {
                 std::cout << "Table index: " << i << " occupied by key: " << table[i].key << std::endl;
                 std::cout << "  Bucket contains:" << std::endl;
                 auto bucket = &table[i].indices;
                 for (auto value : *bucket) {
                     std::cout << "____" << value << std::endl;
                 }
-                std::bitset<64> bitmask(table[i].bitmask);
+                std::bitset<64> bitmask(table[i].bitmask());
                 std::cout << "Bitmap: " << bitmask << std::endl;
             } else {
                 std::cout << "Table index: " << i << " unoccupied" <<std::endl;

@@ -41,10 +41,11 @@ public:
     }
 
 private: 
+
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-        HopscotchHashTable<T> hash_table(build.size()/0.20);
+        HopscotchHashTable<T> hash_table(build.size() * 1.8);
         /*build hash table from build table*/
         for (auto&& [idx, record]: build | views::enumerate) {
             std::visit([&hash_table, idx = idx](const auto& key) {
@@ -57,15 +58,34 @@ private:
             },
             record[build_col]);
         }
-        int max_collisions = -1;
-        /*probe larger probe table*/ 
-        for (auto& probe_record: probe) {
+        /* prefetch amount */
+        constexpr size_t PREFETCH = 16;
+        size_t limit = PREFETCH > probe.size() ? probe.size() : PREFETCH; 
+        for (size_t i = 0; i < limit; i++) {
+            std::visit([&](const auto& key) {
+                using Tk = std::decay_t<decltype(key)>;
+                if constexpr (std::is_same_v<Tk, T>) {
+                    hash_table.prefetch(key);
+                }
+            }, probe[i][probe_col]);
+        }
+
+        for (size_t i = 0; i < probe.size(); i++ ){
+            if (i + PREFETCH < probe.size()) {
+                std::visit([&](const auto& key) {
+                    using Tk = std::decay_t<decltype(key)>;
+                    if constexpr (std::is_same_v<Tk, T>) {
+                        hash_table.prefetch(key);
+                    }
+                }, probe[i + PREFETCH][probe_col]);
+            }
+
+            auto& probe_record = probe[i];
             std::visit([&](const auto& key) {
                 using Tk = std::decay_t<decltype(key)>;
                 if constexpr (std::is_same_v<Tk, T>) {
                     auto indices = hash_table.find(key);
-                    if (indices == nullptr) return;
-                    for (auto build_idx : *indices) {
+                    for (auto build_idx : indices) {
                         swap ? construct_result(build[build_idx], probe_record):
                                construct_result(probe_record, build[build_idx]);
                     }
@@ -75,7 +95,9 @@ private:
             },
             probe_record[probe_col]);
         }
-    }
+
+
+        }
 
    template <class T>
     void nested_loop_join() {
