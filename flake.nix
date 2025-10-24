@@ -22,6 +22,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             llvmPackages_21.libcxxClang
+            llvmPackages_21.libllvm
             gdb
             curl
             git

@@ -413,5 +413,4 @@ TEST_CASE("Hopscotch test bucket functionality", "[hopscotch]") {
         for (auto idx: *bucket)
             REQUIRE(idx == (j++));
     }
-    hash_table.diagnostic();
 }
