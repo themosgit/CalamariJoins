@@ -511,3 +511,105 @@ TEST_CASE("Sparse keys", "[join]") {
     Contest::destroy_context(context);
     REQUIRE(result.num_rows == 5);
 }
+TEST_CASE("All keys different", "[join]") {
+    Plan plan;
+    plan.new_scan_node(0, {{0, DataType::INT32}});
+    plan.new_scan_node(1, {{0, DataType::INT32}});
+    plan.new_join_node(true, 0, 1, 0, 0, {{0, DataType::INT32}, {1, DataType::INT32}});
+    std::vector<std::vector<Data>> data1{
+        {1}, {2}, {3}
+    };
+    std::vector<std::vector<Data>> data2{
+        {4}, {5}, {6}
+    };
+    std::vector<DataType> types{DataType::INT32};
+    Table table1(std::move(data1), types);
+    Table table2(std::move(data2), types);
+    ColumnarTable input1 = table1.to_columnar();
+    ColumnarTable input2 = table2.to_columnar();
+    plan.inputs.emplace_back(std::move(input1));
+    plan.inputs.emplace_back(std::move(input2));
+    plan.root = 2;
+    auto* context = Contest::build_context();
+    auto result = Contest::execute(plan, context);
+    Contest::destroy_context(context);
+    REQUIRE(result.num_rows == 0);
+}
+TEST_CASE("Negative keys join", "[join]") {
+    Plan plan;
+    plan.new_scan_node(0, {{0, DataType::INT32}});
+    plan.new_scan_node(1, {{0, DataType::INT32}});
+    plan.new_join_node(true, 0, 1, 0, 0, {{0, DataType::INT32}, {1, DataType::INT32}});
+    std::vector<std::vector<Data>> data1{
+        {-1}, {-2}, {-3}
+    };
+    std::vector<std::vector<Data>> data2{
+        {-2}, {-3}, {-4}
+    };
+    std::vector<DataType> types{DataType::INT32};
+    Table table1(std::move(data1), types);
+    Table table2(std::move(data2), types);
+    ColumnarTable input1 = table1.to_columnar();
+    ColumnarTable input2 = table2.to_columnar();
+    plan.inputs.emplace_back(std::move(input1));
+    plan.inputs.emplace_back(std::move(input2));
+    plan.root = 2;
+    auto* context = Contest::build_context();
+    auto result = Contest::execute(plan, context);
+    Contest::destroy_context(context);
+    REQUIRE(result.num_rows == 2); // -2 and -3
+}
+TEST_CASE("Large string keys", "[join]") {
+    Plan plan;
+    plan.new_scan_node(0, {{0, DataType::VARCHAR}});
+    plan.new_scan_node(1, {{0, DataType::VARCHAR}});
+    plan.new_join_node(true, 0, 1, 0, 0, {{0, DataType::VARCHAR}, {1, DataType::VARCHAR}});
+    using namespace std::string_literals;
+    std::string bigA(1000, 'a');
+    std::string bigB(1000, 'b');
+    std::string bigC(1000, 'c');
+    std::vector<std::vector<Data>> data1{
+        {bigA}, {bigB}
+    };
+    std::vector<std::vector<Data>> data2{
+        {bigA}, {bigC}
+    };
+    std::vector<DataType> types{DataType::VARCHAR};
+    Table table1(std::move(data1), types);
+    Table table2(std::move(data2), types);
+    ColumnarTable input1 = table1.to_columnar();
+    ColumnarTable input2 = table2.to_columnar();
+    plan.inputs.emplace_back(std::move(input1));
+    plan.inputs.emplace_back(std::move(input2));
+    plan.root = 2;
+    auto* context = Contest::build_context();
+    auto result = Contest::execute(plan, context);
+    Contest::destroy_context(context);
+    REQUIRE(result.num_rows == 1); // μόνο το bigA ταιριάζει
+}
+TEST_CASE("Heavy hash collisions", "[join]") {
+    Plan plan;
+    plan.new_scan_node(0, {{0, DataType::INT32}});
+    plan.new_scan_node(1, {{0, DataType::INT32}});
+    plan.new_join_node(true, 0, 1, 0, 0, {{0, DataType::INT32}, {1, DataType::INT32}});
+    // Επιλέγουμε keys που δίνουν το ίδιο hash
+    std::vector<std::vector<Data>> data1{
+        {0}, {1024}, {2048}, {3072}
+    };
+    std::vector<std::vector<Data>> data2{
+        {0}, {1024}, {4096}
+    };
+    std::vector<DataType> types{DataType::INT32};
+    Table table1(std::move(data1), types);
+    Table table2(std::move(data2), types);
+    ColumnarTable input1 = table1.to_columnar();
+    ColumnarTable input2 = table2.to_columnar();
+    plan.inputs.emplace_back(std::move(input1));
+    plan.inputs.emplace_back(std::move(input2));
+    plan.root = 2;
+    auto* context = Contest::build_context();
+    auto result = Contest::execute(plan, context);
+    Contest::destroy_context(context);
+    REQUIRE(result.num_rows == 2);
+}
+

@@ -31,12 +31,12 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
  * size for which we swap them for to optimise our algorithm*/
 
 struct JoinAlgorithm {
-    ExecuteResult&                                   build;
-    ExecuteResult&                                   probe;
-    ExecuteResult&                                   results;
+    ExecuteResult&                                   build; //smaller table in join
+    ExecuteResult&                                   probe; //bigger table
+    ExecuteResult&                                   results; // vector of vectors
     size_t                                           build_col, probe_col;
-    bool                                             swap;
-    const std::vector<std::tuple<size_t, DataType>>& output_attrs;
+    bool                                             swap; 
+    const std::vector<std::tuple<size_t, DataType>>& output_attrs; //
 
 /* new function that calls nested_loop_join
  * to prevent creating hash tables for small tables
@@ -44,11 +44,11 @@ struct JoinAlgorithm {
 public:
     template <class T>
     auto run() {
-        const size_t HASH_TABLE_THRESHOLD = 4;
+        const size_t HASH_TABLE_THRESHOLD = 4; //if build col has < 4 rows nested_loop_join
         if (build.size() < HASH_TABLE_THRESHOLD) {
             nested_loop_join<T>();
         } else {
-            hash_join<T>();
+            hash_join<T>(); // else hash_join
         }
     }
 
@@ -62,8 +62,8 @@ private:
          * to allow for buckets on collisions*/
         size_t build_size= build.size();
         build_size = build_size ? build_size : 1;//handle empty table
-        size_t power_of_2 = 1;
-        while(power_of_2 * 0.60 < build_size){
+        size_t power_of_2 = 1; //use it to keep powerof2's
+        while(power_of_2 * 0.60 < build_size){ // at least 40% empty but if build_table > result <<= 1 and us this result to build the hash_table
             power_of_2 <<= 1;
         }
         RobinHoodTable<T> hash_table(power_of_2);
