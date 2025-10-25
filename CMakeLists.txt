@@ -75,9 +75,27 @@ find_package(LLVM REQUIRED CONFIG)
 
 # Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
 # Try re-running cmake in case changes are not recognized.
-file(GLOB SIGMODPC_SRC
+file(GLOB ALL_SRC
     CONFIGURE_DEPENDS
     "src/*.cpp"
+)
+
+set(SIGMODPC_SRC ${ALL_SRC})
+list(REMOVE_ITEM SIGMODPC_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+)
+
+set(HOPSCOTCH_SRC ${ALL_SRC})
+list(REMOVE_ITEM HOPSCOTCH_SRC 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+)
+
+set(ROBINHOOD_SRC ${ALL_SRC})
+list(REMOVE_ITEM HOPSCOTCH_SRC 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
 )
 
 # Enable server-specific compiler optimizations.
@@ -89,39 +107,44 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
 endif()
 
 # Targets
-add_executable(run ${SIGMODPC_SRC} tests/read_sql.cpp)
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
 add_executable(build_database tests/build_database.cpp)
 
 # For all executables
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    target_compile_definitions(run PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_definitions(build_database PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_definitions(unit_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     add_executable(build_cache ${SIGMODPC_SRC} tests/read_sql.cpp)
-    add_executable(fast ${SIGMODPC_SRC} tests/read_sql.cpp)
-
     target_link_libraries(build_cache PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
     target_compile_definitions(build_cache PRIVATE TEAMOPT_USE_DUCKDB TEAMOPT_BUILD_CACHE)
-    target_link_libraries(fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(build_cache PRIVATE include)
-    target_include_directories(fast PRIVATE include)
+
+    add_executable(base_fast ${SIGMODPC_SRC} tests/read_sql.cpp)
+    target_link_libraries(base_fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(base_fast PRIVATE include)
+
+    add_executable(hopscotch_fast ${HOPSCOTCH_SRC} tests/read_sql.cpp)
+    target_link_libraries(hopscotch_fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(hopscotch_fast PRIVATE include)
+
+    add_executable(robinhood_fast ${ROBINHOOD_SRC} tests/read_sql.cpp)
+    target_link_libraries(robinhood_fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(robinhood_fast PRIVATE include)
 
     target_compile_definitions(build_cache PRIVATE ${LLVM_DEFINITIONS})
-    target_compile_definitions(fast PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(base_fast PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(hopscotch_fast PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(robinhood_fast PRIVATE ${LLVM_DEFINITIONS})
+
     llvm_map_components_to_libnames(llvm_libs support core)
     target_link_libraries(build_cache PRIVATE ${llvm_libs})
-    target_link_libraries(fast PRIVATE ${llvm_libs})
+    target_link_libraries(base_fast PRIVATE ${llvm_libs})
+    target_link_libraries(hopscotch_fast PRIVATE ${llvm_libs})
+    target_link_libraries(robinhood_fast PRIVATE ${llvm_libs})
 endif()
-
-target_link_libraries(run PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
-target_compile_definitions(run PRIVATE TEAMOPT_USE_DUCKDB ${LLVM_DEFINITIONS})
-target_include_directories(run PRIVATE include ${LLVM_INCLUDE_DIRS})
-llvm_map_components_to_libnames(llvm_libs support core)
-target_link_libraries(run PRIVATE ${llvm_libs})
 
 target_link_libraries(build_database PRIVATE fmt duckdb)
 target_include_directories(build_database PRIVATE include ${LLVM_INCLUDE_DIRS})
