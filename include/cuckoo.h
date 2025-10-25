@@ -37,15 +37,15 @@ private:
     }
 
     // Tries to insert the entry by kicking other elements. 
-    // Returns true on success, false if a cycle or kick limit is reached.
-    bool insert_internal(CuckooEntry<Key> entry) {
+    // Returns the entry that failed to be placed on a cycle/kick limit, or std::nullopt on success.
+    std::optional<CuckooEntry<Key>> insert_internal(CuckooEntry<Key> entry) {
         for (size_t current_kicks = 0; current_kicks < MAX_KICKS; ++current_kicks) {
             
             // Try h1 slot in table1
             size_t idx1 = h1(entry.key);
             if (!table1[idx1].has_value()) {
                 table1[idx1] = std::move(entry);
-                return true;
+                return std::nullopt; // Success
             }
             
             // Kick the existing entry from table1 to table2
@@ -55,15 +55,15 @@ private:
             size_t idx2 = h2(entry.key);
             if (!table2[idx2].has_value()) {
                 table2[idx2] = std::move(entry);
-                return true;
+                return std::nullopt; // Success
             }
             
             // Kick the existing entry from table2 to table1 (as its next step)
             std::swap(entry, *table2[idx2]);
         }
         
-        // Failed to insert after MAX_KICKS attempts, requires rehash
-        return false;
+        // Failed to insert after MAX_KICKS attempts, return the entry that couldn't be placed.
+        return std::move(entry);
     }
     
     // Doubles the capacity and rebuilds the tables
@@ -79,15 +79,15 @@ private:
         // Reinsert all old entries
         for (auto& optional_entry : old_table1) {
             if (optional_entry.has_value()) {
-                if (!insert_internal(std::move(*optional_entry))) {
-                    throw std::runtime_error("Cuckoo rehash failed: rehash cycle detected");
+                if (insert_internal(std::move(*optional_entry)).has_value()) {
+                    throw std::runtime_error("Cuckoo rehash failed: rehash cycle detected (T1)");
                 }
             }
         }
         for (auto& optional_entry : old_table2) {
             if (optional_entry.has_value()) {
-                if (!insert_internal(std::move(*optional_entry))) {
-                    throw std::runtime_error("Cuckoo rehash failed: rehash cycle detected");
+                if (insert_internal(std::move(*optional_entry)).has_value()) {
+                    throw std::runtime_error("Cuckoo rehash failed: rehash cycle detected (T2)");
                 }
             }
         }
@@ -115,9 +115,15 @@ public:
         CuckooEntry<Key> new_entry = {key, {idx}};
 
         // 3. Insert/Kick, rehash if cycle is detected
-        while (!insert_internal(std::move(new_entry))) {
-            rehash(); 
-            // The kicked entry is back in new_entry due to the last swap in insert_internal.
+        while (true) {
+            if (auto failed_entry_opt = insert_internal(std::move(new_entry))) {
+                // Insertion failed, get the failed entry, rehash, and try again.
+                new_entry = std::move(failed_entry_opt.value());
+                rehash(); 
+            } else {
+                // Success
+                break;
+            }
         }
     }
 
