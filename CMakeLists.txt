@@ -71,6 +71,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
 endif()
 FetchContent_MakeAvailable(duckdb)
 
+find_package(LLVM REQUIRED CONFIG)
+
 # Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
 # Try re-running cmake in case changes are not recognized.
 file(GLOB SIGMODPC_SRC
@@ -83,7 +85,7 @@ file(GLOB SIGMODPC_SRC
 #    clang++-18: error: unsupported option '-march=' for target 'powerpc64le-unknown-linux-gnu'
 # This flag works on other Power systems, but for now, we disable march=native on all Power machines.
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
-    add_compile_options(-march=native -O2)
+    add_compile_options(-march=native)
 endif()
 
 # Targets
@@ -107,17 +109,26 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(build_cache PRIVATE include)
     target_include_directories(fast PRIVATE include)
+
+    target_compile_definitions(build_cache PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(fast PRIVATE ${LLVM_DEFINITIONS})
+    llvm_map_components_to_libnames(llvm_libs support core)
+    target_link_libraries(build_cache PRIVATE ${llvm_libs})
+    target_link_libraries(fast PRIVATE ${llvm_libs})
 endif()
 
 target_link_libraries(run PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
-target_compile_definitions(run PRIVATE TEAMOPT_USE_DUCKDB)
+target_compile_definitions(run PRIVATE TEAMOPT_USE_DUCKDB ${LLVM_DEFINITIONS})
+target_include_directories(run PRIVATE include ${LLVM_INCLUDE_DIRS})
+llvm_map_components_to_libnames(llvm_libs support core)
+target_link_libraries(run PRIVATE ${llvm_libs})
+
 target_link_libraries(build_database PRIVATE fmt duckdb)
+target_include_directories(build_database PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(build_database PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(build_database PRIVATE ${llvm_libs})
+
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-
-target_include_directories(run PRIVATE include)
-target_include_directories(build_database PRIVATE include)
-target_include_directories(unit_tests PRIVATE include)
-
-
-
-
+target_include_directories(unit_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(unit_tests PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(unit_tests PRIVATE ${llvm_libs})

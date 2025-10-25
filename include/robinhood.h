@@ -3,7 +3,7 @@
 #include <optional>
 #include <cstddef>
 #include <functional>
-#include <memory>
+#include <llvm/ADT/SmallVector.h>
 
 /*
 Robin hood hashing algorithm: the idea behind this hashing algorithm is
@@ -22,9 +22,9 @@ struct Entry
 {
     Key key;
     size_t psl;
-    std::unique_ptr<std::vector<size_t>> indices; //pointer in vector
-    Entry() : psl(0) , indices(nullptr){}
-    Entry(Key k, size_t p, std::unique_ptr<std::vector<size_t>>idx) //constructor with key,psl +unique_ptr
+    llvm::SmallVector<size_t,1>indices; //pointer in vector
+    Entry() : psl(0) {}
+    Entry(Key k, size_t p, llvm::SmallVector<size_t,1> idx) //constructor with key,psl +unique_ptr
         : key(k),psl(p), indices(std::move(idx)) {} //then initialize
 };
 
@@ -54,14 +54,14 @@ public:
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
         Key k = key;
-        auto v = std::make_unique<std::vector<size_t>>();//heap alloc
-        v->push_back(idx);
+        auto v = llvm::SmallVector<size_t,1>();//heap alloc
+        v.push_back(idx);
         // check if the key already exists
         while (table[p].has_value())
         {
             if (table[p]->key == key)
             {
-                table[p]->indices->push_back(idx);
+                table[p]->indices.push_back(idx);
                 return;
             }
             // if entry has smaller psl swap
@@ -77,7 +77,7 @@ public:
         table[p] = Entry<Key>{k, vpsl, std::move(v)};
     }
 
-    std::optional<std::vector<size_t> *> search(const Key &key)
+    std::optional<llvm::SmallVector<size_t,1> *> search(const Key &key)
     {
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
@@ -85,7 +85,7 @@ public:
         {
             if (table[p]->key == key)
             {
-                return table[p]->indices.get();
+                return &table[p]->indices;
             }
             if (vpsl > table[p]->psl)
             {
