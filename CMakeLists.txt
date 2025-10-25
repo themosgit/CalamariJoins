@@ -83,15 +83,21 @@ file(GLOB ALL_SRC
 set(SIGMODPC_SRC ${ALL_SRC})
 list(REMOVE_ITEM SIGMODPC_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
 )
 
 set(HOPSCOTCH_SRC ${ALL_SRC})
 list(REMOVE_ITEM HOPSCOTCH_SRC 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
 )
 
-message(STATUS "SIGMODPC_SRC contains: ${SIGMODPC_SRC}")
-message(STATUS "HOPSCOTCH_SRC contains: ${HOPSCOTCH_SRC}")
+set(ROBINHOOD_SRC ${ALL_SRC})
+list(REMOVE_ITEM HOPSCOTCH_SRC 
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+)
+
 # Enable server-specific compiler optimizations.
 # Use march=native for all but Power servers, which results in the following error:
 #    clang++-18: error: unsupported option '-march=' for target 'powerpc64le-unknown-linux-gnu'
@@ -124,14 +130,20 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(hopscotch_fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(hopscotch_fast PRIVATE include)
 
+    add_executable(robinhood_fast ${ROBINHOOD_SRC} tests/read_sql.cpp)
+    target_link_libraries(robinhood_fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(robinhood_fast PRIVATE include)
+
     target_compile_definitions(build_cache PRIVATE ${LLVM_DEFINITIONS})
     target_compile_definitions(base_fast PRIVATE ${LLVM_DEFINITIONS})
     target_compile_definitions(hopscotch_fast PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(robinhood_fast PRIVATE ${LLVM_DEFINITIONS})
 
     llvm_map_components_to_libnames(llvm_libs support core)
     target_link_libraries(build_cache PRIVATE ${llvm_libs})
     target_link_libraries(base_fast PRIVATE ${llvm_libs})
     target_link_libraries(hopscotch_fast PRIVATE ${llvm_libs})
+    target_link_libraries(robinhood_fast PRIVATE ${llvm_libs})
 endif()
 
 target_link_libraries(build_database PRIVATE fmt duckdb)
