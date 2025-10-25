@@ -1,5 +1,3 @@
-#include <type_traits>
-#include <variant>
 #if defined(__APPLE__) && defined(__aarch64__)
     #include <hardware_darwin.h>
 #else
@@ -16,8 +14,10 @@ using ExecuteResult = std::vector<std::vector<Data>>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
-/*join algorithm refactored for build table and probe table
- *swap is previous built left maintains valid result format*/
+/**
+ *  join algorithm refactored for build table and probe table
+ *  swap is previous built left maintains valid result format
+ **/
 struct JoinAlgorithm {
     ExecuteResult&                                   build;
     ExecuteResult&                                   probe;
@@ -26,12 +26,14 @@ struct JoinAlgorithm {
     bool                                             swap;
     const std::vector<std::tuple<size_t, DataType>>& output_attrs;
 
-/* new function that calls nested_loop_join
- * to prevent creating hash tables for small tables*/
+/**
+ * new function that calls nested_loop_join
+ * to prevent creating hash tables for small tables
+ **/
 public:
     template <class T>
     auto run() {
-        /* 4 was chosen as an optimal value from tests*/
+        /* 4 was chosen as an optimal value from tests */
         const size_t HASH_TABLE_THRESHOLD = 4;
         if (build.size() < HASH_TABLE_THRESHOLD) {
             nested_loop_join<T>();
@@ -47,7 +49,7 @@ private:
         namespace views = ranges::views;
         HopscotchHashTable<T> hash_table(build.size() * 1.8);
         
-        /*build hash table from build table*/
+        /* build hash table from build table */
         for (auto&& [idx, record]: build | views::enumerate) {
             if (auto* key = std::get_if<T>(&record[build_col])) {
                 hash_table.insert(*key, idx);
@@ -98,8 +100,10 @@ private:
         }
     }
 
-    /*constucts final result keeps left/right name because
-     * its relevant for constructing a valid result*/
+    /**
+     *  constucts final result keeps left/right name because
+     *  its relevant for constructing a valid result
+     **/
     void construct_result(const std::vector<Data>& left_record, 
         const std::vector<Data>& right_record) {
         std::vector<Data> new_record;
@@ -116,9 +120,11 @@ private:
     }
 };
 
-/* this is the function which calls our join algorithm it takes
- * its arguments from execute_impl which takes its arguments from
- * execute thats all i know for now */
+/** 
+ *  this is the function which calls our join algorithm it takes
+ *  its arguments from execute_impl which takes its arguments from
+ *  execute thats all i know for now
+ **/
 ExecuteResult execute_hash_join(const Plan&          plan,
     const JoinNode&                                  join,
     const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
@@ -132,9 +138,11 @@ ExecuteResult execute_hash_join(const Plan&          plan,
     auto                           right       = execute_impl(plan, right_idx);
     std::vector<std::vector<Data>> results;
 
-    /*it chooses which table will be built and which will be
-     *be probed the smaller one is chosen to be built to minimize
-     *hash table size */
+    /**
+     *  it chooses which table will be built and which will be
+     *  be probed the smaller one is chosen to be built to minimize
+     *  hash table size
+     **/
     bool determine_build_left = (left.size() < right.size()) ? true : false;
 
     /* here we initialize the join algorithm with the desired tables */
