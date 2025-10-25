@@ -39,7 +39,7 @@ private:
             return internal_bitmask & (1ULL << 63);
         }
 
-        inline void set_occupied(bool occuppied) noexcept {
+        inline void set_occupied(bool occupied) noexcept {
             internal_bitmask = (internal_bitmask & 0x7FFFFFFFFFFFFFFFULL) | 
                        (static_cast<uint64_t>(occupied) << 63);
         }
