@@ -46,7 +46,6 @@ private:
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-        // Changed HopscotchHashTable to CuckooTable
         CuckooTable<T> hash_table(build.size() * 1.8);
         /*build hash table from build table*/
         for (auto&& [idx, record]: build | views::enumerate) {
