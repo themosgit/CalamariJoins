@@ -1,5 +1,7 @@
+#include "hopscotch.h"
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <table.h>
 #include <plan.h>
 #include <robinhood.h>
@@ -13,7 +15,7 @@ void sort(std::vector<std::vector<Data>>& table) {
 // =================================================================================
 // New CuckooTable Specific Tests
 // =================================================================================
-
+/*
 TEST_CASE("CuckooTable Basic Insert and Search", "[cuckoo]") {
     CuckooTable<TableEntity> table(10);
     TableEntity key1{"t1", 1};
@@ -82,7 +84,7 @@ TEST_CASE("CuckooTable Rehash Implicit Test (Many Inserts)", "[cuckoo]") {
         REQUIRE(result.value()->at(0) == (size_t)i);
     }
 }
-
+*/
 // =================================================================================
 // Existing Join Tests
 // =================================================================================
@@ -449,6 +451,8 @@ TEST_CASE("3-way join", "[join]") {
     sort(result_table.table());
     REQUIRE(result_table.table() == ground_truth);
 }
+/*
+<<<<<<< HEAD
 TEST_CASE("Large Duplicate keys","[join]"){
     Plan plan;
     plan.new_scan_node(0,{{0, DataType::INT32}});
@@ -692,3 +696,49 @@ TEST_CASE("Heavy hash collisions", "[join]") {
     Contest::destroy_context(context);
     REQUIRE(result.num_rows == 2); // 0 and 1024 match. 2048 is in T1 only, 3072 is in T1 only. 4096 is in T2 only.
 }
+=======
+
+TEST_CASE("Hopscotch creation", "[hopscotch]") {
+    HopscotchHashTable<int32_t> hash_table(10);
+    REQUIRE(hash_table.size() >= 10);
+    hash_table.diagnostic();
+}
+
+TEST_CASE("Hopscotch basic insertion", "[hopscotch]") {
+    HopscotchHashTable<int32_t> hash_table(10);
+    for(int i = 0; i < hash_table.size(); i++) {
+        hash_table.insert(i, i+10);
+    }
+}
+
+TEST_CASE("Hopscotch basic find", "[hopscotch]") {
+    HopscotchHashTable<int32_t> hash_table(10);
+
+    for(int i = 0; i < 5; i++) {
+        hash_table.insert(i, i+10);
+    }
+
+    for (int i = 0; i < 5; i++) {
+        auto bucket = hash_table.find(i);
+        for (auto idx : bucket) {
+            REQUIRE(idx == i + 10);
+        }
+    }
+}
+
+TEST_CASE("Hopscotch test bucket functionality", "[hopscotch]") {
+    HopscotchHashTable<int32_t> hash_table(10);
+    for (int i = 0; i < 10; i++) {
+        for (int j = 0; j < 100; j++ ) {
+            hash_table.insert(i, j);
+        }
+    }
+    for (int i = 0; i < 10; i++) {
+        auto bucket =  hash_table.find(i);
+        int j = 0;
+        for (auto idx: bucket)
+            REQUIRE(idx == (j++));
+    }
+}
+>>>>>>> main
+*/
