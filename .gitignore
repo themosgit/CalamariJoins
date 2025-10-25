@@ -10,3 +10,4 @@
 /cache
 flake.lock
 .clangd
+compile_commands.json
