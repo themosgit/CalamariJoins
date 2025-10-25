@@ -46,77 +46,55 @@ private:
     void hash_join() {
         namespace views = ranges::views;
         HopscotchHashTable<T> hash_table(build.size() * 1.8);
+        
         /*build hash table from build table*/
         for (auto&& [idx, record]: build | views::enumerate) {
-            std::visit([&hash_table, idx = idx](const auto& key) {
-                using Tk = std::decay_t<decltype(key)>;
-                if constexpr (std::is_same_v<Tk, T>) {
-                    hash_table.insert(key, idx);
-                } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
-                    throw std::runtime_error("wrong type of field on build");
-                }
-            },
-            record[build_col]);
+            if (auto* key = std::get_if<T>(&record[build_col])) {
+                hash_table.insert(*key, idx);
+            } else if (!std::holds_alternative<std::monostate>(record[build_col])) {
+                throw std::runtime_error("wrong type of field on build");
+            }
         }
+        
         /* prefetch amount */
         constexpr size_t PREFETCH = 16;
-        size_t limit = PREFETCH > probe.size() ? probe.size() : PREFETCH; 
-        for (size_t i = 0; i < limit; i++) {
-            std::visit([&](const auto& key) {
-                using Tk = std::decay_t<decltype(key)>;
-                if constexpr (std::is_same_v<Tk, T>) {
-                    hash_table.prefetch(key);
-                }
-            }, probe[i][probe_col]);
-        }
-
-        for (size_t i = 0; i < probe.size(); i++ ){
+        for (size_t i = 0; i < probe.size(); i++) {
             if (i + PREFETCH < probe.size()) {
-                std::visit([&](const auto& key) {
-                    using Tk = std::decay_t<decltype(key)>;
-                    if constexpr (std::is_same_v<Tk, T>) {
-                        hash_table.prefetch(key);
-                    }
-                }, probe[i + PREFETCH][probe_col]);
-            }
-
-            auto& probe_record = probe[i];
-            std::visit([&](const auto& key) {
-                using Tk = std::decay_t<decltype(key)>;
-                if constexpr (std::is_same_v<Tk, T>) {
-                    auto indices = hash_table.find(key);
-                    for (auto build_idx : indices) {
-                        swap ? construct_result(build[build_idx], probe_record):
-                               construct_result(probe_record, build[build_idx]);
-                    }
-                } else if constexpr (not std::is_same_v<Tk, std::monostate>) {
-                    throw std::runtime_error("wrong type of field on probe");
+                if (auto* key = std::get_if<T>(&probe[i + PREFETCH][probe_col])) {
+                    hash_table.prefetch(*key);
                 }
-            },
-            probe_record[probe_col]);
+            }
+            
+            auto& probe_record = probe[i];
+            if (auto* key = std::get_if<T>(&probe_record[probe_col])) {
+                auto indices = hash_table.find(*key);
+                for (auto build_idx : indices) {
+                    swap ? construct_result(build[build_idx], probe_record):
+                           construct_result(probe_record, build[build_idx]);
+                }
+            } else if (!std::holds_alternative<std::monostate>(probe_record[probe_col])) {
+                throw std::runtime_error("wrong type of field on probe");
+            }
         }
 
+    }
 
-        }
-
-   template <class T>
+    template <class T>
     void nested_loop_join() {
         for (auto& build_record: build) {
-        for (auto& probe_record: probe) {
-            std::visit([&](const auto& build_key, const auto& probe_key) {
-                using Tb = std::decay_t<decltype(build_key)>;
-                using Tp = std::decay_t<decltype(probe_key)>;
-                if constexpr (std::is_same_v<Tb, T> && std::is_same_v<Tp, T>) {
-                    if (build_key == probe_key) {
-                        swap ? construct_result(build_record, probe_record) :
-                               construct_result(probe_record, build_record);
-                    }
-                } else if constexpr (not std::is_same_v<Tb, std::monostate>
-                                  || not std::is_same_v<Tp, std::monostate>) {
-                    throw std::runtime_error("wrong type of field on probe");
+            auto* build_key = std::get_if<T>(&build_record[build_col]);
+            if (!build_key)
+                continue;
+            for (auto& probe_record: probe) {
+                auto* probe_key = std::get_if<T>(&probe_record[probe_col]);
+                if (!probe_key)
+                    continue;
+
+                if (*build_key == *probe_key) {
+                    swap ? construct_result(build_record, probe_record) :
+                           construct_result(probe_record, build_record);
                 }
-            }, build_record[build_col], probe_record[probe_col]);
-        }
+            }
         }
     }
 
