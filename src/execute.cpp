@@ -60,16 +60,6 @@ private:
         }
         /* prefetch amount */
         constexpr size_t PREFETCH = 16;
-        size_t limit = PREFETCH > probe.size() ? probe.size() : PREFETCH; 
-        for (size_t i = 0; i < limit; i++) {
-            std::visit([&](const auto& key) {
-                using Tk = std::decay_t<decltype(key)>;
-                if constexpr (std::is_same_v<Tk, T>) {
-                    hash_table.prefetch(key);
-                }
-            }, probe[i][probe_col]);
-        }
-
         for (size_t i = 0; i < probe.size(); i++ ){
             if (i + PREFETCH < probe.size()) {
                 std::visit([&](const auto& key) {
