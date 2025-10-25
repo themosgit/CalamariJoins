@@ -84,18 +84,21 @@ set(SIGMODPC_SRC ${ALL_SRC})
 list(REMOVE_ITEM SIGMODPC_SRC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_cuckoo.cpp"
 )
 
 set(HOPSCOTCH_SRC ${ALL_SRC})
 list(REMOVE_ITEM HOPSCOTCH_SRC 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_cuckoo.cpp"
 )
 
 set(ROBINHOOD_SRC ${ALL_SRC})
-list(REMOVE_ITEM HOPSCOTCH_SRC 
+list(REMOVE_ITEM ROBINHOOD_SRC 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_cuckoo.cpp"
 )
 
 # Enable server-specific compiler optimizations.
@@ -108,6 +111,7 @@ endif()
 
 # Targets
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
+add_executable(hopscotch_tests ${HOPSCOTCH_SRC} tests/hopscotch_tests.cpp)
 add_executable(build_database tests/build_database.cpp)
 
 # For all executables
@@ -155,3 +159,8 @@ target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain
 target_include_directories(unit_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(unit_tests PRIVATE ${LLVM_DEFINITIONS})
 target_link_libraries(unit_tests PRIVATE ${llvm_libs})
+
+target_link_libraries(hopscotch_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(hopscotch_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(hopscotch_tests PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(hopscotch_tests PRIVATE ${llvm_libs})
