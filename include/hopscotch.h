@@ -18,13 +18,19 @@ private:
     static constexpr size_t H = 64;
     static constexpr uint64_t EMPTY_MASK = 0;
 
+    /**
+     *  first is the bit mask of the bucket
+     *  with occupied state stored at the last bit
+     *  or first bit 
+     *
+     *  then llvm's small vector is used to keep
+     *  buckets of size 1 in stack larger bucket
+     *  use heap allocations
+     *
+     **/
     struct Bucket {
-        /* bit mask of the bucket
-         * + occupied state*/
         uint64_t internal_bitmask;
-        /* vector containing same key idx*/
         llvm::SmallVector<size_t, 1> indices;
-        /* key corresponding to bucket */
         Key key;
 
         Bucket() : internal_bitmask(EMPTY_MASK){}
@@ -34,10 +40,8 @@ private:
         }
 
         inline void set_occupied(bool occuppied) noexcept {
-            if(occuppied)
-                internal_bitmask |= (1ULL << 63);
-            else
-                internal_bitmask &= ~(1ULL << 63);
+            internal_bitmask = (internal_bitmask & 0x7FFFFFFFFFFFFFFFULL) | 
+                       (static_cast<uint64_t>(occupied) << 63);
         }
 
         inline uint64_t bitmask() const noexcept {
@@ -70,40 +74,20 @@ private:
     /* ultra complicated hash expanding to 64 bit */
     __attribute__((always_inline))
     static inline size_t hash_int32(int32_t key) noexcept {
-        uint32_t h = static_cast<uint32_t>(key);
-        
-        h = murmur3_fmix32(h);
-        
-        uint64_t h64 = h;
-        h64 = (h64 ^ 0x1312acab) + (h64 << 5);
-        h64 ^= h64 >> 23;
-        h64 *= 0x2127599bf4325c37ULL;
-        h64 ^= h64 >> 47;
-        
-        h64 *= 0xbf58476d1ce4e5b9ULL;
-        h64 ^= h64 >> 27;
-        h64 *= 0x94d049bb133111ebULL;
-        h64 ^= h64 >> 31;
-        
-        return h64;
-    }
+        uint64_t h = static_cast<uint32_t>(key);
 
-    /*optimized hash function for int32_t keys*/
-    __attribute__((always_inline))
-    static inline uint32_t murmur3_fmix32(uint32_t h) noexcept {
-        h ^= h >> 16;
-        h *= 0x85ebca6b;
-        h ^= h >> 13;
-        h *= 0xc2b2ae35;
-        h ^= h >> 16;
+        h ^= h << 32;
+        h *= 0x9e3779b97f4a7c15ULL;
+        h ^= h >> 32;
+        h *= 0xc2b2ae3d27d4eb4fULL;
+        h ^= h >> 29;
         return h;
     }
-
-    
    
-    /*find free bucket within max distance from ideal position*/
+    /*find free bucket within search distance from current position*/
     inline size_t find_free_bucket(size_t start_idx) const noexcept {
-        for (size_t i = 0; i < capacity; ++i) {
+        static constexpr size_t MAX_SEARCH = 512;
+        for (size_t i = 0; i < MAX_SEARCH && i < capacity; ++i) {
             size_t idx = (start_idx + i) & (capacity - 1);
             if (!table[idx].occupied()) {
                 return idx;
@@ -125,10 +109,14 @@ private:
             }
             
             bool found = false;
-           /* this loop looks backwards from free_index
-            * and checks occupied items' bitmask*/ 
+
+           /* looks backwards from free_index  and checks occupied items' bitmask*/ 
             for (size_t offset = 1; offset < H && !found; ++offset) {
                 size_t check_index = (free_index + capacity - offset) & (capacity - 1);
+
+                if (offset + 4 < H) {
+                    __builtin_prefetch(&table[(free_index + capacity - offset - 4) & (capacity - 1)]);
+                }
                 
                 if (!table[check_index].occupied()) continue;
                 
@@ -139,9 +127,11 @@ private:
                     if (bitmask & (1ULL << j)) {
                         size_t item_idx = (check_index + j) & (capacity - 1);
                         size_t new_dist = (free_index + capacity - check_index) & (capacity - 1);
-                       /* check if the item can be moved to free_index while
-                        * staying in its appropiate neighborhood if this can
-                        * be done move the items */
+                       /**
+                        *  check if the item can be moved to free_index while
+                        *  staying in its appropiate neighborhood if this can
+                        *  be done move the items 
+                        **/
                         if (new_dist < H && item_idx != free_index) {
                             table[free_index] = std::move(table[item_idx]);
                             table[item_idx].set_occupied(false);
@@ -177,8 +167,7 @@ public:
             throw std::invalid_argument("Cannot build hash table of this size");
         } else {
             /* calculate next power of 2 */
-            size_t clz = __builtin_clzll(size - 1);
-            capacity = 1ULL << (64 - clz);
+            capacity = 1ULL << (64 - __builtin_clzll(size - 1));
         }
         table.resize(capacity);
     }
@@ -187,7 +176,7 @@ public:
         size_t hash_val = hash_key(key);
         size_t base_index = hash_val & (capacity - 1);
         
-        /* check if key has already been inserted*/ 
+        /* check if key has already been inserted */ 
         uint64_t bitmask = table[base_index].bitmask();
         uint64_t temp_mask = bitmask;
         while (temp_mask) {
@@ -198,7 +187,7 @@ public:
                 table[check_index].indices.emplace_back(idx);
                 return;
             }
-            /*clear bit */
+            /* clear bit */
             temp_mask &= (temp_mask - 1);
         }
         
@@ -232,8 +221,11 @@ public:
     }
 
 
-    /* struct to return pointers
-     * avoids inderections */
+    /** 
+     *  struct to return pointers
+     *  avoids inderections 
+     *
+     **/
     struct IndexSpan {
         const size_t *data;
         size_t size;
@@ -261,7 +253,7 @@ public:
         while (bitmask) {
             size_t i = __builtin_ctzll(bitmask);
             size_t check_index = (base_index + i) & (capacity - 1);
-            if (table[check_index].occupied() && table[check_index].key == key) {
+            if (table[check_index].key == key) {
                 return {
                     table[check_index].indices.data(),
                     table[check_index].indices.size()
@@ -280,8 +272,11 @@ public:
     }
 
 
-    /* diagnostic functions that prints all data 
-     * in the hash table useful for tricky debugging */
+    /**
+     *  diagnostic functions that prints all data 
+     *  in the hash table useful for tricky debugging 
+     *
+     **/
     void diagnostic() {
         for (size_t i = 0; i < capacity; i++) {
             if (table[i].occupied()) {
