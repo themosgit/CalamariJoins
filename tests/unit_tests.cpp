@@ -394,7 +394,7 @@ TEST_CASE("Hopscotch basic find", "[hopscotch]") {
 
     for (int i = 0; i < 5; i++) {
         auto bucket = hash_table.find(i);
-        for (auto idx : *bucket) {
+        for (auto idx : bucket) {
             REQUIRE(idx == i + 10);
         }
     }
@@ -410,7 +410,7 @@ TEST_CASE("Hopscotch test bucket functionality", "[hopscotch]") {
     for (int i = 0; i < 10; i++) {
         auto bucket =  hash_table.find(i);
         int j = 0;
-        for (auto idx: *bucket)
+        for (auto idx: bucket)
             REQUIRE(idx == (j++));
     }
 }
