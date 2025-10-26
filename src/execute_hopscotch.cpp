@@ -59,7 +59,7 @@ private:
         }
         
         /* prefetch amount */
-        constexpr size_t PREFETCH = 16;
+        constexpr size_t PREFETCH = 48;
         for (size_t i = 0; i < probe.size(); i++) {
             if (i + PREFETCH < probe.size()) {
                 if (auto* key = std::get_if<T>(&probe[i + PREFETCH][probe_col])) {

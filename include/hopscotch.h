@@ -10,7 +10,6 @@
 #include <functional>
 #include <stdexcept>
 #include <bitset>
-#include <llvm/ADT/SmallVector.h>
 
 template <typename Key, typename Hash = std::hash<Key>>
 class HopscotchHashTable {
@@ -23,17 +22,22 @@ private:
      *  with occupied state stored at the last bit
      *  or first bit 
      *
-     *  then llvm's small vector is used to keep
-     *  buckets of size 1 in stack larger bucket
-     *  use heap allocations
+     *  then the index of the values within
+     *  are value store vector the count of the
+     *  items and padding to keep buckets at 
+     *  32 bytes on the M1 proccesor cache line
+     *  size is ta 128 bytes so we fit 4 buckets
+     *  per cacheline
      *
      **/
     struct Bucket {
         uint64_t internal_bitmask;
-        llvm::SmallVector<size_t, 1> indices;
         Key key;
+        uint32_t value_index;
+        unint16_t count;
+        unint16_t _padding;
 
-        Bucket() : internal_bitmask(EMPTY_MASK){}
+        Bucket() : internal_bitmask(EMPTY_MASK), value_index(0), count(0), _padding(0){}
 
         inline bool occupied() const noexcept {
             return internal_bitmask & (1ULL << 63);
@@ -56,11 +60,14 @@ private:
             internal_bitmask &= ~(1ULL << pos);
         }
 
-    }__attribute__((aligned(64)));
+    }__attribute__((aligned(32)));
+
+    static_assert(sizeof(Bucket) == 32, "Bucket should be 32 bytes");
 
     std::vector<Bucket> table;
+    std::vector<size_t> value_store;
     size_t capacity;
-    size_t num_items;
+    size_t value_store_size;
     Hash hasher;
     
 
@@ -88,6 +95,7 @@ private:
     inline size_t find_free_bucket(size_t start_idx) const noexcept {
         static constexpr size_t MAX_SEARCH = 512;
         for (size_t i = 0; i < MAX_SEARCH && i < capacity; ++i) {
+
             size_t idx = (start_idx + i) & (capacity - 1);
             if (!table[idx].occupied()) {
                 return idx;
@@ -115,7 +123,7 @@ private:
                 size_t check_index = (free_index + capacity - offset) & (capacity - 1);
 
                 if (offset + 4 < H) {
-                    __builtin_prefetch(&table[(free_index + capacity - offset - 4) & (capacity - 1)]);
+                    __builtin_prefetch(&table[(free_index + capacity - offset - 4) & (capacity - 1)], 0, 2);
                 }
                 
                 if (!table[check_index].occupied()) continue;
@@ -133,7 +141,7 @@ private:
                         *  be done move the items 
                         **/
                         if (new_dist < H && item_idx != free_index) {
-                            table[free_index] = std::move(table[item_idx]);
+                            table[free_index] = table[item_idx];
                             table[item_idx].set_occupied(false);
                             table[item_idx].internal_bitmask = EMPTY_MASK;
                             /* clears and sets proper bit map positions */
@@ -182,9 +190,10 @@ public:
         while (temp_mask) {
             size_t i = __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
-            if (table[check_index].occupied() && table[check_index].key == key) {
+            if (table[check_index].key == key) {
                 /* key found add value to vector */ 
-                table[check_index].indices.emplace_back(idx);
+                value_storage.emplace_back(idx);
+                tble[check_index].count++;
                 return;
             }
             /* clear bit */
@@ -215,7 +224,12 @@ public:
         }
         /* update table entries with proper data */ 
         table[free_index].key = key;
-        table[free_index].indices.emplace_back(idx);
+        table[free_index].value_index = value_vector_size;
+        table[free_index].count = 1;
+        value_store.emplace_back(idx);
+        value_store_size++;
+        
+
         table[free_index].set_occupied(true);
         table[base_index].set_bitmask(dist);
     }
@@ -253,10 +267,16 @@ public:
         while (bitmask) {
             size_t i = __builtin_ctzll(bitmask);
             size_t check_index = (base_index + i) & (capacity - 1);
-            if (table[check_index].key == key) {
+
+            const Bucket& bucket = table[check_index];
+            if (bucket.count > 0) {
+                __builtin_prefetch(&value_store[bucket.flat_index], 0, 3);
+            }
+
+            if (bucket.key == key) {
                 return {
-                    table[check_index].indices.data(),
-                    table[check_index].indices.size()
+                    value_store.data() + bucket.value_index,
+                    bucket.count 
                 };
             }
             /* clear bit */
