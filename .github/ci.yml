@@ -23,40 +23,16 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y llvm-dev libzstd-dev llvm clang
 
-    - name: Ensure download script is executable (if not already)
-      run: chmod +x ./download_imdb.sh
-      
-    # --- Initial Data Download and Build ---
-    - name: Download IMDb data
-      run: ./download_imdb.sh
-
     - name: Configure initial build with CMake
       run: |
         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
 
     - name: Build all targets
-      run: cmake --build build -- -j $(nproc)
+      run: cmake --build build -- -j $(nproc) unit_tests hopscotch_tests cuckoo_tests
 
-    - name: Build the database
-      run: ./build/build_database imdb.db
 
-    # --- Cache Download, Re-Configuration, and Specific Targets Build ---
-    - name: Download and extract cache file
-      run: |
-        wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_x86.tar.gz
-        tar -xf sigmod25_cache_x86.tar.gz
-
-    - name: Re-configure and build 'fast' target
-      run: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
-        cmake --build build -- -j $(nproc) fast
-
-    # --- Unit Tests ---
-    - name: Build 'unit_tests' target
-      run: cmake --build build
-
-    # - name: Run unit tests
-    #   run: ./build/unit_tests
+    - name: Run unit tests
+      run: ./build/unit_tests
 
     # --- Hopscotch Tests ---
     - name: Run hopscotch tests
