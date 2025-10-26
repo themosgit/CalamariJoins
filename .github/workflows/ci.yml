@@ -28,7 +28,7 @@ jobs:
         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
 
     - name: Build all targets
-      run: cmake --build build -- -j $(nproc) unit_tests hopscotch_tests cuckoo_tests
+      run: cmake --build build -- -j $(nproc) unit_tests hopscotch_tests cuckoo_tests robinhood_tests
 
 
     - name: Run unit tests
