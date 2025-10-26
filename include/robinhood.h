@@ -61,7 +61,7 @@ public:
         {
             if (table[p]->key == key)
             {
-                table[p]->indices.push_back(idx);
+                table[p]->indices.push_back(idx); //push it to the end of the vec
                 return;
             }
             // if entry has smaller psl swap
@@ -71,26 +71,21 @@ public:
                 std::swap(v, table[p]->indices);
                 std::swap(vpsl, table[p]->psl);
             }
-            p = (p + 1) & (size - 1);
+            p = (p + 1) & (size - 1); //liner probing
             vpsl++;
         }
-        table[p] = Entry<Key>{k, vpsl, std::move(v)};
+        table[p] = Entry<Key>{k, vpsl, std::move(v)}; // if it's empty insert
     }
 
     std::optional<llvm::SmallVector<size_t,1> *> search(const Key &key)
     {
         size_t p = hash(key) & (size - 1);
-        size_t vpsl = 0;
-        while (table[p].has_value())
+        size_t vpsl = 0; //psl of the key we're searching
+        while (table[p].has_value())//start from it's "primal position"
         {
-            if (table[p]->key == key)
-            {
-                return &table[p]->indices;
-            }
-            if (vpsl > table[p]->psl)
-            {
-                return std::nullopt;
-            }
+            if (table[p]->key == key){return &table[p]->indices;} //if u find the key return it
+            /*if the key we're looking for has done more steps than the key that exists in the entry we're now looking for then the key doesn't exist.*/
+            if (vpsl > table[p]->psl){return std::nullopt;}
             p = (p + 1) & (size - 1);
             vpsl++;
         }
