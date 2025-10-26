@@ -5,6 +5,7 @@
 #include <functional>
 #include <llvm/ADT/SmallVector.h>
 #include <iostream>
+#include <stdexcept>
 /*
 Robin hood hashing algorithm: the idea behind this hashing algorithm is
 to keep the psl(probe sequence lenght) as low as possible.
@@ -22,7 +23,7 @@ struct Entry
 {
     Key key;
     size_t psl;
-    llvm::SmallVector<size_t,1>indices; //pointer in vector
+    llvm::SmallVector<size_t,1> indices; //pointer in vector
     Entry() : psl(0) {}
     Entry(Key k, size_t p, llvm::SmallVector<size_t,1> idx) //constructor with key,psl +unique_ptr
         : key(k),psl(p), indices(std::move(idx)) {} //then initialize
@@ -32,8 +33,9 @@ template <typename Key>
 class RobinHoodTable
 {
 private:
-    std::vector<std::optional<Entry<Key>>> table;//allows empty slots without wasting memory
     size_t size;
+    size_t probe_limit;//probe limit 
+    std::vector<std::optional<Entry<Key>>> table;//allows empty slots without wasting memory //probe limit for searching the key(explain in search)
     size_t hash(const Key &key) const
     {
         size_t h =  std::hash<Key>{}(key); //hash mixing with MurmurHash3 finalizer for better distribution
@@ -47,19 +49,30 @@ private:
     }
 
 public:
-    RobinHoodTable(size_t s) : size(s), table(s) {}
+    RobinHoodTable(size_t s,size_t limit = 0)
+    : size(s),
+      probe_limit((limit > 0) ? limit : (64 - __builtin_clzll(s)) * 2), 
+      table(s) {}
+
+    inline void prefetch(const Key& key) const noexcept { //prefetch to avoid cache misses
+        size_t hash_val = hash(key);
+        size_t base_index = hash_val & (size - 1);
+        __builtin_prefetch(&table[base_index], 0, 3);
+}
 
 
     void insert(const Key &key, size_t idx)
     {
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
+        size_t probes = 0;
         Key k = key;
         auto v = llvm::SmallVector<size_t,1>();//heap alloc
         v.push_back(idx);
         // check if the key already exists
         while (table[p].has_value())
         {
+            __builtin_prefetch(&table[(p + 1) & (size - 1)], 0, 3);
             if (table[p]->key == key)
             {
                 table[p]->indices.push_back(idx);
@@ -74,6 +87,7 @@ public:
             }
             p = (p + 1) & (size - 1);
             vpsl++;
+            probes++;
         }
         table[p] = Entry<Key>{k, vpsl, std::move(v)};
     }
@@ -85,32 +99,31 @@ public:
         size_t probes = 0;
         while (table[p].has_value())
         {
-            if (table[p]->key == key) {
-                return &table[p]->indices;
-            }
-            if (vpsl > table[p]->psl) {
-                return std::nullopt;
-            }
+            __builtin_prefetch(&table[(p + 1) & (size - 1)], 0, 3);
+            if (table[p]->key == key) {return &table[p]->indices;} // found
+            if (vpsl > table[p]->psl) {return std::nullopt;} //if psl's bigger than the psl of the current idx means it doesn't exist so return
+            probes++;
+            if(probes >= probe_limit) {return std::nullopt;} //if number of probes is > than the limit then return
             p = (p + 1) & (size - 1);
             vpsl++;
         }
         return std::nullopt;
     }
-    void diagnostic(){
-        for(size_t i = 0; i < size; i++){
-            if(table[i].has_value()){
-                std::cout<<"Table index: "<< i << "occupied by key: " << table[i]->key << "and has psl: "<< table[i]->psl <<std::endl;
-                std::cout<< " Bucket contains: " << std::endl;
+    // void diagnostic(){
+    //     for(size_t i = 0; i < size; i++){
+    //         if(table[i].has_value()){
+    //             std::cout<<"Table index: "<< i << "occupied by key: " << table[i]->key << "and has psl: "<< table[i]->psl <<std::endl;
+    //             std::cout<< " Bucket contains: " << std::endl;
 
-                auto bucket = &table[i]->indices;
-                for(auto value : *bucket){
-                    std::cout << "____" << value << std::endl;
-                }
+    //             auto bucket = &table[i]->indices;
+    //             for(auto value : *bucket){
+    //                 std::cout << "____" << value << std::endl;
+    //             }
                 
-            }else{
-                std::cout << "Table index: " << i << "empty " << std::endl;
-            }
-        }
-    }
-    size_t capacity() const{return table.size();}
+    //         }else{
+    //             std::cout << "Table index: " << i << "empty " << std::endl;
+    //         }
+    //     }
+    // }
+    // size_t capacity() const{return table.size();}
 };

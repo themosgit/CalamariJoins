@@ -9,7 +9,7 @@ TEST_CASE("RobinHood creating", "[robinhood]")
 {
     RobinHoodTable<int32_t> hash_table(10);
     REQUIRE((hash_table.capacity()) >= 10);
-    hash_table.diagnostic();
+    // hash_table.diagnostic();
 }
 
 TEST_CASE("RobinHood sequintial numbers", "[robinhood]")
@@ -26,7 +26,7 @@ TEST_CASE("RobinHood sequintial numbers", "[robinhood]")
         REQUIRE(result.value()->size() == 1);
         REQUIRE((*result.value())[0] == i);
     }
-    hash_table.diagnostic();
+    // hash_table.diagnostic();
 }
 TEST_CASE("RobinHOod functionality", "[robinhood]")
 { // check if indices are saved for each key and in the right order.
@@ -46,7 +46,7 @@ TEST_CASE("RobinHOod functionality", "[robinhood]")
         for (auto idx : (*bucket.value()))
             REQUIRE(idx == (j++));
     }
-    hash_table.diagnostic();
+    // hash_table.diagnostic();
 }
 TEST_CASE("RobinHood PSL functionality", "[robinhood]")
 {
@@ -59,7 +59,7 @@ TEST_CASE("RobinHood PSL functionality", "[robinhood]")
     hash_table.insert(17, 17);
     hash_table.insert(12, 12);
 
-    hash_table.diagnostic();
+    // hash_table.diagnostic();
 }
 TEST_CASE("RobinHood duplicate keys","[robinhood]"){
     RobinHoodTable<int32_t> hash_table(16);
@@ -74,7 +74,7 @@ TEST_CASE("RobinHood duplicate keys","[robinhood]"){
         REQUIRE(result.value()->size()==3);
         for(int j = 0; j < 3; ++j)  REQUIRE((*result.value())[j] == i* 100+ j);
     }
-    hash_table.diagnostic();
+    // hash_table.diagnostic();
 }
 
 TEST_CASE("RobinHood Missing key", "[robinhood]"){
@@ -83,6 +83,6 @@ TEST_CASE("RobinHood Missing key", "[robinhood]"){
     hash_table.insert(2,20);
 
     auto result = hash_table.search(99);
-    hash_table.diagnostic();
+    // hash_table.diagnostic();
 }
 

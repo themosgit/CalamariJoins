@@ -74,7 +74,7 @@ namespace Contest
             { // at least 40% empty but if build_table > result <<= 1 and us this result to build the hash_table
                 power_of_2 <<= 1;
             }
-            RobinHoodTable<T> hash_table(power_of_2);;
+            RobinHoodTable<T> hash_table(power_of_2);
 
             /*build hash table with the smaller table
              * iterate through table with record, idx is
