@@ -61,7 +61,9 @@ private:
         /* prefetch amount */
         constexpr size_t PREFETCH = 48;
         for (size_t i = 0; i < probe.size(); i++) {
+
             if (i + PREFETCH < probe.size()) {
+                __builtin_prefetch(&probe[i + PREFETCH], 0, 2);
                 if (auto* key = std::get_if<T>(&probe[i + PREFETCH][probe_col])) {
                     hash_table.prefetch(*key);
                 }
@@ -70,9 +72,18 @@ private:
             auto& probe_record = probe[i];
             if (auto* key = std::get_if<T>(&probe_record[probe_col])) {
                 auto indices = hash_table.find(*key);
-                for (auto build_idx : indices) {
-                    swap ? construct_result(build[build_idx], probe_record):
-                           construct_result(probe_record, build[build_idx]);
+
+                for (size_t j = 0; j < indices.size; j++) {
+                    if (j + 4 < indices.size) {
+                        size_t prefetch_index = indices.data[j + 4];
+                        if (prefetch_index < build.size()) {
+                            __builtin_prefetch(&build[prefetch_index], 0, 2);
+                        }
+                    }
+
+                    size_t build_index = indices.data[j];
+                    swap ? construct_result(build[build_index], probe_record):
+                           construct_result(probe_record, build[build_index]);
                 }
             } else if (!std::holds_alternative<std::monostate>(probe_record[probe_col])) {
                 throw std::runtime_error("wrong type of field on probe");
@@ -83,18 +94,30 @@ private:
 
     template <class T>
     void nested_loop_join() {
-        for (auto& build_record: build) {
-            auto* build_key = std::get_if<T>(&build_record[build_col]);
-            if (!build_key)
-                continue;
+        constexpr size_t BLOCK_SIZE = 256;
+
+        for (size_t build_start = 0; build_start < build.size(); build_start += BLOCK_SIZE) {
+            size_t build_end = std::min(build_start + BLOCK_SIZE, build.size());
+
             for (auto& probe_record: probe) {
                 auto* probe_key = std::get_if<T>(&probe_record[probe_col]);
                 if (!probe_key)
                     continue;
 
-                if (*build_key == *probe_key) {
-                    swap ? construct_result(build_record, probe_record) :
-                           construct_result(probe_record, build_record);
+                for (size_t i = build_start; i < build_end; i++) {
+                    if (i + 8 < build_end) {
+                        __builtin_prefetch(&build[i + 8], 0, 2);
+                    }
+
+                    auto& build_record = build[i];
+                    auto* build_key = std::get_if<T>(&build_record[build_col]);
+                    if (!build_key)
+                        continue;
+
+                    if (*build_key == *probe_key) {
+                        swap ? construct_result(build_record, probe_record) :
+                               construct_result(probe_record, build_record);
+                    }
                 }
             }
         }
