@@ -48,23 +48,7 @@ private:
     void hash_join() {
         namespace views = ranges::views;
         HopscotchHashTable<T> hash_table(build.size() * 1.8);
-        std::sort(build.begin(), build.end(), [&](const auto& record_a, const auto& record_b) {
-            const auto* key_a = std::get_if<T>(&record_a[build_col]);
-            const auto* key_b = std::get_if<T>(&record_b[build_col]);
-
-            /* compare keys taking in account if they are present */
-            if (key_a && key_b) {
-                return *key_a < *key_b;
-            }
-            if (key_a) {
-                return true; 
-            }
-            if (key_b) {
-                return false;
-            }
-            return false;
-        });
-        
+       
         /* build hash table from build table */
         for (auto&& [idx, record]: build | views::enumerate) {
             if (auto* key = std::get_if<T>(&record[build_col])) {
