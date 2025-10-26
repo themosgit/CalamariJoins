@@ -1,0 +1,47 @@
+name: Build and Test Repo
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository code
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y llvm-dev libzstd-dev llvm clang
+
+    - name: Configure initial build with CMake
+      run: |
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
+
+    - name: Build all targets
+      run: cmake --build build -- -j $(nproc) unit_tests hopscotch_tests cuckoo_tests
+
+
+    - name: Run unit tests
+      run: ./build/unit_tests
+
+    # --- Hopscotch Tests ---
+    - name: Run hopscotch tests
+      run: ./build/hopscotch_tests
+
+    # --- Cuckoo Tests ---
+    - name: Run cuckoo tests
+      run: ./build/cuckoo_tests
+
+    # --- Robinhood Tests ---
+    # - name: Run robin tests
+    #   run: ./build/robinhood_tests
