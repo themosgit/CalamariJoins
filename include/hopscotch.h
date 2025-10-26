@@ -28,19 +28,18 @@ private:
      *  32 bytes on the M1 proccesor cache line
      *  size is ta 128 bytes so we fit 4 buckets
      *  per cacheline
-     *
      **/
-    struct Bucket {
+
+     struct alignas(std::is_same_v<Key, int32_t> ? 32 : alignof(Key)) Bucket {
         uint64_t bitmask;
         Key key;
         uint32_t value_index;
         uint16_t count;
-        uint16_t _padding;
         bool occupied;
 
-        Bucket() : bitmask(EMPTY_MASK), value_index(0), count(0), _padding(0), occupied(false){}
+        Bucket() : bitmask(EMPTY_MASK), value_index(0), count(0), occupied(false){}
 
-    }__attribute__((aligned(64)));
+    };
 
 
 
@@ -145,7 +144,7 @@ private:
     
 public:
     explicit HopscotchHashTable(size_t size, const Hash& hash = Hash()) 
-        : capacity(0), hasher(hash) {
+        : capacity(0), value_store_size(0), hasher(hash) {
         static constexpr size_t MIN_CAPACITY = 64;
         static constexpr size_t MAX_CAPACITY = 1ULL << 62;
 
@@ -168,13 +167,29 @@ public:
         uint64_t bitmask = table[base_index].bitmask;
         uint64_t temp_mask = bitmask;
         while (temp_mask) {
-            size_t i = __builtin_ctzll(temp_mask);
+            int i = __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
             if (table[check_index].occupied && table[check_index].key == key) {
-                /* key found add value to vector */ 
+
+                size_t old_index = table[check_index].value_index;
+                size_t old_count = table[check_index].count;
+
                 value_store.push_back(item);
-                table[check_index].count++;
-                value_store_size++;
+
+                if (old_index + old_count == value_store_size) {
+                    table[check_index].count++;
+                    value_store_size++;
+                    return;
+                }
+
+                size_t new_index = value_store_size;
+                for (size_t j = 0; j < old_count; j++) {
+                    value_store.push_back(value_store[old_index + j]);
+                }
+
+                table[check_index].value_index = new_index;
+                table[check_index].count = old_count + 1;
+                value_store_size = value_store.size();
                 return;
             }
             /* clear bit */
@@ -246,7 +261,7 @@ public:
 
         /* bit scanning */
         while (bitmask) {
-            size_t i = __builtin_ctzll(bitmask);
+            int i = __builtin_ctzll(bitmask);
             size_t check_index = (base_index + i) & (capacity - 1);
 
             const Bucket& bucket = table[check_index];
