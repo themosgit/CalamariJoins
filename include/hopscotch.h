@@ -37,14 +37,13 @@ private:
          (sizeof(Key) <= 8) ? 32 : 64;
 
      struct alignas(BUCKET_SIZE) Bucket {
-        __uint128_t bitmask __attribute__((aligned(32)));
+        __uint128_t bitmask;
         Key key;
         uint32_t value_index;
         uint16_t count;
         bool occupied;
 
         Bucket() : bitmask(EMPTY_MASK), value_index(0), count(0), occupied(false){}
-
     };
 
 
@@ -74,6 +73,13 @@ private:
         h *= 0xc2b2ae3d27d4eb4fULL;
         h ^= h >> 29;
         return h;
+    }
+    __attribute__((always_inline))
+    inline int ctz128(__uint128_t bitmask) const noexcept {
+        uint64_t low = (uint64_t)bitmask;
+        if (low) return __builtin_ctzll(low);
+        uint64_t high = (uint64_t)(bitmask >> 64);
+        return high ? 64 + __builtin_ctzll(high) : 128;
     }
    
     /*find free bucket within search distance from current position*/
@@ -117,7 +123,7 @@ private:
                 
                 for (size_t j = H - 1; j > 0 && !found; --j){
                     /* check its bitmap position */
-                    if (bitmask & (1ULL << j)) {
+                    if (bitmask & ((__uint128_t)1 << j)) {
                         size_t item_index = (check_index + j) & (capacity - 1);
                         size_t new_dist = (free_index + capacity - check_index) & (capacity - 1);
                        /**
@@ -130,8 +136,8 @@ private:
                             table[item_index].occupied = false;
                             table[item_index].bitmask = EMPTY_MASK;
                             /* clears and sets proper bit map positions */
-                            table[check_index].bitmask &= ~(1ULL << j);
-                            table[check_index].bitmask |= (1ULL << new_dist);
+                            table[check_index].bitmask &= ~((__uint128_t)1 << j);
+                            table[check_index].bitmask |= ((__uint128_t)1 << new_dist);
                             
                             free_index = item_index;
                             found = true;
@@ -158,6 +164,8 @@ public:
             capacity = MIN_CAPACITY; 
         } else if (size > MAX_CAPACITY) {
             throw std::invalid_argument("Cannot build hash table of this size");
+        } else if (size < MIN_CAPACITY) {
+            capacity = MIN_CAPACITY;
         } else {
             /* calculate next power of 2 */
             capacity = 1ULL << (64 - __builtin_clzll(size - 1));
@@ -173,9 +181,9 @@ public:
         __uint128_t bitmask = table[base_index].bitmask;
         __uint128_t temp_mask = bitmask;
         while (temp_mask) {
-            int i = __builtin_ctzll(temp_mask);
+            int i = ctz128(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
-            if (table[check_index].occupied && table[check_index].key == key) {
+            if (table[check_index].key == key) {
 
                 size_t old_index = table[check_index].value_index;
                 size_t old_count = table[check_index].count;
@@ -233,7 +241,7 @@ public:
         
 
         table[free_index].occupied = true;
-        table[base_index].bitmask |= (1ULL << dist);
+        table[base_index].bitmask |= ((__uint128_t)1 << dist);
     }
 
 
@@ -267,7 +275,7 @@ public:
 
         /* bit scanning */
         while (bitmask) {
-            int i = __builtin_ctzll(bitmask);
+            int i = ctz128(bitmask);
             size_t check_index = (base_index + i) & (capacity - 1);
 
             const Bucket& bucket = table[check_index];
