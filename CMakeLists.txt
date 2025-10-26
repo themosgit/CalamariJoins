@@ -89,6 +89,7 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
 endif()
 
 # Targets
+add_executable(robinhood_tests ${SIGMODPC_SRC} tests/robinhood_tests.cpp)
 add_executable(run ${SIGMODPC_SRC} tests/read_sql.cpp)
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
 add_executable(build_database tests/build_database.cpp)
@@ -132,3 +133,7 @@ target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain
 target_include_directories(unit_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(unit_tests PRIVATE ${LLVM_DEFINITIONS})
 target_link_libraries(unit_tests PRIVATE ${llvm_libs})
+target_link_libraries(robinhood_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(robinhood_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(robinhood_tests PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(robinhood_tests PRIVATE ${llvm_libs})

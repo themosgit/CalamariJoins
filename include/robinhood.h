@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <functional>
 #include <llvm/ADT/SmallVector.h>
-
+#include <iostream>
 /*
 Robin hood hashing algorithm: the idea behind this hashing algorithm is
 to keep the psl(probe sequence lenght) as low as possible.
@@ -32,7 +32,7 @@ template <typename Key>
 class RobinHoodTable
 {
 private:
-    std::vector<std::optional<Entry<Key>>> table; //allows empty slots without wasting memory
+    std::vector<std::optional<Entry<Key>>> table;//allows empty slots without wasting memory
     size_t size;
     size_t hash(const Key &key) const
     {
@@ -48,6 +48,7 @@ private:
 
 public:
     RobinHoodTable(size_t s) : size(s), table(s) {}
+
 
     void insert(const Key &key, size_t idx)
     {
@@ -81,14 +82,13 @@ public:
     {
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
+        size_t probes = 0;
         while (table[p].has_value())
         {
-            if (table[p]->key == key)
-            {
+            if (table[p]->key == key) {
                 return &table[p]->indices;
             }
-            if (vpsl > table[p]->psl)
-            {
+            if (vpsl > table[p]->psl) {
                 return std::nullopt;
             }
             p = (p + 1) & (size - 1);
@@ -96,4 +96,21 @@ public:
         }
         return std::nullopt;
     }
+    void diagnostic(){
+        for(size_t i = 0; i < size; i++){
+            if(table[i].has_value()){
+                std::cout<<"Table index: "<< i << "occupied by key: " << table[i]->key << "and has psl: "<< table[i]->psl <<std::endl;
+                std::cout<< " Bucket contains: " << std::endl;
+
+                auto bucket = &table[i]->indices;
+                for(auto value : *bucket){
+                    std::cout << "____" << value << std::endl;
+                }
+                
+            }else{
+                std::cout << "Table index: " << i << "empty " << std::endl;
+            }
+        }
+    }
+    size_t capacity() const{return table.size();}
 };
