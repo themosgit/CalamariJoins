@@ -174,8 +174,8 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
             } else {
                 return execute_scan(plan, value, node.output_attrs);
             }
-        }
-    );
+        },
+    node.data);
 }
 
 ColumnarTable execute(const Plan& plan, void* context) {
