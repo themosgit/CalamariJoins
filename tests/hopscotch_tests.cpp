@@ -1,5 +1,4 @@
 #include <catch2/catch_test_macros.hpp>
-
 #include <cstdint>
 #include <table.h>
 #include <plan.h>
@@ -8,7 +7,6 @@
 TEST_CASE("Hopscotch creation", "[hopscotch]") {
     HopscotchHashTable<int32_t> hash_table(10);
     REQUIRE(hash_table.size() >= 10);
-    hash_table.diagnostic();
 }
 
 TEST_CASE("Hopscotch basic insertion", "[hopscotch]") {
