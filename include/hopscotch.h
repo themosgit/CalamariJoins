@@ -11,11 +11,13 @@
 #include <stdexcept>
 #include <bitset>
 
+
 template <typename Key, typename Hash = std::hash<Key>>
 class HopscotchHashTable {
 private:
     static constexpr size_t H = 128;
-    static constexpr uint128_t EMPTY_MASK = 0;
+
+    static constexpr __uint128_t EMPTY_MASK = 0;
 
     /**
      *  first is the bit mask of the bucket
@@ -30,8 +32,12 @@ private:
      *  per cacheline
      **/
 
-     struct alignas(std::is_same_v<Key, int32_t> ? 32 : alignof(Key)) Bucket {
-        uint128_t bitmask;
+     inline static constexpr size_t BUCKET_SIZE =
+         (sizeof(Key) <=4) ? 32 :
+         (sizeof(Key) <= 8) ? 32 : 64;
+
+     struct alignas(BUCKET_SIZE) Bucket {
+        __uint128_t bitmask __attribute__((aligned(32)));
         Key key;
         uint32_t value_index;
         uint16_t count;
@@ -107,7 +113,7 @@ private:
                 
                 if (!table[check_index].occupied) continue;
                 
-                uint64_t bitmask = table[check_index].bitmask;
+                __uint128_t bitmask = table[check_index].bitmask;
                 
                 for (size_t j = H - 1; j > 0 && !found; --j){
                     /* check its bitmap position */
@@ -164,8 +170,8 @@ public:
         size_t base_index = hash_val & (capacity - 1);
         
         /* check if key has already been inserted */ 
-        uint64_t bitmask = table[base_index].bitmask;
-        uint64_t temp_mask = bitmask;
+        __uint128_t bitmask = table[base_index].bitmask;
+        __uint128_t temp_mask = bitmask;
         while (temp_mask) {
             int i = __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
@@ -255,7 +261,7 @@ public:
 
         __builtin_prefetch(&table[base_index], 0 , 3);
         /* find the value based on the bitmap */
-        uint64_t bitmask = table[base_index].bitmask;
+        __uint128_t bitmask = table[base_index].bitmask;
         if (bitmask == 0)
             return {nullptr, 0};
 
