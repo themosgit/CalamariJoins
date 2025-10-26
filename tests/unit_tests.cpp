@@ -8,83 +8,11 @@ void sort(std::vector<std::vector<Data>>& table) {
     std::sort(table.begin(), table.end());
 }
 
-// =================================================================================
-// New CuckooTable Specific Tests
-// =================================================================================
 /*
-TEST_CASE("CuckooTable Basic Insert and Search", "[cuckoo]") {
-    CuckooTable<TableEntity> table(10);
-    TableEntity key1{"t1", 1};
-    TableEntity key2{"t2", 2};
-    
-    // Insert first key
-    table.insert(key1, 100);
-    
-    // Search for first key
-    auto result1 = table.search(key1);
-    REQUIRE(result1.has_value());
-    REQUIRE(result1.value()->size() == 1);
-    REQUIRE(result1.value()->at(0) == 100);
-
-    // Insert second key
-    table.insert(key2, 200);
-
-    // Search for second key
-    auto result2 = table.search(key2);
-    REQUIRE(result2.has_value());
-    REQUIRE(result2.value()->size() == 1);
-    REQUIRE(result2.value()->at(0) == 200);
-
-    // Search for non-existent key
-    TableEntity key3{"t3", 3};
-    auto result3 = table.search(key3);
-    REQUIRE_FALSE(result3.has_value());
-}
-
-TEST_CASE("CuckooTable Duplicate Key Handling", "[cuckoo]") {
-    CuckooTable<TableEntity> table(10);
-    TableEntity key1{"t1", 1};
-    
-    // Insert with first index
-    table.insert(key1, 100);
-    
-    // Insert with second index (should append)
-    table.insert(key1, 101);
-    
-    // Insert with third index (should append)
-    table.insert(key1, 102);
-
-    auto result = table.search(key1);
-    REQUIRE(result.has_value());
-    REQUIRE(result.value()->size() == 3);
-    REQUIRE(result.value()->at(0) == 100);
-    REQUIRE(result.value()->at(1) == 101);
-    REQUIRE(result.value()->at(2) == 102);
-}
-
-TEST_CASE("CuckooTable Rehash Implicit Test (Many Inserts)", "[cuckoo]") {
-    // Start with a small table, forcing rehashes. Capacity will be max(1, 10/2) = 5 per table.
-    CuckooTable<int> table(10); 
-    size_t num_inserts = 100;
-    
-    // Insert many unique keys. If the insert logic or rehash is broken, this will fail.
-    for (int i = 0; i < num_inserts; ++i) {
-        table.insert(i, i);
-    }
-    
-    // Verify all keys are present
-    for (int i = 0; i < num_inserts; ++i) {
-        auto result = table.search(i);
-        REQUIRE(result.has_value());
-        REQUIRE(result.value()->size() == 1);
-        REQUIRE(result.value()->at(0) == (size_t)i);
-    }
-}
+*
+* Default tests
+*
 */
-// =================================================================================
-// Existing Join Tests
-// =================================================================================
-
 TEST_CASE("Empty join", "[join]") {
     Plan plan;
     plan.new_scan_node(0, {{0, DataType::INT32}});
