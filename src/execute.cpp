@@ -11,7 +11,7 @@ namespace Contest {
 
 using ExecuteResult = std::vector<std::vector<Data>>;
 
-ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
+ExecuteResult execute_impl(const Plan &plan, size_t node_idx);
 
 struct JoinAlgorithm {
     bool                                             build_left;
@@ -175,7 +175,7 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
                 return execute_scan(plan, value, node.output_attrs);
             }
         },
-        node.data);
+    node.data);
 }
 
 ColumnarTable execute(const Plan& plan, void* context) {
@@ -188,7 +188,7 @@ ColumnarTable execute(const Plan& plan, void* context) {
     return table.to_columnar();
 }
 
-void* build_context() {
+void *build_context() {
     return nullptr;
 }
 
