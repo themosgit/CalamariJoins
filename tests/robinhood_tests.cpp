@@ -12,7 +12,7 @@ TEST_CASE("RobinHood creating", "[robinhood]")
     // hash_table.diagnostic();
 }
 
-TEST_CASE("RobinHood sequintial numbers", "[robinhood]")
+TEST_CASE("RobinHood sequential numbers", "[robinhood]")
 {
     RobinHoodTable<int32_t> hash_table(256); // use only power of 2 cause of hash_func
     for (size_t i = 0; i < 150; ++i)
@@ -28,7 +28,7 @@ TEST_CASE("RobinHood sequintial numbers", "[robinhood]")
     }
     // hash_table.diagnostic();
 }
-TEST_CASE("RobinHOod functionality", "[robinhood]")
+TEST_CASE("RobinHood functionality", "[robinhood]")
 { // check if indices are saved for each key and in the right order.
     RobinHoodTable<int32_t> hash_table(128);
     for (int i = 0; i < 10; i++)

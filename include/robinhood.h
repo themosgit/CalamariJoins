@@ -54,6 +54,10 @@ public:
       probe_limit((limit > 0) ? limit : (64 - __builtin_clzll(s)) * 2), 
       table(s) {}
 
+    const size_t capacity(void) {
+        return size;
+    }
+
     inline void prefetch(const Key& key) const noexcept { //prefetch to avoid cache misses
         size_t hash_val = hash(key);
         size_t base_index = hash_val & (size - 1);
@@ -75,7 +79,7 @@ public:
             __builtin_prefetch(&table[(p + 1) & (size - 1)], 0, 3);
             if (table[p]->key == key)
             {
-                table[p]->indices.push_back(idx);
+                table[p]->indices.push_back(idx); //push it to the end of the vec
                 return;
             }
             // if entry has smaller psl swap
@@ -85,11 +89,11 @@ public:
                 std::swap(v, table[p]->indices);
                 std::swap(vpsl, table[p]->psl);
             }
-            p = (p + 1) & (size - 1);
+            p = (p + 1) & (size - 1); //liner probing
             vpsl++;
             probes++;
         }
-        table[p] = Entry<Key>{k, vpsl, std::move(v)};
+        table[p] = Entry<Key>{k, vpsl, std::move(v)}; // if it's empty insert
     }
 
     std::optional<llvm::SmallVector<size_t,1> *> search(const Key &key)
@@ -104,26 +108,10 @@ public:
             if (vpsl > table[p]->psl) {return std::nullopt;} //if psl's bigger than the psl of the current idx means it doesn't exist so return
             probes++;
             if(probes >= probe_limit) {return std::nullopt;} //if number of probes is > than the limit then return
+
             p = (p + 1) & (size - 1);
             vpsl++;
         }
         return std::nullopt;
     }
-    // void diagnostic(){
-    //     for(size_t i = 0; i < size; i++){
-    //         if(table[i].has_value()){
-    //             std::cout<<"Table index: "<< i << "occupied by key: " << table[i]->key << "and has psl: "<< table[i]->psl <<std::endl;
-    //             std::cout<< " Bucket contains: " << std::endl;
-
-    //             auto bucket = &table[i]->indices;
-    //             for(auto value : *bucket){
-    //                 std::cout << "____" << value << std::endl;
-    //             }
-                
-    //         }else{
-    //             std::cout << "Table index: " << i << "empty " << std::endl;
-    //         }
-    //     }
-    // }
-    // size_t capacity() const{return table.size();}
 };
