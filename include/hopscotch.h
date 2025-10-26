@@ -14,8 +14,8 @@
 template <typename Key, typename Hash = std::hash<Key>>
 class HopscotchHashTable {
 private:
-    static constexpr size_t H = 64;
-    static constexpr uint64_t EMPTY_MASK = 0;
+    static constexpr size_t H = 128;
+    static constexpr uint128_t EMPTY_MASK = 0;
 
     /**
      *  first is the bit mask of the bucket
@@ -31,7 +31,7 @@ private:
      **/
 
      struct alignas(std::is_same_v<Key, int32_t> ? 32 : alignof(Key)) Bucket {
-        uint64_t bitmask;
+        uint128_t bitmask;
         Key key;
         uint32_t value_index;
         uint16_t count;
@@ -86,7 +86,7 @@ private:
     /* get a free bucket within H positions*/
     bool relocate(size_t &free_index, size_t target_index) {
         /* relocation attempt limit */
-        static constexpr size_t MAX_DEPTH = 128;
+        static constexpr size_t MAX_DEPTH = 256;
         
         for (size_t depth = 0; depth < MAX_DEPTH; ++depth) {
             size_t dist = (free_index + capacity - target_index) & (capacity - 1);
@@ -298,7 +298,7 @@ public:
             if (table[i].occupied) {
                 std::cout << "Table index: " << i << " occupied by key: " << table[i].key << std::endl;
                 std::cout << "Storage index: " << table[i].value_index << " Storage count: " << table[i].count << std::endl;
-                std::bitset<64> bitmask(table[i].bitmask);
+                std::bitset<128> bitmask(table[i].bitmask);
                 std::cout << "Bitmap: " << bitmask << std::endl;
                 std::cout << "  Bucket contains:" << std::endl;
                 int index = table[i].value_index;
