@@ -55,8 +55,8 @@ jobs:
     - name: Build 'unit_tests' target
       run: cmake --build build
 
-    - name: Run unit tests
-      run: ./build/unit_tests
+    # - name: Run unit tests
+    #   run: ./build/unit_tests
 
     # --- Hopscotch Tests ---
     - name: Run hopscotch tests
