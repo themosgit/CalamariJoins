@@ -43,5 +43,5 @@ jobs:
       run: ./build/cuckoo_tests
 
     # --- Robinhood Tests ---
-    # - name: Run robin tests
-    #   run: ./build/robinhood_tests
+    - name: Run robin tests
+      run: ./build/robinhood_tests
