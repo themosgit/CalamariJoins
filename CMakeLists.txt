@@ -112,12 +112,15 @@ list(REMOVE_ITEM CUCKOO_SRC
 #    clang++-18: error: unsupported option '-march=' for target 'powerpc64le-unknown-linux-gnu'
 # This flag works on other Power systems, but for now, we disable march=native on all Power machines.
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
-    add_compile_options(-march=native)
+    add_compile_options(-march=native -O2)
 endif()
 
 # Targets
+add_executable(run ${SIGMODPC_SRC} tests/read_sql.cpp)
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
 add_executable(hopscotch_tests ${HOPSCOTCH_SRC} tests/hopscotch_tests.cpp)
+add_executable(robinhood_tests ${ROBINHOOD_SRC} tests/robinhood_tests.cpp)
+add_executable(cuckoo_tests ${CUCKOO_SRC} tests/cuckoo_tests.cpp)
 add_executable(build_database tests/build_database.cpp)
 
 # For all executables
@@ -173,7 +176,17 @@ target_include_directories(unit_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(unit_tests PRIVATE ${LLVM_DEFINITIONS})
 target_link_libraries(unit_tests PRIVATE ${llvm_libs})
 
+target_link_libraries(robinhood_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(robinhood_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(robinhood_tests PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(robinhood_tests PRIVATE ${llvm_libs})
+
 target_link_libraries(hopscotch_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(hopscotch_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(hopscotch_tests PRIVATE ${LLVM_DEFINITIONS})
 target_link_libraries(hopscotch_tests PRIVATE ${llvm_libs})
+
+target_link_libraries(cuckoo_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(cuckoo_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(cuckoo_tests PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(cuckoo_tests PRIVATE ${llvm_libs})

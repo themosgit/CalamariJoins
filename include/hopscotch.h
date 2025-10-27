@@ -46,7 +46,6 @@ private:
     };
 
 
-
     std::vector<Bucket> table;
     std::vector<size_t> value_store;
     size_t capacity;
