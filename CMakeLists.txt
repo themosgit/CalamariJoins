@@ -7,12 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 Include(FetchContent)
-
-FetchContent_Declare(
-    Catch2
-    URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.8.0.tar.gz
-)
-
+FetchContent_Declare( Catch2 URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.8.0.tar.gz)
 FetchContent_MakeAvailable(Catch2)
 
 FetchContent_Declare(
@@ -28,6 +23,7 @@ FetchContent_Declare(
     re2
     URL https://github.com/google/re2/releases/download/2024-07-02/re2-2024-07-02.tar.gz
 )
+
 
 FetchContent_MakeAvailable(re2)
 
@@ -111,7 +107,9 @@ list(REMOVE_ITEM CUCKOO_SRC
 # Use march=native for all but Power servers, which results in the following error:
 #    clang++-18: error: unsupported option '-march=' for target 'powerpc64le-unknown-linux-gnu'
 # This flag works on other Power systems, but for now, we disable march=native on all Power machines.
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
+    add_compile_options(-O3 -mcpu=apple-m1)
+else()
     add_compile_options(-march=native -O2)
 endif()
 
@@ -135,9 +133,9 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(build_cache PRIVATE TEAMOPT_USE_DUCKDB TEAMOPT_BUILD_CACHE)
     target_include_directories(build_cache PRIVATE include)
 
-    add_executable(base_fast ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_link_libraries(base_fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(base_fast PRIVATE include)
+    add_executable(fast ${SIGMODPC_SRC} tests/read_sql.cpp)
+    target_link_libraries(fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(fast PRIVATE include)
 
     add_executable(hopscotch ${HOPSCOTCH_SRC} tests/read_sql.cpp)
     target_link_libraries(hopscotch PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
@@ -153,14 +151,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
 
 
     target_compile_definitions(build_cache PRIVATE ${LLVM_DEFINITIONS})
-    target_compile_definitions(base_fast PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(fast PRIVATE ${LLVM_DEFINITIONS})
     target_compile_definitions(cuckoo PRIVATE ${LLVM_DEFINITIONS})
     target_compile_definitions(hopscotch PRIVATE ${LLVM_DEFINITIONS})
     target_compile_definitions(robinhood PRIVATE ${LLVM_DEFINITIONS})
 
     llvm_map_components_to_libnames(llvm_libs support core)
     target_link_libraries(build_cache PRIVATE ${llvm_libs})
-    target_link_libraries(base_fast PRIVATE ${llvm_libs})
+    target_link_libraries(fast PRIVATE ${llvm_libs})
     target_link_libraries(cuckoo PRIVATE ${llvm_libs})
     target_link_libraries(hopscotch PRIVATE ${llvm_libs})
     target_link_libraries(robinhood PRIVATE ${llvm_libs})
