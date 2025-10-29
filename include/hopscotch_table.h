@@ -212,6 +212,7 @@ public:
         }
         table.resize(capacity);
         value_store.reserve(size / 2);
+        segments.reserve(size / 4);
     }
 
     void insert(const Key& key, uint32_t item) {
