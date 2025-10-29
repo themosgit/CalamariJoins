@@ -149,42 +149,25 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(cuckoo PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(cuckoo PRIVATE include)
 
-
-    target_compile_definitions(build_cache PRIVATE ${LLVM_DEFINITIONS})
-    target_compile_definitions(fast PRIVATE ${LLVM_DEFINITIONS})
-    target_compile_definitions(cuckoo PRIVATE ${LLVM_DEFINITIONS})
-    target_compile_definitions(hopscotch PRIVATE ${LLVM_DEFINITIONS})
+    #llvm support for smallVector
     target_compile_definitions(robinhood PRIVATE ${LLVM_DEFINITIONS})
-
     llvm_map_components_to_libnames(llvm_libs support core)
-    target_link_libraries(build_cache PRIVATE ${llvm_libs})
-    target_link_libraries(fast PRIVATE ${llvm_libs})
-    target_link_libraries(cuckoo PRIVATE ${llvm_libs})
-    target_link_libraries(hopscotch PRIVATE ${llvm_libs})
     target_link_libraries(robinhood PRIVATE ${llvm_libs})
 endif()
 
 target_link_libraries(build_database PRIVATE fmt duckdb)
-target_include_directories(build_database PRIVATE include ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(build_database PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(build_database PRIVATE ${llvm_libs})
+target_include_directories(build_database PRIVATE include)
 
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(unit_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(unit_tests PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(unit_tests PRIVATE ${llvm_libs})
+target_include_directories(unit_tests PRIVATE include)
+
+target_link_libraries(hopscotch_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(hopscotch_tests PRIVATE include)
+
+target_link_libraries(cuckoo_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(cuckoo_tests PRIVATE include)
 
 target_link_libraries(robinhood_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(robinhood_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(robinhood_tests PRIVATE ${LLVM_DEFINITIONS})
 target_link_libraries(robinhood_tests PRIVATE ${llvm_libs})
-
-target_link_libraries(hopscotch_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(hopscotch_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(hopscotch_tests PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(hopscotch_tests PRIVATE ${llvm_libs})
-
-target_link_libraries(cuckoo_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(cuckoo_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(cuckoo_tests PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(cuckoo_tests PRIVATE ${llvm_libs})

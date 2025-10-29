@@ -7,7 +7,7 @@
 
 #include <plan.h>
 #include <table.h>
-#include <hopscotch.h>
+#include <hopscotch_table.h>
 
 namespace Contest {
 
@@ -52,7 +52,7 @@ private:
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-        HopscotchHashTable<T> hash_table(build.size() * 1.8);
+        HopscotchHashTable<T> hash_table(build.size() * 2);
        
         /* build hash table from build table */
         for (auto&& [idx, record]: build | views::enumerate) {
@@ -70,8 +70,7 @@ private:
             __builtin_prefetch(&probe_record + 128, 0, 2);
             if (auto* key = std::get_if<T>(&probe_record[probe_col])) {
                 auto indices = hash_table.find(*key);
-                for (size_t j = 0; j < indices.size; j++) {
-                    size_t build_index = indices.data[j];
+                for (size_t build_index : indices) {
                     swap ? construct_result(build[build_index], probe_record) :
                            construct_result(probe_record, build[build_index]);
                 }
