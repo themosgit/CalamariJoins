@@ -60,14 +60,7 @@ private:
         /* the deafault unordered map hash table T is for the datatype key
          * see execute_hash_join for further details and the vector is there
          * to allow for buckets on collisions*/
-        size_t build_size= build.size();
-        build_size = build_size ? build_size : 1;//handle empty table
-        size_t power_of_2 = 1; //use it to keep powerof2's
-        while(power_of_2 * 0.60 < build_size){ // at least 40% empty but if build_table > result <<= 1 and us this result to build the hash_table
-            power_of_2 <<= 1;
-        }
-        RobinHoodTable<T> hash_table(power_of_2);
-
+        RobinHoodTable<T> hash_table(build.size());
         /*build hash table with the smaller table
          * iterate through table with record, idx is
          * created by views::enumerate as an index*/
@@ -105,12 +98,12 @@ private:
                     /*if the are the same continue else throw exception */
                     if constexpr (std::is_same_v<Tk, T>) {
                         /*get index from the hash table*/
-                        auto result = hash_table.search(key);
+                        auto indices = hash_table.find(key);
                         /*if the key is not found exit the lambda*/
-                        if (!result.has_value()) return;
+                        if (!indices) return;
                         /*because of linear probing we iterate
                          * through the vector*/
-                        for (auto build_idx: **result) {
+                        for (auto build_idx: *indices) {
                             /*swap left and right if the have
                              * been swapped on function call 
                              * this is done to provide a valid result*/
