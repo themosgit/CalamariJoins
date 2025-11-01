@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <table.h>
 #include <plan.h>
-#include <hopscotch_table.h>
+#include <hopscotch.h>
 
 TEST_CASE("Hopscotch creation", "[hopscotch]") {
     HopscotchHashTable<int32_t> hash_table(10);

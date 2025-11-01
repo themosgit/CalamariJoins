@@ -1,110 +1,121 @@
 #pragma once
+
+#if defined(__x86_64__)
+    #include  <immintrin.h>
+#endif
+
 #include <vector>
-#include <optional>
 #include <cstddef>
 #include <functional>
-#include <llvm/ADT/SmallVector.h>
-#include <iostream>
-#include <stdexcept>
+#include <cstdint>
+#include <hashtable_structs.h>
+
 /*
 Robin hood hashing algorithm: the idea behind this hashing algorithm is
-to keep the psl(probe sequence lenght) as low as possible.
+to keep the psl(probe sequence length) as low as possible.
 Psl is the distance from key's ideal position to actual position.
-on collision if new key has higher psl than existing key,they swap positions
+on collision if new key has higher psl than existing key, they swap positions
 this keeps the variance low and search fast
 
-
+Enhanced with value store and segment logic for efficient duplicate key handling
 */
 
 
 template <typename Key>
-
-struct Entry
-{
+struct Entry {
     Key key;
     size_t psl;
-    llvm::SmallVector<size_t,1> indices; //small vector to avoid heap alocation for 1 bucket(keep it in stack instead)
-    Entry() : psl(0) {}
-    Entry(Key k, size_t p, llvm::SmallVector<size_t,1> idx)
-        : key(k),psl(p), indices(std::move(idx)) {} 
+    uint32_t first_segment;
+    uint32_t last_segment;
+    uint16_t count;
+    
+    Entry() : psl(0), first_segment(0), last_segment(UINT32_MAX), count(0) {}
+    Entry(Key k, size_t p, uint32_t item)
+        : key(k), psl(p), first_segment(0), last_segment(item), count(1) {}
 };
-        
 
-template <typename Key>
-class RobinHoodTable
-{
+template <typename Key, typename Hash = std::hash<Key>>
+class RobinHoodTable {
 private:
     size_t size;
     std::vector<Entry<Key>> table;
-    size_t hash(const Key &key) const{
-        size_t h =  std::hash<Key>{}(key); //hash mixing with MurmurHash3 finalizer for better distribution
-        h ^= h >> 33; //
-        h *= 0xff51afd7ed558ccdULL;
-        h ^= h >> 33;
-        h *= 0xc4ceb9fe1a85ec53ULL;
-        h ^= h >> 33;
-    return h;
+    std::vector<uint32_t> value_store;
+    std::vector<Segment> segments;
+    Hash hasher;
+    
+    inline size_t hash(const Key& key) const noexcept {
+        if constexpr (std::is_same_v<Key, int32_t>)
+            return hash_int32(key);
+        return hasher(key);
     }
 
-public:
-    RobinHoodTable(size_t build_size){
-        //keep size table to size of 2's for faster hash function
-        build_size = build_size ? build_size : 1;
-        size_t power_of_2 = 1;
-        while(power_of_2 * 0.60 < build_size) power_of_2 <<= 1;
-        size = power_of_2;
-        table.resize(size);
+    static inline size_t hash_int32(int32_t key) noexcept {
+        #if defined(__aarch64__)
+            return __builtin_arm_crc32w(key, 0);
+        #elif defined(__x86_64__)
+            return __builtin_ia32_crc32di(key, 0);
+        #endif
     }
-    
+public:
+    RobinHoodTable(size_t build_size, const Hash& hash = Hash()) {
+        build_size = build_size ? build_size : 1;
+        size = 1ULL << (64 - __builtin_clzll(build_size - 1));
+        table.resize(size);
+        value_store.reserve(build_size / 2);
+        segments.reserve(build_size / 4);
+    }
 
     const size_t capacity(void) {
         return size;
     }
 
-    inline void prefetch(const Key& key) const noexcept { //prefetch to avoid cache misses
-        size_t hash_val = hash(key);
-        size_t base_index = hash_val & (size - 1);
-        __builtin_prefetch(&table[base_index], 0, 3);
-}
-
-
-    void insert(const Key &key, size_t idx){
-
+    void insert(const Key &key, uint32_t idx) {
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
-        Key k = key;
-        auto v = llvm::SmallVector<size_t,1>();
-        v.push_back(idx);
-        // check if the key already exists
-        while (!table[p].indices.empty()){
-            __builtin_prefetch(&table[(p + 1) & (size - 1)], 0, 3);
-            if (table[p].key == key){
-                table[p].indices.push_back(idx); //push it to the end of the vec
+        // Check if the key already exists
+        size_t search_p = p;
+        size_t search_psl = 0;
+        while (table[search_p].count > 0) {
+            if (table[search_p].key == key) {
+                insert_duplicate(table[search_p], idx,
+                        value_store, segments);
                 return;
             }
-            // if entry has smaller psl swap
-            if (vpsl > table[p].psl){
-                std::swap(k, table[p].key);
-                std::swap(v, table[p].indices);
-                std::swap(vpsl, table[p].psl);
+            if (search_psl > table[search_p].psl) break;
+            search_p = (search_p + 1) & (size - 1);
+            search_psl++;
+        }
+        // New key - need to insert
+        Key k = key;
+        Entry<Key> entry_to_insert(key, vpsl, idx);
+        while (table[p].count > 0) {
+            if (entry_to_insert.psl > table[p].psl) {
+                std::swap(entry_to_insert, table[p]);
             }
             p = (p + 1) & (size - 1);
-            vpsl++;
+            entry_to_insert.psl++;
         }
-        table[p] = Entry<Key>{k, vpsl, std::move(v)}; // if it's empty insert
+        table[p] = std::move(entry_to_insert);
     }
 
-    llvm::SmallVector<size_t,1>* find(const Key &key){
+    ValueSpan<Key> find(const Key &key) const noexcept {
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
-        while (!table[p].indices.empty()){
-            __builtin_prefetch(&table[(p + 1) & (size - 1)], 0, 3);
-            if (table[p].key == key) return &table[p].indices; // found
-            if (vpsl > table[p].psl) break; //if psl's bigger than the psl of the current idx means it doesn't exist so return
-
+        while (table[p].count > 0) {
+            if (table[p].key == key) {
+                const Entry<Key>& entry = table[p];
+                if (entry.count == 1) {
+                    return { nullptr, nullptr,
+                        entry.last_segment, entry.count };
+                }
+                return { &value_store, &segments,
+                    entry.first_segment, entry.count };
+            }
+            
+            if (vpsl > table[p].psl) break;
             p = (p + 1) & (size - 1);
             vpsl++;
         }
-        return nullptr; //not found
+        return {nullptr, nullptr, UINT32_MAX, 0};
     }
 };

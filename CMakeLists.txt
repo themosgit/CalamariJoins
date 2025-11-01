@@ -78,31 +78,14 @@ file(GLOB ALL_SRC
 
 set(SIGMODPC_SRC ${ALL_SRC})
 list(REMOVE_ITEM SIGMODPC_SRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_cuckoo.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_opt.cpp"
 )
 
-set(HOPSCOTCH_SRC ${ALL_SRC})
-list(REMOVE_ITEM HOPSCOTCH_SRC 
+set(MANOLATES_SRC ${ALL_SRC})
+list(REMOVE_ITEM MANOLATES_SRC 
     "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_cuckoo.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
 )
 
-set(ROBINHOOD_SRC ${ALL_SRC})
-list(REMOVE_ITEM ROBINHOOD_SRC 
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_cuckoo.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
-)
-
-set(CUCKOO_SRC ${ALL_SRC})
-list(REMOVE_ITEM CUCKOO_SRC 
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_hopscotch.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_robinhood.cpp"
-)
 # Enable server-specific compiler optimizations.
 # Use march=native for all but Power servers, which results in the following error:
 #    clang++-18: error: unsupported option '-march=' for target 'powerpc64le-unknown-linux-gnu'
@@ -110,15 +93,15 @@ list(REMOVE_ITEM CUCKOO_SRC
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
     add_compile_options(-O3 -mcpu=apple-m1)
 else()
-    add_compile_options(-march=native -O2)
+    add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive)
 endif()
 
 # Targets
 add_executable(run ${SIGMODPC_SRC} tests/read_sql.cpp)
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
-add_executable(hopscotch_tests ${HOPSCOTCH_SRC} tests/hopscotch_tests.cpp)
-add_executable(robinhood_tests ${ROBINHOOD_SRC} tests/robinhood_tests.cpp)
-add_executable(cuckoo_tests ${CUCKOO_SRC} tests/cuckoo_tests.cpp)
+add_executable(hopscotch_tests ${MANOLATES_SRC} tests/hopscotch_tests.cpp)
+add_executable(robinhood_tests ${MANOLATES_SRC} tests/robinhood_tests.cpp)
+add_executable(cuckoo_tests ${MANOLATES_SRC} tests/cuckoo_tests.cpp)
 add_executable(build_database tests/build_database.cpp)
 
 # For all executables
@@ -134,25 +117,40 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_include_directories(build_cache PRIVATE include)
 
     add_executable(fast ${SIGMODPC_SRC} tests/read_sql.cpp)
+    target_compile_definitions(fast PRIVATE HASHTABLE=0)
     target_link_libraries(fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(fast PRIVATE include)
 
-    add_executable(hopscotch ${HOPSCOTCH_SRC} tests/read_sql.cpp)
+    add_executable(hopscotch_base ${SIGMODPC_SRC} tests/read_sql.cpp)
+    target_compile_definitions(hopscotch_base PRIVATE HASHTABLE=1)
+    target_link_libraries(hopscotch_base PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(hopscotch_base PRIVATE include)
+
+    add_executable(robinhood_base ${SIGMODPC_SRC} tests/read_sql.cpp)
+    target_compile_definitions(robinhood_base PRIVATE HASHTABLE=2)
+    target_link_libraries(robinhood_base PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(robinhood_base PRIVATE include)
+
+    add_executable(cuckoo_base ${SIGMODPC_SRC} tests/read_sql.cpp)
+    target_compile_definitions(cuckoo_base PRIVATE HASHTABLE=3)
+    target_link_libraries(cuckoo_base PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(cuckoo_base PRIVATE include)
+
+    add_executable(hopscotch ${MANOLATES_SRC} tests/read_sql.cpp)
+    target_compile_definitions(hopscotch PRIVATE HASHTABLE=1)
     target_link_libraries(hopscotch PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(hopscotch PRIVATE include)
 
-    add_executable(robinhood ${ROBINHOOD_SRC} tests/read_sql.cpp)
+    add_executable(robinhood ${MANOLATES_SRC} tests/read_sql.cpp)
+    target_compile_definitions(robinhood PRIVATE HASHTABLE=2)
     target_link_libraries(robinhood PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(robinhood PRIVATE include)
 
-    add_executable(cuckoo ${CUCKOO_SRC} tests/read_sql.cpp)
+    add_executable(cuckoo ${MANOLATES_SRC} tests/read_sql.cpp)
+    target_compile_definitions(cuckoo PRIVATE HASHTABLE=3)
     target_link_libraries(cuckoo PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(cuckoo PRIVATE include)
 
-    #llvm support for smallVector
-    target_compile_definitions(robinhood PRIVATE ${LLVM_DEFINITIONS})
-    llvm_map_components_to_libnames(llvm_libs support core)
-    target_link_libraries(robinhood PRIVATE ${llvm_libs})
 endif()
 
 target_link_libraries(build_database PRIVATE fmt duckdb)
@@ -161,13 +159,16 @@ target_include_directories(build_database PRIVATE include)
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(unit_tests PRIVATE include)
 
+target_compile_definitions(hopscotch_tests PRIVATE HASHTABLE=1)
 target_link_libraries(hopscotch_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(hopscotch_tests PRIVATE include)
 
+target_compile_definitions(robinhood_tests PRIVATE HASHTABLE=2)
+target_link_libraries(robinhood_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(robinhood_tests PRIVATE include)
+
+target_compile_definitions(cuckoo_tests PRIVATE HASHTABLE=3)
 target_link_libraries(cuckoo_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(cuckoo_tests PRIVATE include)
 
-target_link_libraries(robinhood_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(robinhood_tests PRIVATE include ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(robinhood_tests PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(robinhood_tests PRIVATE ${llvm_libs})
+

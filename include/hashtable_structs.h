@@ -1,53 +1,6 @@
-#ifndef HOPSCOTCH_STRUCTURES_HPP
-#define HOPSCOTCH_STRUCTURES_HPP
-
 #include <vector>
 #include <cstdint>
 #include <cstddef>
-
-/**
- *
- *  The buckets contain the neighbourhood bitmask,
- *  the key that corresponds to the bucket and 
- *  indices to segments that  help locate values
- *  within the value_store vector found in the hash table.
- *
- *  Bucket alignment is very important and the
- *  specialized one will be chosen for the most
- *  usual case of uint32_t keys
- *
- *  All other structs are alinged as well.
- *
- *  Buckets also utilize an optimization
- *  whre the first value is stored inline
- *  via the last_segment field
- *
- **/
-template <typename Key>
-struct alignas(64) Bucket {
-    uint64_t bitmask;
-    Key key;
-    uint32_t first_segment;
-    uint32_t last_segment;
-    uint16_t count;
-    bool occupied;
-
-    Bucket() : bitmask(0), first_segment(0), last_segment(UINT32_MAX),
-               count(0), occupied(false){}
-};
-
-template<>
-struct alignas(32) Bucket<int32_t> {
-    uint64_t bitmask;
-    int32_t key;
-    uint32_t first_segment;
-    uint32_t last_segment;
-    uint16_t count;
-    bool occupied;
-
-    Bucket() : bitmask(0), first_segment(0), last_segment(UINT32_MAX),
-               count(0), occupied(false){}
-};
 
 /**
  *
@@ -70,6 +23,66 @@ struct alignas(16) Segment {
     Segment(uint32_t start, uint16_t cnt, uint32_t next = UINT32_MAX)
         : start_index(start), count(cnt), next_segment(next) {}
 };
+
+/**
+ *
+ *  Templated method for all types of buckets
+ *
+ *  handles duplicate key insertion effeciently by using 
+ *  pre stored last_segment field of Bucket
+ *
+ *  Enables O(1) because we can immediatly idenitfy
+ *  if this bucket's last segment is at the vectors end.
+ *
+ *  The first branch checks if we had only one value inserted
+ *  and does the appropriate operations for our optimization.
+ *
+ **/
+
+template <typename BucketType>
+inline void insert_duplicate(
+    BucketType& bucket,
+    uint32_t item,
+    std::vector<uint32_t>& value_store,
+    std::vector<Segment>& segments)
+{
+    if (bucket.count == 1) {
+        /* migrate inline value to value_store */
+        value_store.push_back(bucket.last_segment);
+        value_store.push_back(item);
+        
+        uint32_t new_segment_index = segments.size();
+        segments.emplace_back(value_store.size() - 2, 2, UINT32_MAX);
+        
+        bucket.first_segment = new_segment_index;
+        bucket.last_segment = new_segment_index;
+        bucket.count = 2;
+        return;
+    }
+
+    if (bucket.last_segment != UINT32_MAX) {
+        Segment& last_seg = segments[bucket.last_segment];
+        if (last_seg.start_index + last_seg.count == value_store.size()) {
+            value_store.push_back(item);
+            last_seg.count++;
+            bucket.count++;
+            return;
+        }
+    }
+    
+    /* create new segment */
+    value_store.push_back(item);
+    uint32_t new_segment_index = segments.size();
+    segments.emplace_back(value_store.size() - 1, 1, UINT32_MAX);
+
+    if (bucket.last_segment != UINT32_MAX)
+        segments[bucket.last_segment].next_segment = new_segment_index;
+    else
+        bucket.first_segment = new_segment_index;
+
+    bucket.last_segment = new_segment_index;
+    bucket.count++;
+}
 
 
 /**
@@ -108,11 +121,15 @@ struct alignas(32) ValueSpan {
         const std::vector<Segment>* segments;
         uint32_t current_segment;
         uint16_t offset;
+        Segment cached_segment;
 
         Iterator(const std::vector<uint32_t>* vs, const std::vector<Segment>* segs,
                 uint32_t seg_index, uint16_t offset = 0)
             : value_store(vs), segments(segs), current_segment(seg_index),
-              offset(offset) {}
+              offset(offset) {
+              if (seg_index != UINT32_MAX && segs != nullptr)
+                  cached_segment = (*segs)[seg_index];
+              }
 
         size_t operator*() const {
             /* inline value handling */
@@ -122,12 +139,6 @@ struct alignas(32) ValueSpan {
             /* usual case */
             const Segment& seg = (*segments)[current_segment];
             size_t data_index = seg.start_index + offset;
-            if (offset + 16 < seg.count) {
-                __builtin_prefetch(&(*value_store)[data_index + 16], 0, 2);
-            } else if (seg.next_segment != UINT32_MAX) {
-                const Segment& next_seg = (*segments)[seg.next_segment];
-                __builtin_prefetch(&(*value_store)[next_seg.start_index], 0, 2);
-            }
             return (*value_store)[seg.start_index + offset];
 
         }
@@ -142,8 +153,15 @@ struct alignas(32) ValueSpan {
             const Segment& seg = (*segments)[current_segment];
             offset++;
             if (offset >= seg.count) {
-                current_segment = seg.next_segment;
+                current_segment = cached_segment.next_segment;
                 offset = 0;
+                if (current_segment != UINT32_MAX) {
+                    cached_segment = (*segments)[current_segment];
+                    if (cached_segment.count > 0) {
+                        __builtin_prefetch(&(*value_store)
+                                [cached_segment.start_index], 0, 2);
+                    }
+                }
             }
             return *this;
         }
@@ -165,5 +183,3 @@ struct alignas(32) ValueSpan {
     size_t size() const { return total_count; }
     bool empty() const { return total_count == 0; }
 };
-
-#endif
