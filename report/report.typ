@@ -40,8 +40,11 @@
 #align(center)[#text(12pt)[Ανάλυση της Κλάσης #text(weight: "bold")[HopscotchTable]]]
 = HopscotchTable <hopscotch>
 = Δομές Δεδομένων <hopscotch_data_structures>
+= Συναρτήσεις Κατακερματισμού
 #align(center)[#text(12pt)[Ανάλυση της Κλάσης #text(weight: "bold")[RobinHoodTable]]]
 = RobinHoodTable <robinhood>
+= Δομές Δεδομένων <robinhood_data_structures>
+= Συναρτήσεις Κατακερματισμού
 #align(center)[#text(12pt)[Ανάλυση της Κλάσης #text(weight: "bold")[CuckooTable]]]
 = CuckooTable <cuckoo>
 = Δομές Δεδομένων <cuckoo_data_structures>

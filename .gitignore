@@ -4,6 +4,7 @@
 /output*.txt
 /*.tgz
 /*.db
+*.tar.gz
 /TPC-H*
 /job-sample
 /.cache
@@ -11,3 +12,7 @@
 flake.lock
 .clangd
 compile_commands.json
+env/
+
+
+# i need a picture that will show the median for all algorithms all together in a line and a picture that willshow as bar chart
