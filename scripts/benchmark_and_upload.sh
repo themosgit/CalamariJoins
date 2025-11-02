@@ -2,8 +2,6 @@
 
 sys=$(uname -s)
 
-echo "$sys"
-
 if [[ $sys == Linux ]]; then
     echo "Sudo password is required to prevent system from sleeping during benchmarks"
     sudo systemd-inhibit python3 scripts/benchmark.py 
