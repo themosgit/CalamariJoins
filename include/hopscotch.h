@@ -11,6 +11,10 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <iostream>
+#include <bitset>
+#include <cmath>
+
 /**
  *
  *  This is the main class of the hopscotch table
@@ -78,8 +82,9 @@ private:
     }
 
     inline size_t find_free_bucket(size_t start_index) const noexcept {
+        size_t index;
         for (size_t i = 0; i < capacity; ++i) {
-            size_t index = (start_index + i) & (capacity - 1);
+            index = (start_index + i) & (capacity - 1);
             if (!table[index].occupied) {
                 return index;
             }
@@ -98,46 +103,35 @@ private:
      *  potitions closer to the target index each iteration
      *
      **/
-    bool relocate(size_t &free_index, size_t target_index) {
-        /* limit attempts */
-        static constexpr size_t MAX_DEPTH = 128;
-        const size_t capacity_mask = capacity - 1;
-        for (size_t depth = 0; depth < MAX_DEPTH; ++depth) {
-            /* if the free bucket is within the target H success */
-            if (((free_index - target_index) & capacity_mask) < H) {
+    inline bool relocate(size_t &free_index, size_t target_index) noexcept {
+        size_t initial_distance = (free_index - target_index) & (capacity - 1);
+        size_t estimated_hops = (initial_distance / H) + 1;
+        
+        while(estimated_hops) {
+            size_t swap_index = (free_index - H + 1) & (capacity - 1);
+
+            while (!table[swap_index].bitmask) {
+                swap_index++;
+            }
+            const int bitmask_pos = __builtin_ctzll(table[swap_index].bitmask);
+            const size_t new_distance = (free_index - swap_index) & (capacity - 1);
+            
+            table[swap_index].bitmask &= ~(1ULL << bitmask_pos);
+            table[swap_index].bitmask |= (1ULL << new_distance);
+            table[swap_index].occupied = false;
+
+            table[free_index].bitmask = 0;
+            table[free_index].occupied = true;
+
+            std::swap(table[free_index], table[swap_index]);
+            free_index = swap_index;
+            
+            size_t distance_to_target = (free_index - target_index) & (capacity - 1);
+            if (distance_to_target < H) {
                 return true;
             }
-            bool moved = false;
-            for (size_t offset = 1; offset < H && !moved; ++offset) {
-                size_t check_index = (free_index - offset) & capacity_mask;
-                uint64_t bitmask = table[check_index].bitmask;
-                /*doesnt house any items of its own in  neighbourhood*/
-                if (!table[check_index].occupied || bitmask == 0) continue;
-                /* check buckets in neighbourhood  */
-                uint64_t temp_mask = bitmask;
-                while (temp_mask) {
-                    size_t j = 63 - __builtin_clzll(temp_mask);
-                    size_t item_index = (check_index + j) & capacity_mask;
-                    size_t new_dist = (free_index - check_index) & capacity_mask;
-
-                    if (new_dist < H && item_index != free_index) {
-                        table[free_index] = table[item_index];
-                        table[item_index].occupied = false;
-                        table[item_index].bitmask = 0;
-                        table[check_index].bitmask = (bitmask & ~(1ULL << j)) | (1ULL << new_dist);
-                        
-                        free_index = item_index;
-                        moved = true;
-                        break;
-                    }
-                    
-                    temp_mask &= ~(1ULL << j);
-                }
-            }
-            
-            if (!moved) return false;
+            estimated_hops--;
         }
-        
         return false;
     }
 
@@ -165,17 +159,15 @@ public:
         uint64_t temp_mask = table[base_index].bitmask;
         /* check for pre existing bucket */
         while (temp_mask) {
-            uint8_t i = __builtin_ctzll(temp_mask);
-            size_t check_index = (base_index + i) & (capacity - 1);
-
-            if (table[check_index].key != key) {
-                temp_mask &= (temp_mask - 1);
-            } else {
-                return insert_duplicate(table[check_index],
-                        item, value_store, segments); 
+            int offset = __builtin_ctzll(temp_mask);
+            size_t check_index = (base_index + offset) & (capacity - 1);
+            if (table[check_index].key == key) {
+                return insert_duplicate(table[check_index], item,
+                        value_store, segments);
             }
+            temp_mask &= (temp_mask - 1);
         }
-        /* new key find a free bucket for it */
+
         size_t free_index = find_free_bucket(base_index);
         if (free_index == capacity)
             throw std::runtime_error("Hash table full");
@@ -185,8 +177,9 @@ public:
         if (dist >= H) {
             if (!relocate(free_index, base_index))
                 throw std::runtime_error("Failed to relocate item within neighborhood");
+
+            dist = (free_index + capacity - base_index) & (capacity - 1);
         }
-        /* insert new value/key inplace */
         table[free_index].key = key;
         table[free_index].last_segment = item;
         table[free_index].count = 1;
@@ -211,7 +204,7 @@ public:
             return {nullptr, nullptr, UINT32_MAX,  0};
 
         while (temp_mask) {
-            uint8_t i =  __builtin_ctzll(temp_mask);
+            int i =  __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
             const Bucket<Key>& bucket = table[check_index];
             if (bucket.key == key) {
