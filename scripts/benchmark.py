@@ -68,16 +68,17 @@ def save_results(executable, results, timestamp, arch, results_dir):
 
     filepath = os.path.join(results_dir, filename)
 
-    with open(filename, 'w') as f:
+    with open(filepath, 'w') as f:
         json.dump(report, f, indent=2)
-    print(f"  Results saved to {filename}")
+    print(f"  Results saved to {filepath}")
 
 def main():
-    executables = ['robinhood', 'fast']
+    executables = ['fast', 'robinhood', 'hopscotch', 'cuckoo',
+                   'robinhood_base', 'hopscotch_base', 'cuckoo_base']
     project_dir = '.'
-    iterations = 1
+    iterations = 5
 
-    RESULTS_DIR = '../project-site/benchmark-results'
+    RESULTS_DIR = '../project-site/benchmark_results'
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     num_cores = str(multiprocessing.cpu_count())
@@ -131,7 +132,7 @@ def main():
                 
                 # Save results
                 print(f"\nSaving results for {executable}...")
-                save_results(executable, results_data[executable], timestamp, arch)
+                save_results(executable, results_data[executable], timestamp, arch, RESULTS_DIR)
             
             except Exception as e:
                 print(f"\nERROR: Failed to benchmark {executable}: {e}")
