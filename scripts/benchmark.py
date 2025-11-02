@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import re
 import platform
+import os
 from datetime import datetime
 
 QUERY_REGEX = re.compile(r"Query\s*([\w\d]+)\s*>>\s*.*?Runtime:\s*(\d+)\s*ms", re.DOTALL)
@@ -46,7 +47,7 @@ def calculate_stats(runs):
         'runs': runs
     }
 
-def save_results(executable, results, timestamp, arch):
+def save_results(executable, results, timestamp, arch, results_dir):
     """Save results to JSON file."""
     report = {
         'executable': executable,
@@ -64,15 +65,21 @@ def save_results(executable, results, timestamp, arch):
     }
     
     filename = f"results_{executable}_{arch}_{timestamp.replace(':', '-').replace(' ', '_')}.json"
+
+    filepath = os.path.join(results_dir, filename)
+
     with open(filename, 'w') as f:
         json.dump(report, f, indent=2)
     print(f"  Results saved to {filename}")
 
 def main():
     executables = ['robinhood', 'fast']
-    project_dir = '../k23a-2025-d1-manolates'
+    project_dir = '.'
     iterations = 1
-    
+
+    RESULTS_DIR = '../project-site/benchmark-results'
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
     num_cores = str(multiprocessing.cpu_count())
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     arch = platform.machine()
