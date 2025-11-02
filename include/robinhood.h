@@ -42,6 +42,7 @@ private:
     std::vector<uint32_t> value_store;
     std::vector<Segment> segments;
     Hash hasher;
+    Entry<Key> temp_entry;
     
     inline size_t hash(const Key& key) const noexcept {
         if constexpr (std::is_same_v<Key, int32_t>)
@@ -56,6 +57,15 @@ private:
             return __builtin_ia32_crc32di(key, 0);
         #endif
     }
+
+    inline void SetTempEntry(const Key& key, uint32_t item) noexcept { 
+        temp_entry.key = key;
+        temp_entry.psl = 0;
+        temp_entry.first_segment = 0;
+        temp_entry.last_segment = item;
+        temp_entry.count = 1;
+    }
+
 public:
     RobinHoodTable(size_t build_size, const Hash& hash = Hash()) {
         build_size = build_size ? build_size : 1;
@@ -70,32 +80,21 @@ public:
     }
 
     void insert(const Key &key, uint32_t idx) {
+        SetTempEntry(key, idx);
         size_t p = hash(key) & (size - 1);
-        size_t vpsl = 0;
-        // Check if the key already exists
-        size_t search_p = p;
-        size_t search_psl = 0;
-        while (table[search_p].count > 0) {
-            if (table[search_p].key == key) {
-                insert_duplicate(table[search_p], idx,
-                        value_store, segments);
-                return;
-            }
-            if (search_psl > table[search_p].psl) break;
-            search_p = (search_p + 1) & (size - 1);
-            search_psl++;
-        }
-        // New key - need to insert
-        Key k = key;
-        Entry<Key> entry_to_insert(key, vpsl, idx);
-        while (table[p].count > 0) {
-            if (entry_to_insert.psl > table[p].psl) {
-                std::swap(entry_to_insert, table[p]);
-            }
+        while (!table[p].count == 0) {
+           if (table[p].key == key) {
+               insert_duplicate(table[p], idx,
+                       value_store, segments);
+               return;
+           }
+           if (temp_entry.psl > table[p].psl) 
+               std::swap(temp_entry, table[p]);
+
             p = (p + 1) & (size - 1);
-            entry_to_insert.psl++;
+            temp_entry.psl++;
         }
-        table[p] = std::move(entry_to_insert);
+        table[p] = temp_entry;
     }
 
     ValueSpan<Key> find(const Key &key) const noexcept {
