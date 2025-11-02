@@ -62,7 +62,7 @@ private:
          #if HASHTABLE == 1
             HopscotchHashTable<T> hash_table(build.size() / 0.60);
         #elif HASHTABLE == 2
-            RobinHoodTable<T> hash_table(build.size() / 0.60);
+            RobinHoodTable<T> hash_table(build.size() * 2);
         #elif HASHTABLE == 3
             CuckooTable<T> hash_table(build.size() * 2);
         #endif
