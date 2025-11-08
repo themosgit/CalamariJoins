@@ -100,4 +100,38 @@ TEST_CASE("RobinHoodTable insert/find micro-benchmark", "[robinhood]") {
     std::chrono::duration<double> find_time = end_find - start_find;
 
 }
+TEST_CASE("BloomFilter false positive rate", "[bloom]") {
+    BloomFilter filter(1024);
+    for (int i = 0; i < 200; ++i) {
+        filter.insert(i);
+    }
+    int false_positives = 0;
+    int checks = 1000;
+    for (int i = 10000; i < 10000 + checks; ++i) {
+        if (filter.contains(i)) false_positives++;
+    }
+    double rate = double(false_positives) / checks;
+    REQUIRE(rate < 0.1); // Should be low, but not zero
+}
+
+TEST_CASE("RobinHoodTable respects BloomFilter early exit", "[robinhood][bloom]") {
+    RobinHoodTable<int32_t> hash_table(64);
+    hash_table.insert(42, 123);
+    auto result = hash_table.find(42);
+    REQUIRE(!result.empty()); // Βρέθηκε το key
+
+    auto missing = hash_table.find(9999);
+    REQUIRE(missing.empty()); // Δεν βρέθηκε το key, BloomFilter έδωσε early exit
+}
+
+TEST_CASE("BloomFilter false positive rate stays low", "[bloom]") {
+    BloomFilter filter(1024);
+    for (int i = 0; i < 100; ++i) filter.insert(i);
+    int false_positives = 0;
+    int checks = 500;
+    for (int i = 10000; i < 10000 + checks; ++i)
+        if (filter.contains(i)) false_positives++;
+    double rate = double(false_positives) / checks;
+    REQUIRE(rate < 0.1);
+}
 

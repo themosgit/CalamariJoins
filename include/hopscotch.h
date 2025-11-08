@@ -7,12 +7,10 @@
 #include <hashtable_structs.h>
 #include <cstdlib>
 #include <vector>
-#include <stdexcept>
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
-#include <iostream>
-#include <bitset>
 #include <cmath>
 
 /**
@@ -64,6 +62,7 @@ private:
     std::vector<Bucket<Key>> table;
     std::vector<uint32_t> value_store;
     std::vector<Segment> segments;
+    BloomFilter bloom_filter;
     size_t capacity;
     Hash hasher;
 
@@ -73,11 +72,15 @@ private:
         return hasher(key);
     }
 
-    static inline size_t hash_int32(int32_t key) noexcept {
+    static inline uint64_t hash_int32(int32_t key) noexcept {
         #if defined(__aarch64__)
-            return __builtin_arm_crc32w(key, 0);
+            uint32_t low = __builtin_arm_crc32w(key, 0);
+            uint32_t high = __builtin_arm_crc32w(key, low);
+            return ((uint64_t)high << 32) | low;
         #elif defined(__x86_64__)
-            return __builtin_ia32_crc32di(key, 0);
+            uint32_t low = __builtin_ia32_crc32si(key, 0);
+            uint32_t high = __builtin_ia32_crc32si(key, low);
+            return ((uint64_t)high << 32) | low;
         #endif
     }
 
@@ -138,7 +141,7 @@ private:
 public:
     /* Hopscotch table constructor */
     explicit HopscotchHashTable(size_t size, const Hash& hash = Hash()) 
-        : capacity(0), hasher(hash) {
+        : capacity(0), hasher(hash), bloom_filter(size / 2) {
         static constexpr size_t MIN_CAPACITY = 64;
         static constexpr size_t MAX_CAPACITY = 1ULL << 62;
         if (size == 0 || size < MIN_CAPACITY) {
@@ -150,13 +153,18 @@ public:
         }
         table.resize(capacity);
         value_store.reserve(size / 2);
-        segments.reserve(size / 4);
+        segments.reserve(size / 8);
     }
 
     void insert(const Key& key, uint32_t item) {
         size_t hash_val = hash_key(key);
         size_t base_index = hash_val & (capacity - 1);
-        uint64_t temp_mask = table[base_index].bitmask;
+        uint64_t temp_mask = 0;
+        if (bloom_filter.contains(hash_val)) {
+            temp_mask = table[base_index].bitmask;
+        } else {
+            bloom_filter.insert(hash_val);
+        }
         /* check for pre existing bucket */
         while (temp_mask) {
             int offset = __builtin_ctzll(temp_mask);
@@ -198,11 +206,11 @@ public:
      **/
     inline ValueSpan<Key> find(const Key& key) const noexcept{
         size_t hash_val = hash_key(key);
-        size_t base_index = hash_val & (capacity - 1);
-        uint64_t temp_mask = table[base_index].bitmask;
-        if (temp_mask == 0)
+        if (!bloom_filter.contains(hash_val))
             return {nullptr, nullptr, UINT32_MAX,  0};
 
+        size_t base_index = hash_val & (capacity - 1);
+        uint64_t temp_mask = table[base_index].bitmask;
         while (temp_mask) {
             int i =  __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);

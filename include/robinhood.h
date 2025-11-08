@@ -9,6 +9,8 @@
 #include <functional>
 #include <cstdint>
 #include <hashtable_structs.h>
+#include <cmath>
+#include <immintrin.h>
 
 /*
 Robin hood hashing algorithm: the idea behind this hashing algorithm is
@@ -19,7 +21,6 @@ this keeps the variance low and search fast
 
 Enhanced with value store and segment logic for efficient duplicate key handling
 */
-
 
 template <typename Key>
 struct Entry {
@@ -43,19 +44,12 @@ private:
     std::vector<Segment> segments;
     Hash hasher;
     Entry<Key> temp_entry;
+    BloomFilter bloom;
     
     inline size_t hash(const Key& key) const noexcept {
         if constexpr (std::is_same_v<Key, int32_t>)
-            return hash_int32(key);
+            return (size_t)(key * 0x85ebca6b) | ((size_t)(key * 0xc2b2ae35)) << 32;
         return hasher(key);
-    }
-
-    static inline size_t hash_int32(int32_t key) noexcept {
-        #if defined(__aarch64__)
-            return __builtin_arm_crc32w(key, 0);
-        #elif defined(__x86_64__)
-            return __builtin_ia32_crc32di(key, 0);
-        #endif
     }
 
     inline void SetTempEntry(const Key& key, uint32_t item) noexcept { 
@@ -67,7 +61,8 @@ private:
     }
 
 public:
-    RobinHoodTable(size_t build_size, const Hash& hash = Hash()) {
+    RobinHoodTable(size_t build_size, const Hash& hash = Hash()) : bloom(build_size), hasher(hash) {
+        //init the table with the next power of 2
         build_size = build_size ? build_size : 1;
         size = 1ULL << (64 - __builtin_clzll(build_size - 1));
         table.resize(size);
@@ -80,9 +75,10 @@ public:
     }
 
     void insert(const Key &key, uint32_t idx) {
+        bloom.insert(hash(key)); //update bloom filter
         SetTempEntry(key, idx);
         size_t p = hash(key) & (size - 1);
-        while (!table[p].count == 0) {
+        while (table[p].count != 0) {
            if (table[p].key == key) {
                insert_duplicate(table[p], idx,
                        value_store, segments);
@@ -98,6 +94,8 @@ public:
     }
 
     ValueSpan<Key> find(const Key &key) const noexcept {
+        if(!bloom.contains(hash(key)))
+            return{nullptr,nullptr,UINT32_MAX,0}; //key doesn't exist for sure
         size_t p = hash(key) & (size - 1);
         size_t vpsl = 0;
         while (table[p].count > 0) {
@@ -110,8 +108,11 @@ public:
                 return { &value_store, &segments,
                     entry.first_segment, entry.count };
             }
-            
-            if (vpsl > table[p].psl) break;
+            /*
+            if the psl of the key we're searching exceeds the psl of the current bucket
+            it means that the key cannot be present beyond this point so we stop searching.
+            */
+            if (vpsl > table[p].psl) break; 
             p = (p + 1) & (size - 1);
             vpsl++;
         }

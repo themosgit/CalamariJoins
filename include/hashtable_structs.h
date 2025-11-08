@@ -1,6 +1,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
+#include <cmath>
 
 /**
  *
@@ -182,4 +183,47 @@ struct alignas(32) ValueSpan {
     
     size_t size() const { return total_count; }
     bool empty() const { return total_count == 0; }
+};
+
+
+/**
+ *
+ *  Bloom filter implementation
+ *
+ **/
+struct BloomFilter{
+    /* bit array */
+    std::vector<uint64_t> bits;
+    /* size in bits */
+    size_t m;
+    size_t shift;
+    size_t total_bits;
+
+    BloomFilter(size_t n, const double p = 0.05) noexcept {
+        if (n == 0) n = 1;
+        /* formula for the size of the bit array */
+        m = static_cast<size_t>(-(n* std::log(p)) / (std::log(2) * std::log(2)));
+        /* bloom filter vector alocate and initialize */
+        bits.resize((m + 63) / 64, 0);
+        shift = 0;
+        total_bits = bits.size() * 64;
+        while((1ULL << shift) < total_bits) ++shift;
+    }
+
+    void insert(const size_t hash) noexcept {
+        /* take key and shift right then mod bits */
+        size_t idx = (hash >> shift) % total_bits;
+        bits[idx / 64] |= (1ULL << (idx % 64));
+    }
+
+    bool contains(const size_t hash) const noexcept {
+        size_t idx = (hash >> shift) % total_bits;
+        /**
+         *
+         *  which idx in the bloom filter and which
+         *  place in the idx we will "turn on"(like a switch)
+         *
+         **/
+        return bits[idx / 64] & (1ULL << (idx % 64));
+    }
 };
