@@ -1,0 +1,47 @@
+name: GitHub Push Notifier
+
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install discord.js node-fetch dotenv
+
+      - name: Send Discord notification
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          GITHUB_TOKEN: ${{ vars.GH_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+        run: |
+          node -e "
+          require('dotenv').config();
+          const { Client, GatewayIntentBits } = require('discord.js');
+          const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+          
+          client.once('ready', async () => {
+            const channel = client.channels.cache.get(process.env.CHANNEL_ID);
+            const message = \`🚨 New Push to \\\`${{ github.repository }}\\\` Branch \\\`${{ github.ref_name }}\\\`!\n👤 Author: \\\`${{ github.event.pusher.name }}\\\`\n📝 Commit: \\\`${{ github.event.head_commit.message }}\\\`\n🔗 View: ${{ github.event.head_commit.url }}\`;
+            await channel.send(message);
+            process.exit(0);
+          });
+          
+          client.login(process.env.DISCORD_TOKEN);
+          "
