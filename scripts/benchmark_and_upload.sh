@@ -13,7 +13,7 @@ elif [[ $sys == Darwin ]]; then
     networksetup -setairportpower en0 on
 fi
 
-sleep 5
+sleep 20
 
 cd ../project-site 
 

@@ -9,8 +9,6 @@
 #include <functional>
 #include <cstdint>
 #include <hashtable_structs.h>
-#include <cmath>
-#include <immintrin.h>
 
 /*
 Robin hood hashing algorithm: the idea behind this hashing algorithm is

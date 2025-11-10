@@ -73,10 +73,9 @@ def save_results(executable, results, timestamp, arch, results_dir):
     print(f"  Results saved to {filepath}")
 
 def main():
-    executables = ['fast', 'robinhood', 'hopscotch', 'cuckoo',
-                   'robinhood_base', 'hopscotch_base', 'cuckoo_base']
+    executables = ['hopscotch']
     project_dir = '.'
-    iterations = 5
+    iterations = 10
 
     RESULTS_DIR = '../project-site/benchmark_results'
     os.makedirs(RESULTS_DIR, exist_ok=True)

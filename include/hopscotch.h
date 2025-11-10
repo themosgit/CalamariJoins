@@ -62,7 +62,6 @@ private:
     std::vector<Bucket<Key>> table;
     std::vector<uint32_t> value_store;
     std::vector<Segment> segments;
-    BloomFilter bloom_filter;
     size_t capacity;
     Hash hasher;
 
@@ -141,7 +140,7 @@ private:
 public:
     /* Hopscotch table constructor */
     explicit HopscotchHashTable(size_t size, const Hash& hash = Hash()) 
-        : capacity(0), hasher(hash), bloom_filter(size / 2) {
+        : capacity(0), hasher(hash) {
         static constexpr size_t MIN_CAPACITY = 64;
         static constexpr size_t MAX_CAPACITY = 1ULL << 62;
         if (size == 0 || size < MIN_CAPACITY) {
@@ -159,12 +158,7 @@ public:
     void insert(const Key& key, uint32_t item) {
         size_t hash_val = hash_key(key);
         size_t base_index = hash_val & (capacity - 1);
-        uint64_t temp_mask = 0;
-        if (bloom_filter.contains(hash_val)) {
-            temp_mask = table[base_index].bitmask;
-        } else {
-            bloom_filter.insert(hash_val);
-        }
+        uint64_t temp_mask = table[base_index].bitmask;;
         /* check for pre existing bucket */
         while (temp_mask) {
             int offset = __builtin_ctzll(temp_mask);
@@ -206,11 +200,11 @@ public:
      **/
     inline ValueSpan<Key> find(const Key& key) const noexcept{
         size_t hash_val = hash_key(key);
-        if (!bloom_filter.contains(hash_val))
-            return {nullptr, nullptr, UINT32_MAX,  0};
-
         size_t base_index = hash_val & (capacity - 1);
         uint64_t temp_mask = table[base_index].bitmask;
+        if (temp_mask == 0)
+            return {nullptr, nullptr, UINT32_MAX, 0};
+
         while (temp_mask) {
             int i =  __builtin_ctzll(temp_mask);
             size_t check_index = (base_index + i) & (capacity - 1);
