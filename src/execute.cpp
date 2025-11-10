@@ -14,7 +14,6 @@
 
 #include <plan.h>
 #include <table.h>
-#include <iostream>
 
 namespace Contest {
 

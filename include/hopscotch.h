@@ -11,8 +11,6 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include <cmath>
-
 /**
  *
  *  This is the main class of the hopscotch table
@@ -71,15 +69,11 @@ private:
         return hasher(key);
     }
 
-    static inline uint64_t hash_int32(int32_t key) noexcept {
+    static inline size_t hash_int32(int32_t key) noexcept {
         #if defined(__aarch64__)
-            uint32_t low = __builtin_arm_crc32w(key, 0);
-            uint32_t high = __builtin_arm_crc32w(key, low);
-            return ((uint64_t)high << 32) | low;
+            return __builtin_arm_crc32w(key, 0);
         #elif defined(__x86_64__)
-            uint32_t low = __builtin_ia32_crc32si(key, 0);
-            uint32_t high = __builtin_ia32_crc32si(key, low);
-            return ((uint64_t)high << 32) | low;
+            return __builtin_ia32_crc32si(key, 0);
         #endif
     }
 

@@ -27,6 +27,7 @@
             curl
             git
             cmake
+            typst
           ];
           shellHook = ''
             CLANGD_FILE=".clangd"
