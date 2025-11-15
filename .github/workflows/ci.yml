@@ -12,7 +12,8 @@ on:
 
 jobs:
   build_and_test:
-    runs-on: ubuntu-latest
+    runs-on: 
+      group: k23a
 
     steps:
     - name: Checkout repository code
