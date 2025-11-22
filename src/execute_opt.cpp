@@ -1,23 +1,16 @@
+#include <cstdint>
 #if defined(__APPLE__) && defined(__aarch64__)
     #include <hardware_darwin.h>
 #else
     #include <hardware.h>
 #endif
 
-#if HASHTABLE == 1
-    #include <hopscotch.h>
-#elif HASHTABLE == 2
-    #include <robinhood.h>
-#elif HASHTABLE == 3
-    #include <cuckoo.h>
-#endif
-
-#include <plan.h>
-#include <table.h>
+#include <hashtable.h>
+#include <value_t_builders.h>
 
 namespace Contest {
 
-using ExecuteResult = std::vector<std::vector<Data>>;
+using ExecuteResult = std::vector<std::vector<value_t>>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
@@ -45,7 +38,7 @@ public:
     template <class T>
     auto run() {
         /* 4 was chosen as an optimal value from tests */
-        const size_t HASH_TABLE_THRESHOLD = 4;
+        const size_t HASH_TABLE_THRESHOLD = 0;
         if (build.size() < HASH_TABLE_THRESHOLD) {
             nested_loop_join<T>();
         } else {
@@ -58,37 +51,29 @@ private:
     template <class T>
     void hash_join() {
         namespace views = ranges::views;
-         #if HASHTABLE == 1
-            HopscotchHashTable<T> hash_table(build.size() / 0.60);
-        #elif HASHTABLE == 2
-            RobinHoodTable<T> hash_table(build.size() * 2);
-        #elif HASHTABLE == 3
-            CuckooTable<T> hash_table(build.size() * 2);
-        #endif
-     
-       
+        RobinHoodTable<T> hash_table(build.size() * 2);
         /* build hash table from build table */
         for (auto&& [idx, record]: build | views::enumerate) {
             __builtin_prefetch(&record + 128, 0, 1);
-            if (auto* key = std::get_if<T>(&record[build_col])) {
-                hash_table.insert(*key, idx);
-            } else if (!std::holds_alternative<std::monostate>(record[build_col])) {
-                throw std::runtime_error("wrong type of field on build");
+            auto key = &record[build_col].value;
+            if (*key == INT32_MIN) {
+                continue;
             }
+            hash_table.insert(*key, idx);
         }
-        
+
         const size_t probe_size = probe.size();
         for (size_t i = 0; i < probe_size; i++) {
             auto& probe_record = probe[i];
             __builtin_prefetch(&probe_record + 128, 0, 1);
-            if (auto* key = std::get_if<T>(&probe_record[probe_col])) {
-                auto indices = hash_table.find(*key);
-                for (size_t build_index : indices) {
-                    swap ? construct_result(build[build_index], probe_record) :
-                           construct_result(probe_record, build[build_index]);
-                }
-            } else if (!std::holds_alternative<std::monostate>(probe_record[probe_col])) {
-                throw std::runtime_error("wrong type of field on probe");
+            auto key = &probe_record[probe_col].value;
+            if (*key == INT32_MIN) {
+                continue;
+            }
+            auto indices = hash_table.find(*key);
+            for (size_t build_index : indices) {
+                swap ? construct_result(build[build_index], probe_record) :
+                       construct_result(probe_record, build[build_index]);
             }
         }
     }
@@ -99,14 +84,15 @@ private:
         __builtin_prefetch(&build);
         for (auto& probe_record: probe) {
             __builtin_prefetch(&probe_record + 128);
-            auto* probe_key = std::get_if<T>(&probe_record[probe_col]);
-            if (!probe_key) continue;
+            auto probe_key = probe_record[probe_col].value;
+            if (probe_key == INT32_MIN)
+                continue;
             for (size_t i = 0; i < build.size(); i++) {
                 auto& build_record = build[i];
-                auto* build_key = std::get_if<T>(&build_record[build_col]);
-                if (!build_key)
+                auto build_key = build_record[build_col].value;
+                if (build_key == INT32_MIN)
                     continue;
-                if (*build_key == *probe_key) {
+                if (build_key == probe_key) {
                     swap ? construct_result(build_record, probe_record) :
                            construct_result(probe_record, build_record);
                 }
@@ -120,9 +106,9 @@ private:
      *  its relevant for constructing a valid result
      *
      **/
-    void construct_result(const std::vector<Data>& left_record, 
-        const std::vector<Data>& right_record) {
-        std::vector<Data> new_record;
+    void construct_result(const std::vector<value_t>& left_record, 
+        const std::vector<value_t>& right_record) {
+        std::vector<value_t> new_record;
         new_record.reserve(output_attrs.size());
         for (auto [col_idx, _]: output_attrs) {
             if (col_idx < left_record.size()) {
@@ -154,7 +140,7 @@ ExecuteResult execute_hash_join(const Plan&          plan,
     auto&                          right_types = right_node.output_attrs;
     auto                           left        = execute_impl(plan, left_idx);
     auto                           right       = execute_impl(plan, right_idx);
-    std::vector<std::vector<Data>> results;
+    std::vector<std::vector<value_t>> results;
 
     /**
      *
@@ -164,7 +150,6 @@ ExecuteResult execute_hash_join(const Plan&          plan,
      *
      **/
     bool determine_build_left = (left.size() < right.size()) ? true : false;
-
     /* here we initialize the join algorithm with the desired tables */
     JoinAlgorithm join_algorithm{
     .build         = determine_build_left ? left  : right,
@@ -175,21 +160,7 @@ ExecuteResult execute_hash_join(const Plan&          plan,
     .swap          = determine_build_left,
     .output_attrs  = output_attrs};
 
-    if (determine_build_left) {
-        switch (std::get<1>(left_types[join.left_attr])) {
-        case DataType::INT32:   join_algorithm.run<int32_t>(); break;
-        case DataType::INT64:   join_algorithm.run<int64_t>(); break;
-        case DataType::FP64:    join_algorithm.run<double>(); break;
-        case DataType::VARCHAR: join_algorithm.run<std::string>(); break;
-        }
-    } else {
-        switch (std::get<1>(right_types[join.right_attr])) {
-        case DataType::INT32:   join_algorithm.run<int32_t>(); break;
-        case DataType::INT64:   join_algorithm.run<int64_t>(); break;
-        case DataType::FP64:    join_algorithm.run<double>(); break;
-        case DataType::VARCHAR: join_algorithm.run<std::string>(); break;
-        }
-    }
+    join_algorithm.run<int32_t>();
     return results;
 }
 
@@ -200,13 +171,13 @@ ExecuteResult execute_scan(const Plan&               plan,
     const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
     auto                           table_id = scan.base_table_id;
     auto&                          input    = plan.inputs[table_id];
-    return Table::copy_scan(input, output_attrs);
+    return manolates::copy_scan(input, table_id, output_attrs);
 }
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
     auto& node = plan.nodes[node_idx];
     return std::visit(
-        [&](const auto& value) {
+        [&](const auto& value) -> ExecuteResult {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, JoinNode>) {
                 return execute_hash_join(plan, value, node.output_attrs);
@@ -218,13 +189,8 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
 }
 
 ColumnarTable execute(const Plan& plan, void* context) {
-    namespace views = ranges::views;
-    auto ret        = execute_impl(plan, plan.root);
-    auto ret_types  = plan.nodes[plan.root].output_attrs
-                   | views::transform([](const auto& v) { return std::get<1>(v); })
-                   | ranges::to<std::vector<DataType>>();
-    Table table{std::move(ret), std::move(ret_types)};
-    return table.to_columnar();
+    ExecuteResult ret = execute_impl(plan, plan.root);
+    return manolates::to_columnar(ret, plan);
 }
 
 void* build_context() {

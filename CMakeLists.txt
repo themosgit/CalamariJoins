@@ -18,7 +18,6 @@ FetchContent_Declare(
 set(ABSL_PROPAGATE_CXX_STD ON)
 set(ABSL_ENABLE_INSTALL ON)
 FetchContent_MakeAvailable(abseil)
-
 FetchContent_Declare(
     re2
     URL https://github.com/google/re2/releases/download/2024-07-02/re2-2024-07-02.tar.gz
@@ -55,19 +54,12 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(fmtlib)
 
-FetchContent_Declare(
-    duckdb
-    URL https://github.com/duckdb/duckdb/archive/refs/tags/v1.2.1.tar.gz
-)
 set(ENABLE_SANITIZER OFF)
 set(ENABLE_UBSAN OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     message("Disabling jemalloc extension of DuckDB on Power.")
     set(SKIP_EXTENSIONS jemalloc)
 endif()
-FetchContent_MakeAvailable(duckdb)
-
-find_package(LLVM REQUIRED CONFIG)
 
 # Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
 # Try re-running cmake in case changes are not recognized.
@@ -96,79 +88,28 @@ else()
     add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive)
 endif()
 
-# Targets
-add_executable(run ${SIGMODPC_SRC} tests/read_sql.cpp)
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
-add_executable(hopscotch_tests ${MANOLATES_SRC} tests/hopscotch_tests.cpp)
-add_executable(robinhood_tests ${MANOLATES_SRC} tests/robinhood_tests.cpp)
-add_executable(cuckoo_tests ${MANOLATES_SRC} tests/cuckoo_tests.cpp)
-add_executable(build_database tests/build_database.cpp)
-
-# For all executables
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    target_compile_definitions(build_database PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_definitions(unit_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
-endif()
+add_executable(unit_tests_opt ${MANOLATES_SRC} tests/unit_tests.cpp)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    add_executable(build_cache ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_link_libraries(build_cache PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
-    target_compile_definitions(build_cache PRIVATE TEAMOPT_USE_DUCKDB TEAMOPT_BUILD_CACHE)
-    target_include_directories(build_cache PRIVATE include)
-
     add_executable(fast ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_compile_definitions(fast PRIVATE HASHTABLE=0)
+    target_compile_definitions(fast PRIVATE)
     target_link_libraries(fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(fast PRIVATE include)
 
-    add_executable(hopscotch_base ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_compile_definitions(hopscotch_base PRIVATE HASHTABLE=1)
-    target_link_libraries(hopscotch_base PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(hopscotch_base PRIVATE include)
-
-    add_executable(robinhood_base ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_compile_definitions(robinhood_base PRIVATE HASHTABLE=2)
-    target_link_libraries(robinhood_base PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(robinhood_base PRIVATE include)
-
-    add_executable(cuckoo_base ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_compile_definitions(cuckoo_base PRIVATE HASHTABLE=3)
-    target_link_libraries(cuckoo_base PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(cuckoo_base PRIVATE include)
-
-    add_executable(hopscotch ${MANOLATES_SRC} tests/read_sql.cpp)
-    target_compile_definitions(hopscotch PRIVATE HASHTABLE=1)
-    target_link_libraries(hopscotch PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(hopscotch PRIVATE include)
-
-    add_executable(robinhood ${MANOLATES_SRC} tests/read_sql.cpp)
-    target_compile_definitions(robinhood PRIVATE HASHTABLE=2)
-    target_link_libraries(robinhood PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(robinhood PRIVATE include)
-
-    add_executable(cuckoo ${MANOLATES_SRC} tests/read_sql.cpp)
-    target_compile_definitions(cuckoo PRIVATE HASHTABLE=3)
-    target_link_libraries(cuckoo PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(cuckoo PRIVATE include)
+    add_executable(faster ${MANOLATES_SRC} tests/read_sql.cpp)
+    target_compile_definitions(faster PRIVATE)
+    target_link_libraries(faster PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+    target_include_directories(faster PRIVATE include)
 
 endif()
-
-target_link_libraries(build_database PRIVATE fmt duckdb)
-target_include_directories(build_database PRIVATE include)
 
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(unit_tests PRIVATE include)
 
-target_compile_definitions(hopscotch_tests PRIVATE HASHTABLE=1)
-target_link_libraries(hopscotch_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(hopscotch_tests PRIVATE include)
+target_compile_definitions(unit_tests_opt PRIVATE)
+target_link_libraries(unit_tests_opt PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
+target_include_directories(unit_tests_opt PRIVATE include)
 
-target_compile_definitions(robinhood_tests PRIVATE HASHTABLE=2)
-target_link_libraries(robinhood_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(robinhood_tests PRIVATE include)
-
-target_compile_definitions(cuckoo_tests PRIVATE HASHTABLE=3)
-target_link_libraries(cuckoo_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(cuckoo_tests PRIVATE include)
 
 

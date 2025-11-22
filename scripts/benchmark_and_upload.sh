@@ -19,10 +19,10 @@ cd ../project-site
 
 git pull
 
-python3 update_entries.py
+python3 update_entries.py --part part2
 
 git add .
 
-git commit -m "updating benchmarks"
+git commit -m "Updating benchmarks"
 
 git push
