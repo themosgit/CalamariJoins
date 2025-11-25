@@ -2,9 +2,9 @@
 #include <value_t_builders.h>
 #include <inner_column.h>
 
-namespace manolates {
+namespace mema {
 
-    using row_store = std::vector<std::vector<value_t>>;
+    using columnar = std::vector<column_t>;
 
     inline bool get_bitmap(const uint8_t* bitmap, uint16_t idx) {
         return bitmap[idx / 8] & (1u << (idx % 8));
@@ -29,10 +29,9 @@ namespace manolates {
     }
 
 
-    row_store copy_scan(const ColumnarTable& table, uint8_t table_idx, 
+    Columnar copy_scan(const ColumnarTable& table, uint8_t table_idx, 
                        const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
-        row_store results(table.num_rows, std::vector<value_t>(output_attrs.size()));
-        
+        Columnar results;
         /**
          *
          *  reads from output_attrs the columns we need and materializes
@@ -40,10 +39,12 @@ namespace manolates {
          *  we store the necessary fields talked about in the handout
          *
          **/
+        results.resize(output_attrs.size());
+
         for (size_t out_col_idx = 0; out_col_idx < output_attrs.size(); ++out_col_idx) {
             auto [col_idx, col_type] = output_attrs[out_col_idx];
             auto& column = table.columns[col_idx];
-            size_t row_idx = 0;
+            results[out_col_idx].reserve(table.num_rows);
             
             switch (column.type) {
                 case DataType::INT32: {
@@ -58,10 +59,11 @@ namespace manolates {
                         
                         for (uint16_t i = 0; i < num_rows; ++i) {
                             if (get_bitmap(bitmap, i)) {
-                                results[row_idx][out_col_idx]
-                                    = {data_begin[data_idx++], 0, 0, 0};
+                                results[out_col_idx].append(
+                                        {data_begin[data_idx++],0,0,0});
+                            }else{
+                                results[out_col_idx].append_null();
                             }
-                            row_idx++;
                         }
                     }
                     break;
@@ -80,9 +82,10 @@ namespace manolates {
                         auto* page = page_obj->data;
                         auto num_rows = *reinterpret_cast<uint16_t*>(page);
                         if (num_rows == 0xffff) {
-                            results[row_idx++][out_col_idx] = 
-                                {page_idx, table_idx, static_cast<uint8_t>(col_idx), UINT16_MAX};
-                        } 
+                            results[out_col_idx].append( 
+                                {page_idx, table_idx,
+                                    static_cast<uint8_t>(col_idx), UINT16_MAX});
+                        }
                         else if (num_rows == 0xfffe) {
                         } 
                         else {
@@ -91,10 +94,12 @@ namespace manolates {
                             uint16_t offset_idx = 0;
                             for (uint16_t i = 0; i < num_rows; ++i) {
                                 if (get_bitmap(bitmap, i)) {
-                                    results[row_idx][out_col_idx] =
-                                        {page_idx, table_idx, static_cast<uint8_t>(col_idx), offset_idx++};
+                                    results[out_col_idx].append(
+                                        {page_idx, table_idx,
+                                            static_cast<uint8_t>(col_idx), offset_idx++});
+                                }else{
+                                    results[out_col_idx].append_null();
                                 }
-                                row_idx++;
                             }
                         }
                         page_idx++;
@@ -106,40 +111,47 @@ namespace manolates {
                     break;
             }
         }
+
+        /* build cache boiii */
+        for (auto& col : results)
+            col.build_cache();
+
         return results;
     }
 
 
 
-    ColumnarTable to_columnar(const row_store& table, const Plan& plan) {
+    ColumnarTable to_columnar(const columnar& table, const Plan& plan) {
         ColumnarTable ret;
-        ret.num_rows = table.size();
-        
         auto& root_node = plan.nodes[plan.root];
         size_t num_cols = root_node.output_attrs.size();
 
         /* when the table is empty it still requires empty columns */
         if (table.empty()) {
+            ret.num_rows = 0;
             for (size_t col_idx = 0; col_idx < num_cols; ++col_idx) {
                 DataType data_type = std::get<1>(root_node.output_attrs[col_idx]);
                 ret.columns.emplace_back(data_type);
             }
             return ret;
         }
+        ret.num_rows = table[0].row_count();
 
         /**
          *
          *  to materialize values the strategy is similar
          *  to the one used in to_columnar the difference
          *  being that we need to materialize strings
-         *  for int the values our stored directly fo the process
+         *  for int the values our stored directly for the process
          *  is identical.
          *
          **/
-        for (size_t col_idx = 0; col_idx < num_cols; ++col_idx) {
+        for (size_t col_idx = 0; col_idx < table.size(); ++col_idx) {
             DataType data_type = std::get<1>(root_node.output_attrs[col_idx]);
+            const auto& src_column = table[col_idx];
             ret.columns.emplace_back(data_type);
             auto& column = ret.columns.back();
+            
             
             switch (data_type) {
             case DataType::INT32: {
@@ -160,9 +172,9 @@ namespace manolates {
                     bitmap.clear();
                 };
                 
-                for (const auto& record : table) {
-                    const auto& val = record[col_idx];
-                    if (val.value == INT32_MIN) {
+                for (size_t row_idx = 0; row_idx < src_column.row_count(); ++row_idx) {
+                    const value_t* val_ptr = src_column.get_by_row(row_idx);
+                    if (!val_ptr) {
                         if (4 + data.size() * 4 + (num_rows / 8 + 1) > PAGE_SIZE) {
                             save_page();
                         }
@@ -173,7 +185,7 @@ namespace manolates {
                             save_page();
                         }
                         set_bitmap(bitmap, num_rows);
-                        data.emplace_back(val.value);
+                        data.emplace_back(val_ptr->value);
                         ++num_rows;
                     }
                 }
@@ -245,10 +257,10 @@ namespace manolates {
                     bitmap.clear();
                 };
                 
-                for (const auto& record : table) {
-                    const auto& val = record[col_idx];
+                for (size_t row_idx = 0; row_idx < src_column.row_count(); ++row_idx) {
+                    const value_t* val_ptr = src_column.get_by_row(row_idx);
                     
-                    if (val.value == INT32_MIN) {
+                    if (!val_ptr) {
                         if (4 + offsets.size() * 2 + data.size() + (num_rows / 8 + 1) > PAGE_SIZE) {
                             save_page();
                         }
@@ -256,11 +268,11 @@ namespace manolates {
                         ++num_rows;
                     } else {
                         std::string str;
-                        const auto& src_table = plan.inputs[val.table];
-                        const auto& src_col = src_table.columns[val.column];
+                        const auto& src_table = plan.inputs[val_ptr->table];
+                        const auto& src_col = src_table.columns[val_ptr->column];
                         
-                        if (val.offset == UINT16_MAX) {
-                            size_t page_idx = val.value;
+                        if (val_ptr->offset == UINT16_MAX) {
+                            size_t page_idx = val_ptr->value;
                             auto* p = reinterpret_cast<uint8_t*>(src_col.pages[page_idx]->data);
                             uint16_t len = *reinterpret_cast<uint16_t*>(p + 2);
                             str.append(reinterpret_cast<char*>(p + 4), len);
@@ -275,14 +287,14 @@ namespace manolates {
                                 page_idx++;
                             }
                         } else {
-                            int page_idx = val.value;
+                            int page_idx = val_ptr->value;
                             auto* page = reinterpret_cast<uint8_t*>(src_col.pages[page_idx]->data);
                             auto num_valid = *reinterpret_cast<uint16_t*>(page + 2);
                             auto* offset_array = reinterpret_cast<uint16_t*>(page + 4);
                             char* char_begin = reinterpret_cast<char*>(page + 4 + num_valid * 2);
                             
-                            uint16_t end_off = offset_array[val.offset];
-                            uint16_t start_off = (val.offset == 0) ? 0 : offset_array[val.offset - 1];
+                            uint16_t end_off = offset_array[val_ptr->offset];
+                            uint16_t start_off = (val_ptr->offset == 0) ? 0 : offset_array[val_ptr->offset - 1];
                             
                             str.assign(char_begin + start_off, end_off - start_off);
                         }
