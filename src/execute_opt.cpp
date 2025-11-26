@@ -225,9 +225,13 @@ ExecuteResult execute_hash_join(const Plan&          plan,
      *
      **/
 
-    bool determine_build_left = (left.size() < right.size()) ? true : false;
+    const auto& left_col = left[join.left_attr];
+    const auto& right_col = right[join.right_attr];
+
+
+    bool determine_build_left = (left_col.size() < right_col.size()) ? true : false;
     for (int i = 0; i < output_attrs.size(); i++)
-        results[i].reserve(determine_build_left ? right.size() : left.size());
+        results[i].reserve(determine_build_left ? right_col.size() : left_col.size());
 
     JoinAlgorithm join_algorithm{
     .build          = determine_build_left ? left  : right,

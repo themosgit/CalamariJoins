@@ -73,7 +73,7 @@ def save_results(executable, results, timestamp, arch, results_dir):
     print(f"  Results saved to {filepath}")
 
 def main():
-    executables = ['hopscotch']
+    executables = ['faster']
     project_dir = '.'
     iterations = 10
 
