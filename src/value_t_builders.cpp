@@ -44,8 +44,9 @@ namespace mema {
         for (size_t out_col_idx = 0; out_col_idx < output_attrs.size(); ++out_col_idx) {
             auto [col_idx, col_type] = output_attrs[out_col_idx];
             auto& column = table.columns[col_idx];
-            results[out_col_idx].reserve(table.num_rows);
-            
+            auto& result_col = results[out_col_idx];
+
+            result_col.reserve(table.num_rows);
             switch (column.type) {
                 case DataType::INT32: {
                     for (auto* page_obj : column.pages) {
@@ -59,10 +60,10 @@ namespace mema {
                         
                         for (uint16_t i = 0; i < num_rows; ++i) {
                             if (get_bitmap(bitmap, i)) {
-                                results[out_col_idx].append(
+                                result_col.append(
                                         {data_begin[data_idx++],0,0,0});
                             }else{
-                                results[out_col_idx].append_null();
+                                result_col.append_null();
                             }
                         }
                     }
@@ -82,39 +83,38 @@ namespace mema {
                         auto* page = page_obj->data;
                         auto num_rows = *reinterpret_cast<uint16_t*>(page);
                         if (num_rows == 0xffff) {
-                            results[out_col_idx].append( 
+                            result_col.append(
                                 {page_idx, table_idx,
                                     static_cast<uint8_t>(col_idx), UINT16_MAX});
                         }
                         else if (num_rows == 0xfffe) {
-                        } 
+                        }
                         else {
                             auto* bitmap = reinterpret_cast<uint8_t*>
                                 (page + PAGE_SIZE - (num_rows + 7) / 8);
                             uint16_t offset_idx = 0;
                             for (uint16_t i = 0; i < num_rows; ++i) {
                                 if (get_bitmap(bitmap, i)) {
-                                    results[out_col_idx].append(
+                                    result_col.append(
                                         {page_idx, table_idx,
                                             static_cast<uint8_t>(col_idx), offset_idx++});
                                 }else{
-                                    results[out_col_idx].append_null();
+                                    result_col.append_null();
                                 }
                             }
                         }
                         page_idx++;
                     }
                     break;
-                }
-                
+                } 
                 default:
                     break;
             }
         }
 
-        /* build cache boiii */
-        for (auto& col : results)
+        for (auto& col : results) {
             col.build_cache();
+        }
 
         return results;
     }

@@ -46,71 +46,126 @@ struct JoinAlgorithm {
 
 private: 
     void hash_join() {
-        RobinHoodTable hash_table(build[build_col].size() * 2);
         mema::column_t& build_column = build[build_col];
-        const size_t build_count = build_column.row_count();
-        for (size_t idx = 0; idx < build_count; idx++) {
-            const mema::value_t* key = build_column.get_by_row(idx);
-            if (key) hash_table.insert(key->value, idx);
-        }
-        
         mema::column_t& probe_column = probe[probe_col];
+
+        const bool build_direct = build_column.has_direct_access();
+        const bool probe_direct = probe_column.has_direct_access();
+
+        RobinHoodTable hash_table(build[build_col].size() * 2);
+        const size_t build_count = build_column.row_count();
+
+        if (build_direct) {
+            for (size_t idx = 0; idx < build_count; idx++) {
+                hash_table.insert(build_column[idx].value, idx);
+            }
+        } else {
+            for (size_t idx = 0; idx < build_count; idx++) {
+                const mema::value_t* key = build_column.get_by_row(idx);
+                if (key) hash_table.insert(key->value, idx);
+            }
+        }
+
         const size_t probe_count = probe_column.row_count();
-        if (swap) {
-            for (size_t idx = 0; idx < probe_count; idx++) {
-                const mema::value_t* key = probe_column.get_by_row(idx);
-                if (!key) continue;
-                
-                auto indices = hash_table.find(key->value);
-                for (size_t build_row_idx : indices) {
-                    construct_result(build_row_idx, idx);
+
+        if (probe_direct) {
+            if (swap) {
+                for (size_t idx = 0; idx < probe_count; idx++) {
+                    auto indices = hash_table.find(probe_column[idx].value);
+                    for (size_t build_row_idx : indices) {
+                        construct_result(build_row_idx, idx);
+                    }
+                }
+            } else {
+                for (size_t idx = 0; idx < probe_count; idx++) {
+                    auto indices = hash_table.find(probe_column[idx].value);
+                    for (size_t build_row_idx : indices) {
+                        construct_result(idx, build_row_idx);
+                    }
                 }
             }
         } else {
-            for (size_t idx = 0; idx < probe_count; idx++) {
-                const mema::value_t* key = probe_column.get_by_row(idx);
-                if (!key) continue;
-                
-                auto indices = hash_table.find(key->value);
-                for (size_t build_row_idx : indices) {
-                    construct_result(idx, build_row_idx);
+            if (swap) {
+                for (size_t idx = 0; idx < probe_count; idx++) {
+                    const mema::value_t* key = probe_column.get_by_row(idx);
+                    if (!key) continue;
+
+                    auto indices = hash_table.find(key->value);
+                    for (size_t build_row_idx : indices) {
+                        construct_result(build_row_idx, idx);
+                    }
+                }
+            } else {
+                for (size_t idx = 0; idx < probe_count; idx++) {
+                    const mema::value_t* key = probe_column.get_by_row(idx);
+                    if (!key) continue;
+
+                    auto indices = hash_table.find(key->value);
+                    for (size_t build_row_idx : indices) {
+                        construct_result(idx, build_row_idx);
+                    }
                 }
             }
         }
     }
 
     void nested_loop_join() {
-        if (build.size() == 0 || probe.size() == 0 || 
+        if (build.size() == 0 || probe.size() == 0 ||
             build_col >= build.size() || probe_col >= probe.size()) {
             return;
         }
-        
+
         mema::column_t& build_column = build[build_col];
         mema::column_t& probe_column = probe[probe_col];
         const size_t build_count = build_column.row_count();
         const size_t probe_count = probe_column.row_count();
-        
-        if (swap) {
-            for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
-                const mema::value_t* build_key = build_column.get_by_row(build_idx);
-                if (!build_key) continue;
-                
-                for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
-                    const mema::value_t* probe_key = probe_column.get_by_row(probe_idx);
-                    if (probe_key && probe_key->value == build_key->value) {
-                        construct_result(build_idx, probe_idx);
+
+        const bool build_direct = build_column.has_direct_access();
+        const bool probe_direct = probe_column.has_direct_access();
+
+        if (build_direct && probe_direct) {
+            if (swap) {
+                for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
+                    int build_value = build_column[build_idx].value;
+                    for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
+                        if (probe_column[probe_idx].value == build_value) {
+                            construct_result(build_idx, probe_idx);
+                        }
+                    }
+                }
+            } else {
+                for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
+                    int build_value = build_column[build_idx].value;
+                    for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
+                        if (probe_column[probe_idx].value == build_value) {
+                            construct_result(probe_idx, build_idx);
+                        }
                     }
                 }
             }
         } else {
-            for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
-                const mema::value_t* build_key = build_column.get_by_row(build_idx);
-                if (!build_key) continue;
-                
-                for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
-                    const mema::value_t* probe_key = probe_column.get_by_row(probe_idx);
-                    if (probe_key && probe_key->value == build_key->value) {
-                        construct_result(probe_idx, build_idx);
+            if (swap) {
+                for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
+                    const mema::value_t* build_key = build_column.get_by_row(build_idx);
+                    if (!build_key) continue;
+
+                    for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
+                        const mema::value_t* probe_key = probe_column.get_by_row(probe_idx);
+                        if (probe_key && probe_key->value == build_key->value) {
+                            construct_result(build_idx, probe_idx);
+                        }
+                    }
+                }
+            } else {
+                for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
+                    const mema::value_t* build_key = build_column.get_by_row(build_idx);
+                    if (!build_key) continue;
+
+                    for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
+                        const mema::value_t* probe_key = probe_column.get_by_row(probe_idx);
+                        if (probe_key && probe_key->value == build_key->value) {
+                            construct_result(probe_idx, build_idx);
+                        }
                     }
                 }
             }
@@ -128,7 +183,6 @@ private:
         
         for (auto [col_idx, _] : output_attrs) {
             const mema::value_t* value;
-            
             if (col_idx < left_table_size) {
                 value = (*left_table_ref)[col_idx].get_by_row(left_row);
             } else {
@@ -186,8 +240,10 @@ ExecuteResult execute_hash_join(const Plan&          plan,
     
 
     join_algorithm.run();
-    for (auto& col : results)
+
+    for (auto& col : results) {
         col.build_cache();
+    }
 
     return results;
 }

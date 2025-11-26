@@ -38,13 +38,13 @@ namespace mema {
         };
 
         std::vector<Page*> pages;
-        std::vector<uint64_t> bitmap;
         size_t num_values = 0;
         size_t num_rows = 0;
 
-        /* number of 1s per uint64_t bitmap */
+        bool direct_access = true;
+
+        std::vector<uint64_t> bitmap;
         std::vector<uint32_t> chunk_prefix_sum;
-        bool cache = false;
 
         inline void set_bit(size_t idx) {
             size_t target_idx = idx >> 6;
@@ -53,10 +53,22 @@ namespace mema {
             }
             bitmap[target_idx] |= (1ULL << (idx & 0x3F));
         }
+
+
         inline bool is_bit_set(size_t idx) const {
             size_t target_idx = idx >> 6;
             if (target_idx >= bitmap.size()) return false;
             return (bitmap[target_idx] & (1ULL << (idx & 0x3F))) != 0;
+        }
+
+        inline void backfill_previous_bits() {
+            if (num_rows == 0) return;
+
+            size_t last_chunk = (num_rows - 1) >> 6;
+            bitmap.resize(last_chunk + 1, ~0ULL);
+
+            size_t last_bit_offset = (num_rows - 1) & 0x3F;
+            bitmap[last_chunk] = (1ULL << (last_bit_offset + 1)) - 1;
         }
 
     public:
@@ -68,43 +80,31 @@ namespace mema {
         }
 
         /* if we know the size we can pre allocate */
-        void reserve(size_t expected_rows) {
-            bitmap.resize((expected_rows + 63) >> 6, 0);
+        inline void reserve(size_t expected_rows) {
             pages.reserve((expected_rows + CAP_PER_PAGE - 1) / CAP_PER_PAGE);
         }
 
         /* appends value to page creates one if needed
          * simplified index calculation sets bitmap as well */
-        void append(const value_t& val){
+        inline void append(const value_t& val){
             if(num_values % CAP_PER_PAGE == 0) {
                 pages.push_back(new Page());
             }
             pages.back()->data[num_values % CAP_PER_PAGE] = val;
-            set_bit(num_rows);
+            if (!direct_access) set_bit(num_rows);
             num_values++;
             num_rows++;
         }
 
         /* when the value is null
          * we just iterate the num rows */
-        void append_null() {
+        inline void append_null() {
+            if (direct_access) {
+                direct_access = false;
+                backfill_previous_bits();
+            }
             num_rows++;
         }
-
-        void build_cache() {
-            if (cache) return;
-
-            chunk_prefix_sum.clear();
-            chunk_prefix_sum.reserve(bitmap.size());
-
-            uint32_t total_count = 0;
-            for (uint64_t chunk : bitmap) {
-                chunk_prefix_sum.push_back(total_count);
-                total_count += __builtin_popcountll(chunk);
-            }
-            cache = true;
-        }
-
 
         const value_t& operator[](size_t idx) const {
             return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
@@ -112,7 +112,11 @@ namespace mema {
 
         /* navigates to the correct value index by calculating
          * popcount up to that point in the bitmap */
-        const value_t* get_by_row(size_t row_idx) const {
+       inline const value_t* get_by_row(size_t row_idx) const {
+            if (direct_access) {
+                return (row_idx < num_rows) ? &(*this)[row_idx] : nullptr;
+            }
+
             if(!is_bit_set(row_idx)) return nullptr;
 
             size_t chunk_idx = row_idx >> 6;
@@ -125,9 +129,22 @@ namespace mema {
             return &(*this)[value_idx];
         }
 
+        inline void build_cache() {
+            if (direct_access) return;
+
+            chunk_prefix_sum.clear();
+            chunk_prefix_sum.reserve(bitmap.size());
+
+            uint32_t total_count = 0;
+            for (uint64_t chunk : bitmap) {
+                chunk_prefix_sum.push_back(total_count);
+                total_count += __builtin_popcountll(chunk);
+            }
+        }
+
         size_t size() const { return num_values; }
         size_t row_count() const { return num_rows; }
-        bool has_cache() const { return cache; }
+        bool has_direct_access() const { return direct_access; }
 
     };
 
