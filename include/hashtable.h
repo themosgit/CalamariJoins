@@ -1,119 +1,244 @@
 #pragma once
 
-#if defined(__x86_64__)
-    #include <immintrin.h>
-#endif
-
-#include <vector>
 #include <cstddef>
 #include <cstdint>
-#include <hashtable_structs.h>
+#include <cstring>
+#include <value_t_builders.h>
+#include <vector>
 
-/**
- *
- *  Robin hood hashing algorithm: the idea behind this hashing
- *  algorithm is to keep the psl(probe sequence length) as low as possible.
- *  Psl is the distance from key's ideal position to actual position.
- *  on collision if new key has higher psl than existing key, they swap
- *  positions this keeps the variance low and search fast enhanced with
- *  value store and segment logic for efficient duplicate key handling
- *
- **/
 
-using Key = int32_t;
+class UnchainedHashtable {
+public:
+  struct Tuple {
+    int32_t key;
+    uint32_t row_id;
+  };
 
-struct Entry {
-    Key key;
-    size_t psl;
-    uint32_t first_segment;
-    uint32_t last_segment;
-    uint16_t count;
-
-    Entry() : psl(0), first_segment(0), last_segment(UINT32_MAX), count(0) {}
-    Entry(Key k, size_t p, uint32_t item)
-        : key(k), psl(p), first_segment(0), last_segment(item), count(1) {}
-};
-
-class RobinHoodTable {
 private:
-    size_t size;
-    std::vector<Entry> table;
-    std::vector<uint32_t> value_store;
-    std::vector<Segment> segments;
-    Entry temp_entry;
-    BloomFilter bloom;
+  std::vector<uint64_t> directory;
+  std::vector<Tuple> value_store;
+  size_t shift;
 
-    inline size_t hash(const Key& key) const noexcept {
-        return (size_t)(key * 0x85ebca6b) | ((size_t)(key * 0xc2b2ae35)) << 32;
-    }
+  static inline uint64_t hash_key(int32_t k) {
+    uint64_t key = (uint64_t)k;
+    return (key * 0x85ebca6b) ^ ((key * 0xc2b2ae35) << 32);
+  }
 
-    inline void SetTempEntry(const Key& key, uint32_t item) noexcept {
-        temp_entry.key = key;
-        temp_entry.psl = 0;
-        temp_entry.first_segment = 0;
-        temp_entry.last_segment = item;
-        temp_entry.count = 1;
-    }
+  /**
+   * 
+   *  a clever methods that sets
+   *  sets of 4 bits with different
+   *  parts of the hash allowing
+   *  for more sparsity and 
+   *  fewer false positives
+   *
+   **/
+  static inline uint16_t compute_bloom(uint64_t hash) {
+    uint16_t mask = 0;
+    mask |= (1 << (hash & 0xF));
+    mask |= (1 << ((hash >> 4) & 0xF));
+    mask |= (1 << ((hash >> 8) & 0xF));
+    mask |= (1 << ((hash >> 12) & 0xF));
+    return mask;
+  }
 
 public:
-    RobinHoodTable(size_t build_size) : bloom(build_size) {
-        build_size = build_size ? build_size : 1;
-        size = 1ULL << (64 - __builtin_clzll(build_size - 1));
-        table.resize(size);
-        value_store.reserve(build_size / 2);
-        segments.reserve(build_size / 4);
+  UnchainedHashtable(size_t build_size) {
+    size_t dir_size = build_size > 0 ? build_size : 1;
+    size_t pow2 = 1ULL << (64 - __builtin_clzll(dir_size - 1));
+
+    if (pow2 < 2048)
+      pow2 = 2048;
+
+    directory.resize(pow2, 0);
+
+    /**
+     * 
+     *  shift determines the bits used
+     *  to select a bucket be using
+     *  trailing zeros etc.
+     *
+     *  this is the exact amout of bits
+     *  we need to reference its slot
+     *  in the directory
+     *
+     **/
+    shift = 64 - __builtin_ctzll(pow2);
+    value_store.reserve(build_size);
+  }
+
+  void build(const mema::column_t &column) {
+    if (column.has_direct_access()) {
+      build_dense(column);
+    } else {
+      build_sparse(column);
+    }
+  }
+
+private:
+  /* builds the hash table from a nun null column */
+  void build_dense(const mema::column_t &column) {
+    const size_t rows = column.row_count();
+    std::vector<uint32_t> counts(directory.size(), 0);
+
+    /* counts how many values go hash in each bucket */
+    for (size_t i = 0; i < rows; ++i) {
+      uint64_t h = hash_key(column[i].value);
+      counts[h >> shift]++;
     }
 
-    const size_t capacity(void) {
-        return size;
+    /**
+     *
+     *  creates prefix sum in order to index
+     *  each bucket in the value store 
+     *
+     *  after the prefix sum is calculated
+     *  the counts is set to that value
+     *  meaning that count temporaraly
+     *  stores the indexes to value store
+     *  those indexes will be stored in
+     *  the directory during the next phase
+     *  of building
+     *
+     **/
+    uint32_t current_offset = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+      uint32_t count = counts[i];
+      counts[i] = current_offset;
+      current_offset += count;
     }
 
-    void insert(const Key& key, uint32_t idx) {
-        bloom.insert(hash(key));
-        SetTempEntry(key, idx);
-        size_t p = hash(key) & (size - 1);
-        while (table[p].count != 0) {
-            if (table[p].key == key) {
-                insert_duplicate(table[p], idx,
-                    value_store, segments);
-                return;
-            }
-            if (temp_entry.psl > table[p].psl)
-                std::swap(temp_entry, table[p]);
+    value_store.resize(current_offset);
 
-            p = (p + 1) & (size - 1);
-            temp_entry.psl++;
-        }
-        table[p] = temp_entry;
+    /**
+     *
+     *  Hashes keys and stores the
+     *  key index tuples within value
+     *  store using the prefix sums
+     *  created earlier
+     *
+     *  increments its prefix sum to store
+     *  next tuple in the next slot by the
+     *  end of the procedure counts will
+     *  be brought to the original form
+     *  before the prefix calculations
+     *  were made.
+     *
+     *  also creates a bloom for that value
+     *  and stores it in the directory
+     *
+     **/
+
+    for (size_t i = 0; i < rows; ++i) {
+      int32_t val = column[i].value;
+      uint64_t h = hash_key(val);
+      size_t slot = h >> shift;
+      uint32_t pos = counts[slot]++;
+      value_store[pos] = {val, (uint32_t)i};
+      directory[slot] |= compute_bloom(h);
     }
 
-    ValueSpan<Key> find(const Key& key) const noexcept {
-        if (!bloom.contains(hash(key)))
-            return{ nullptr, nullptr, UINT32_MAX, 0};
-        size_t p = hash(key) & (size - 1);
-        size_t vpsl = 0;
-        while (table[p].count > 0) {
-            if (table[p].key == key) {
-                const Entry& entry = table[p];
-                if (entry.count == 1) {
-                    return { nullptr, nullptr,
-                        entry.last_segment, entry.count };
-                }
-                return { &value_store, &segments,
-                    entry.first_segment, entry.count };
-            }
-            /**
-             *
-             *  if the psl of the key we're searching exceeds
-             *  the psl of the current bucket  it means that
-             *  the key cannot be present beyond this point so
-             *  we stop searching.
-             *
-             **/
-            if (vpsl > table[p].psl) break;
-            p = (p + 1) & (size - 1);
-            vpsl++;
-        }
-        return {nullptr, nullptr, UINT32_MAX, 0};
+    finalize_directory(counts);
+  }
+
+  /* build hash table from a column with null values */
+  void build_sparse(const mema::column_t &column) {
+    const size_t rows = column.row_count();
+    std::vector<uint32_t> counts(directory.size(), 0);
+
+    /**
+     *
+     * this makes a temp buffer
+     * so we dont call get_by_row
+     * 3 times.
+     *
+     **/
+    std::vector<Tuple> temp_input;
+    temp_input.reserve(rows);
+    for (size_t i = 0; i < rows; ++i) {
+      const mema::value_t *val = column.get_by_row(i);
+      if (val) {
+        temp_input.push_back({val->value, (uint32_t)i});
+      }
     }
+
+    /* same proccess as build_dense */
+
+    for (const auto &t : temp_input) {
+      uint64_t h = hash_key(t.key);
+      counts[h >> shift]++;
+    }
+
+    uint32_t current_offset = 0;
+    for (size_t i = 0; i < counts.size(); ++i) {
+      uint32_t count = counts[i];
+      counts[i] = current_offset;
+      current_offset += count;
+    }
+
+    value_store.resize(current_offset);
+    for (const auto &t : temp_input) {
+      uint64_t h = hash_key(t.key);
+      size_t slot = h >> shift;
+
+      uint32_t pos = counts[slot]++;
+      value_store[pos] = t;
+      directory[slot] |= compute_bloom(h);
+    }
+
+    finalize_directory(counts);
+  }
+
+  /**
+   *
+   *  this functions packs blooms filter and value store index
+   *  upper 48 bits are the index in value store lower 16 bits
+   *  are the bloom filter
+   *
+   **/
+  inline void finalize_directory(const std::vector<uint32_t> &final_offsets) {
+    for (size_t i = 0; i < directory.size(); ++i) {
+      uint64_t end_idx = final_offsets[i];
+      uint64_t bloom = directory[i] & 0xFFFF;
+      directory[i] = (end_idx << 16) | bloom;
+    }
+  }
+
+public:
+
+  /**
+   *
+   * returns a span of entries
+   * within the value_store
+   * for easy iteration
+   *
+   * but in contrast to previous
+   * implementations we have to validate
+   * the output of those as they might be
+   * refering to other keys as well
+   *
+   **/
+  inline std::pair<const Tuple *, const Tuple *> find(int32_t key) const {
+    uint64_t h = hash_key(key);
+    size_t slot = h >> shift;
+    uint64_t entry = directory[slot];
+
+    /* checks if value is in filter */
+    uint16_t filter = (uint16_t)entry;
+    uint16_t key_mask = compute_bloom(h);
+
+    if ((filter & key_mask) != key_mask) {
+      return {nullptr, nullptr};
+    }
+    /* shifts bloom out and
+     * indexes value_store */
+    uint64_t end_idx = entry >> 16;
+    uint64_t start_idx = (slot == 0) ? 0 : (directory[slot - 1] >> 16);
+
+    if (start_idx >= end_idx) {
+      return {nullptr, nullptr};
+    }
+
+    return {&value_store[start_idx], &value_store[end_idx]};
+  }
 };

@@ -12,18 +12,18 @@
 #define SPC__SUPPORTS_NEON
 
 // l1 and l2 caches from performance cores
-#define SPC__LEVEL1_ICACHE_SIZE                 196608  // 128 KB
-#define SPC__LEVEL1_ICACHE_ASSOC                8
-#define SPC__LEVEL1_ICACHE_LINESIZE             128
-#define SPC__LEVEL1_DCACHE_SIZE                 131072   // 64 KB
-#define SPC__LEVEL1_DCACHE_ASSOC                8
-#define SPC__LEVEL1_DCACHE_LINESIZE             128
-#define SPC__LEVEL2_CACHE_SIZE                  12582912 // 4 MB
-#define SPC__LEVEL2_CACHE_ASSOC                 16
-#define SPC__LEVEL2_CACHE_LINESIZE              128
-#define SPC__LEVEL3_CACHE_SIZE                  0
-#define SPC__LEVEL3_CACHE_ASSOC                 0
-#define SPC__LEVEL3_CACHE_LINESIZE              0
-#define SPC__LEVEL4_CACHE_SIZE                  0
-#define SPC__LEVEL4_CACHE_ASSOC                 0
-#define SPC__LEVEL4_CACHE_LINESIZE              0
+#define SPC__LEVEL1_ICACHE_SIZE 196608 // 128 KB
+#define SPC__LEVEL1_ICACHE_ASSOC 8
+#define SPC__LEVEL1_ICACHE_LINESIZE 128
+#define SPC__LEVEL1_DCACHE_SIZE 131072 // 64 KB
+#define SPC__LEVEL1_DCACHE_ASSOC 8
+#define SPC__LEVEL1_DCACHE_LINESIZE 128
+#define SPC__LEVEL2_CACHE_SIZE 12582912 // 4 MB
+#define SPC__LEVEL2_CACHE_ASSOC 16
+#define SPC__LEVEL2_CACHE_LINESIZE 128
+#define SPC__LEVEL3_CACHE_SIZE 0
+#define SPC__LEVEL3_CACHE_ASSOC 0
+#define SPC__LEVEL3_CACHE_LINESIZE 0
+#define SPC__LEVEL4_CACHE_SIZE 0
+#define SPC__LEVEL4_CACHE_ASSOC 0
+#define SPC__LEVEL4_CACHE_LINESIZE 0

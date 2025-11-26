@@ -1,0 +1,8 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# 1. Set your target ideal length
+ColumnLimit: 80
+# 2. Use spaces instead of tabs
+TabWidth: 4
