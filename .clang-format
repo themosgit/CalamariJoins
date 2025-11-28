@@ -4,5 +4,14 @@ BasedOnStyle: LLVM
 
 # 1. Set your target ideal length
 ColumnLimit: 80
-# 2. Use spaces instead of tabs
+
+# 2. Use spaces instead of tabs (recommended for consistency)
+# UseTab: Never is often the default, but it's good to be explicit
+UseTab: Never
+
+# 3. SET THE INDENTATION WIDTH to 4 SPACES
+IndentWidth: 4
+
+# TabWidth is only relevant if you are actually using tabs, 
+# but setting it to match your IndentWidth is harmless.
 TabWidth: 4

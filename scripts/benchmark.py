@@ -77,7 +77,7 @@ def main():
     project_dir = '.'
     iterations = 10
 
-    RESULTS_DIR = '../project-site/benchmark_results'
+    RESULTS_DIR = '../project-site/benchmark_results/part2'
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     num_cores = str(multiprocessing.cpu_count())
