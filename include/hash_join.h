@@ -1,0 +1,166 @@
+#pragma once
+
+#include <construct_intermediate.h>
+#include <hashtable.h>
+#include <intermediate.h>
+#include <join_setup.h>
+
+/**
+ *
+ *  hash join operations for building and probing hash tables
+ *
+ *  this header contains the build and probe phases of hash joins
+ *  supports both ColumnarTable columnar and column_t intermediate inputs
+ *
+ *  build phase constructs unchained hash table with bloom filters
+ *  probe phase searches hash table and collects matches
+ *
+ **/
+
+namespace Contest {
+
+/**
+ *
+ *  builds hash table from ColumnarTable columnar input
+ *  reads directly from original page format
+ *  constructs unchained hash table with bloom filters
+ *
+ **/
+inline UnchainedHashtable build_from_columnar(const JoinInput &input,
+                                              size_t attr_idx) {
+    auto *table = std::get<const ColumnarTable *>(input.data);
+    auto [actual_col_idx, _] = input.node->output_attrs[attr_idx];
+    const Column &column = table->columns[actual_col_idx];
+
+    size_t row_count = input.row_count(attr_idx);
+    UnchainedHashtable hash_table(row_count);
+    hash_table.build(column);
+
+    return hash_table;
+}
+
+/**
+ *
+ *  builds hash table from column_t intermediate results
+ *  works with intermediate results from previous joins
+ *  constructs unchained hash table with bloom filters
+ *
+ **/
+inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
+                                                  size_t attr_idx) {
+    const auto &result = std::get<ExecuteResult>(input.data);
+    const auto &column = result[attr_idx];
+
+    size_t row_count = input.row_count(attr_idx);
+    UnchainedHashtable hash_table(row_count);
+    hash_table.build(column);
+
+    return hash_table;
+}
+
+/**
+ *
+ *  probes hash table with values from ColumnarTable columnar input
+ *  reads directly from original page format
+ *  handles both dense and sparse pages with bitmaps
+ *  collects matches into MatchCollector for materialization
+ *
+ **/
+inline void probe_columnar(const UnchainedHashtable &hash_table,
+                           const JoinInput &probe_input, size_t probe_attr,
+                           MatchCollector &collector) {
+    const int32_t *keys = hash_table.get_keys();
+    const uint32_t *row_ids = hash_table.get_row_ids();
+
+    auto *table = std::get<const ColumnarTable *>(probe_input.data);
+    auto [actual_col_idx, _] = probe_input.node->output_attrs[probe_attr];
+    const Column &probe_col = table->columns[actual_col_idx];
+
+    uint32_t probe_row_id = 0;
+    for (auto *page_obj : probe_col.pages) {
+        auto *page = page_obj->data;
+        auto num_rows = *reinterpret_cast<const uint16_t *>(page);
+        auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
+        auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
+
+        if (num_rows == num_values) {
+            for (uint16_t i = 0; i < num_rows; ++i) {
+                int32_t key_val = data_begin[i];
+                auto [start_idx, end_idx] = hash_table.find_indices(key_val);
+
+                for (uint64_t j = start_idx; j < end_idx; ++j) {
+                    if (keys[j] == key_val) {
+                        collector.add_match(row_ids[j], probe_row_id);
+                    }
+                }
+                probe_row_id++;
+            }
+        } else {
+            auto *bitmap = reinterpret_cast<const uint8_t *>(
+                page + PAGE_SIZE - (num_rows + 7) / 8);
+            uint16_t data_idx = 0;
+            for (uint16_t i = 0; i < num_rows; ++i) {
+                bool is_valid = bitmap[i / 8] & (1u << (i % 8));
+                if (is_valid) {
+                    int32_t key_val = data_begin[data_idx++];
+                    auto [start_idx, end_idx] =
+                        hash_table.find_indices(key_val);
+
+                    for (uint64_t j = start_idx; j < end_idx; ++j) {
+                        if (keys[j] == key_val) {
+                            collector.add_match(row_ids[j], probe_row_id);
+                        }
+                    }
+                }
+                probe_row_id++;
+            }
+        }
+    }
+}
+
+/**
+ *
+ *  probes hash table with values from column_t intermediate results
+ *  handles both direct access and sparse column_t formats
+ *  skips null values in sparse columns
+ *  collects matches into MatchCollector for materialization
+ *
+ **/
+inline void probe_intermediate(const UnchainedHashtable &hash_table,
+                               const mema::column_t &probe_column,
+                               MatchCollector &collector) {
+    const int32_t *keys = hash_table.get_keys();
+    const uint32_t *row_ids = hash_table.get_row_ids();
+
+    const size_t probe_count = probe_column.row_count();
+    const bool probe_direct = probe_column.has_direct_access();
+
+    if (probe_direct) {
+        for (size_t idx = 0; idx < probe_count; ++idx) {
+            int32_t key_val = probe_column[idx].value;
+            auto [start_idx, end_idx] = hash_table.find_indices(key_val);
+
+            for (uint64_t i = start_idx; i < end_idx; ++i) {
+                if (keys[i] == key_val) {
+                    collector.add_match(row_ids[i], idx);
+                }
+            }
+        }
+    } else {
+        for (size_t idx = 0; idx < probe_count; ++idx) {
+            const mema::value_t *key = probe_column.get_by_row(idx);
+            if (key != nullptr) {
+                int32_t key_val = key->value;
+                auto [start_idx, end_idx] = hash_table.find_indices(key_val);
+
+                for (uint64_t i = start_idx; i < end_idx; ++i) {
+                    if (keys[i] == key_val) {
+                        collector.add_match(row_ids[i], idx);
+                    }
+                }
+            }
+        }
+    }
+}
+
+} // namespace Contest

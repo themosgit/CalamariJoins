@@ -68,15 +68,7 @@ file(GLOB ALL_SRC
     "src/*.cpp"
 )
 
-set(SIGMODPC_SRC ${ALL_SRC})
-list(REMOVE_ITEM SIGMODPC_SRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute_opt.cpp"
-)
-
 set(MANOLATES_SRC ${ALL_SRC})
-list(REMOVE_ITEM MANOLATES_SRC 
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/execute.cpp"
-)
 
 # Enable server-specific compiler optimizations.
 # Use march=native for all but Power servers, which results in the following error:
@@ -88,28 +80,15 @@ else()
     add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive)
 endif()
 
-add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
-add_executable(unit_tests_opt ${MANOLATES_SRC} tests/unit_tests.cpp)
+add_executable(unit_tests ${MANOLATES_SRC} tests/unit_tests.cpp)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    add_executable(fast ${SIGMODPC_SRC} tests/read_sql.cpp)
-    target_compile_definitions(fast PRIVATE)
-    target_link_libraries(fast PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-    target_include_directories(fast PRIVATE include)
-
     add_executable(faster ${MANOLATES_SRC} tests/read_sql.cpp)
     target_compile_definitions(faster PRIVATE)
     target_link_libraries(faster PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(faster PRIVATE include)
-
 endif()
 
+target_compile_definitions(unit_tests PRIVATE)
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(unit_tests PRIVATE include)
-
-target_compile_definitions(unit_tests_opt PRIVATE)
-target_link_libraries(unit_tests_opt PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
-target_include_directories(unit_tests_opt PRIVATE include)
-
-
-

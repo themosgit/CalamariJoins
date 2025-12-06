@@ -1,9 +1,9 @@
 #pragma once
 
-#include <columnar_structs.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <intermediate.h>
 #include <vector>
 
 class UnchainedHashtable {
@@ -15,7 +15,11 @@ class UnchainedHashtable {
 
   private:
     std::vector<uint64_t> directory;
-    std::vector<Tuple> value_store;
+
+    /* structure of srrays layout for better cache locality */
+    std::vector<int32_t> keys;
+    std::vector<uint32_t> row_ids;
+
     int shift;
 
     static inline uint64_t hash_key(int32_t k) {
@@ -63,7 +67,8 @@ class UnchainedHashtable {
          *
          **/
         shift = 64 - __builtin_ctzll(pow2);
-        value_store.reserve(build_size);
+        keys.reserve(build_size);
+        row_ids.reserve(build_size);
     }
 
     void build(const mema::column_t &column) {
@@ -74,8 +79,10 @@ class UnchainedHashtable {
         }
     }
 
+    void build(const Column &column) { build_from_column(column); }
+
   private:
-    /* builds the hash table from a nun null column */
+    /* builds the hash table from a non-null column */
     void build_dense(const mema::column_t &column) {
         const size_t rows = column.row_count();
         std::vector<uint32_t> counts(directory.size(), 0);
@@ -107,33 +114,17 @@ class UnchainedHashtable {
             current_offset += count;
         }
 
-        value_store.resize(current_offset);
+        keys.resize(current_offset);
+        row_ids.resize(current_offset);
 
-        /**
-         *
-         *  hashes keys and stores the
-         *  key index tuples within value
-         *  store using the prefix sums
-         *  created earlier
-         *
-         *  increments its prefix sum to store
-         *  next tuple in the next slot by the
-         *  end of the procedure counts will
-         *  be brought to the original form
-         *  before the prefix calculations
-         *  were made.
-         *
-         *  also creates a bloom for that value
-         *  and stores it in the directory
-         *
-         **/
-
+        /* scatter directly from source - no intermediate buffer needed */
         for (size_t i = 0; i < rows; ++i) {
             int32_t val = column[i].value;
             uint64_t h = hash_key(val);
             size_t slot = h >> shift;
             uint32_t pos = counts[slot]++;
-            value_store[pos] = {val, (uint32_t)i};
+            keys[pos] = val;
+            row_ids[pos] = (uint32_t)i;
             directory[slot] |= compute_bloom(h);
         }
 
@@ -147,27 +138,21 @@ class UnchainedHashtable {
 
         /**
          *
-         * this makes a temp buffer
-         * so we dont call get_by_row
-         * 3 times.
+         *  two-pass approach to avoid temp_input buffer
+         *  pass 1 count per bucket
+         *  pass 2 directly populate
          *
          **/
-        std::vector<Tuple> temp_input;
-        temp_input.reserve(rows);
+
         for (size_t i = 0; i < rows; ++i) {
             const mema::value_t *val = column.get_by_row(i);
             if (val) {
-                temp_input.push_back({val->value, (uint32_t)i});
+                uint64_t h = hash_key(val->value);
+                counts[h >> shift]++;
             }
         }
 
-        /* same proccess as build_dense */
-
-        for (const auto &t : temp_input) {
-            uint64_t h = hash_key(t.key);
-            counts[h >> shift]++;
-        }
-
+        /* prefix sum */
         uint32_t current_offset = 0;
         for (size_t i = 0; i < counts.size(); ++i) {
             uint32_t count = counts[i];
@@ -175,14 +160,106 @@ class UnchainedHashtable {
             current_offset += count;
         }
 
-        value_store.resize(current_offset);
-        for (const auto &t : temp_input) {
-            uint64_t h = hash_key(t.key);
-            size_t slot = h >> shift;
+        keys.resize(current_offset);
+        row_ids.resize(current_offset);
 
-            uint32_t pos = counts[slot]++;
-            value_store[pos] = t;
-            directory[slot] |= compute_bloom(h);
+        for (size_t i = 0; i < rows; ++i) {
+            const mema::value_t *val = column.get_by_row(i);
+            if (val) {
+                int32_t key_val = val->value;
+                uint64_t h = hash_key(key_val);
+                size_t slot = h >> shift;
+                uint32_t pos = counts[slot]++;
+                keys[pos] = key_val;
+                row_ids[pos] = (uint32_t)i;
+                directory[slot] |= compute_bloom(h);
+            }
+        }
+
+        finalize_directory(counts);
+    }
+
+    /* build hash table from original Column format two-pass approach */
+    void build_from_column(const Column &column) {
+        std::vector<uint32_t> counts(directory.size(), 0);
+
+        uint32_t global_row_id = 0;
+        for (auto *page_obj : column.pages) {
+            auto *page = page_obj->data;
+            auto num_rows = *reinterpret_cast<const uint16_t *>(page);
+            auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
+            auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
+
+            if (num_rows == num_values) {
+                for (uint16_t i = 0; i < num_rows; ++i) {
+                    uint64_t h = hash_key(data_begin[i]);
+                    counts[h >> shift]++;
+                }
+                global_row_id += num_rows;
+            } else {
+                auto *bitmap = reinterpret_cast<const uint8_t *>(
+                    page + PAGE_SIZE - (num_rows + 7) / 8);
+                uint16_t data_idx = 0;
+                for (uint16_t i = 0; i < num_rows; ++i) {
+                    bool is_valid = bitmap[i / 8] & (1u << (i % 8));
+                    if (is_valid) {
+                        uint64_t h = hash_key(data_begin[data_idx++]);
+                        counts[h >> shift]++;
+                    }
+                    global_row_id++;
+                }
+            }
+        }
+
+        /* prefix sum to get bucket offsets */
+        uint32_t current_offset = 0;
+        for (size_t i = 0; i < counts.size(); ++i) {
+            uint32_t count = counts[i];
+            counts[i] = current_offset;
+            current_offset += count;
+        }
+
+        keys.resize(current_offset);
+        row_ids.resize(current_offset);
+
+        global_row_id = 0;
+        for (auto *page_obj : column.pages) {
+            auto *page = page_obj->data;
+            auto num_rows = *reinterpret_cast<const uint16_t *>(page);
+            auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
+            auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
+
+            if (num_rows == num_values) {
+                /* dense page - direct scatter */
+                for (uint16_t i = 0; i < num_rows; ++i) {
+                    int32_t val = data_begin[i];
+                    uint64_t h = hash_key(val);
+                    size_t slot = h >> shift;
+                    uint32_t pos = counts[slot]++;
+                    keys[pos] = val;
+                    row_ids[pos] = global_row_id + i;
+                    directory[slot] |= compute_bloom(h);
+                }
+                global_row_id += num_rows;
+            } else {
+                /* sparse page - selective copy */
+                auto *bitmap = reinterpret_cast<const uint8_t *>(
+                    page + PAGE_SIZE - (num_rows + 7) / 8);
+                uint16_t data_idx = 0;
+                for (uint16_t i = 0; i < num_rows; ++i) {
+                    bool is_valid = bitmap[i / 8] & (1u << (i % 8));
+                    if (is_valid) {
+                        int32_t val = data_begin[data_idx++];
+                        uint64_t h = hash_key(val);
+                        size_t slot = h >> shift;
+                        uint32_t pos = counts[slot]++;
+                        keys[pos] = val;
+                        row_ids[pos] = global_row_id;
+                        directory[slot] |= compute_bloom(h);
+                    }
+                    global_row_id++;
+                }
+            }
         }
 
         finalize_directory(counts);
@@ -190,7 +267,7 @@ class UnchainedHashtable {
 
     /**
      *
-     *  this functions packs blooms filter and value store index
+     *  packs blooms filter and value store index
      *  upper 48 bits are the index in value store lower 16 bits
      *  are the bloom filter
      *
@@ -204,39 +281,29 @@ class UnchainedHashtable {
     }
 
   public:
-    /**
-     *
-     * returns a span of entries
-     * within the value_store
-     * for easy iteration
-     *
-     * but in contrast to previous
-     * implementations we have to validate
-     * the output of those as they might be
-     * refering to other keys as well
-     *
-     **/
-    inline std::pair<const Tuple *, const Tuple *> find(int32_t key) const {
+    /* returns index range into keys/row_ids arrays for a given key */
+    inline std::pair<uint64_t, uint64_t> find_indices(int32_t key) const {
         uint64_t h = hash_key(key);
         size_t slot = h >> shift;
         uint64_t entry = directory[slot];
 
-        /* checks if value is in filter */
         uint16_t filter = (uint16_t)entry;
         uint16_t key_mask = compute_bloom(h);
 
         if ((filter & key_mask) != key_mask) {
-            return {nullptr, nullptr};
+            return {0, 0};
         }
-        /* shifts bloom out and
-         * indexes value_store */
+
         uint64_t end_idx = entry >> 16;
         uint64_t start_idx = (slot == 0) ? 0 : (directory[slot - 1] >> 16);
 
         if (start_idx >= end_idx) {
-            return {nullptr, nullptr};
+            return {0, 0};
         }
 
-        return {&value_store[start_idx], &value_store[end_idx]};
+        return {start_idx, end_idx};
     }
+
+    inline const int32_t *get_keys() const { return keys.data(); }
+    inline const uint32_t *get_row_ids() const { return row_ids.data(); }
 };

@@ -19,20 +19,12 @@ jobs:
     - name: Checkout repository code
       uses: actions/checkout@v4
 
-    # - name: Install dependencies
-    #   run: |
-    #     sudo apt-get update
-
     - name: Configure initial build with CMake
       run: |
         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
 
     - name: Build all targets
-      run: cmake --build build -- -j $(nproc) unit_tests unit_tests_opt 
-
+      run: cmake --build build -- -j $(nproc) unit_tests
 
     - name: Run unit tests
       run: ./build/unit_tests
-
-    - name: Run unit tests opt
-      run: ./build/unit_tests_opt
