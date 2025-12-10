@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*' # Trigger on tags like v1.0, v2.0-beta, etc.
+      - 'v*'
 
 jobs:
   release:
@@ -12,10 +12,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
 
       - name: Create archive
         run: |
           tar -czvf ${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz .
+
+      - name: Get Commit Message
+        id: get_msg
+        run: echo "msg=$(git log -1 --format=%s)" >> $GITHUB_OUTPUT
 
       - name: Create Release
         id: create_release
@@ -24,7 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref }}
-          release_name: Deliverable 1 ${{ github.ref }}
+          release_name: ${{ steps.get_msg.outputs.msg }}
           draft: false
           prerelease: false
 
