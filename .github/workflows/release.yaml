@@ -19,9 +19,9 @@ jobs:
         run: |
           tar -czvf ${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz .
 
-      - name: Get Commit Message
+      - name: Get Tag Message
         id: get_msg
-        run: echo "msg=$(git log -1 --format=%s)" >> $GITHUB_OUTPUT
+        run: echo "msg=$(git tag -l --format='%(contents:subject)' ${{ github.ref_name }})" >> $GITHUB_OUTPUT
 
       - name: Create Release
         id: create_release
@@ -30,7 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref }}
-          release_name: ${{ steps.get_msg.outputs.msg }}
+          release_name: ${{ steps.get_msg.outputs.msg }} 
           draft: false
           prerelease: false
 
