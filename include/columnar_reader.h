@@ -20,7 +20,7 @@ namespace Contest {
  *  to find data index for row N requires counting valid bits before it
  *  without optimization this is O(N) bit-by-bit counting
  *  page_prefix_sums divides bitmap into 64-bit chunks with pre-computed
- *popcounts reduces to O(1) array lookup plus one popcount on final 64-bit chunk
+ *  popcounts reduces to O(1) array lookup plus one popcount on final 64-bit chunk
  *
  **/
 struct PageIndex {

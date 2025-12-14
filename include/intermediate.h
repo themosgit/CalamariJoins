@@ -52,7 +52,7 @@ constexpr size_t CAP_PER_PAGE = PAGE_SIZE / sizeof(value_t);
 
 /**
  *
- *  CAP_PER_PAGE = 1024 to achieve 100% memory utilization per page
+ *  CAP_PER_PAGE = 2048 to achieve 100% memory utilization per page
  *  a simple vector of pages with value_t append function that  writes value
  *  sequentially to the end,and also checks if new page is needed.
  *  and also an operator to read the value from the idx
@@ -117,7 +117,7 @@ struct column_t {
         pages.reserve((expected_rows + CAP_PER_PAGE - 1) / CAP_PER_PAGE);
     }
 
-    /* appends value to page creates one if needed
+    /* appends value to page,creates new page if current page is full 
      * simplified index calculation sets bitmap as well */
     inline void append(const value_t &val) {
         if (num_values % CAP_PER_PAGE == 0) {
