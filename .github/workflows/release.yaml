@@ -15,7 +15,8 @@ jobs:
 
       - name: Create archive
         run: |
-          tar -czvf ${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz .
+          tar -czvf /tmp/${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz .
+          mv /tmp/${{ github.event.repository.name }}-${{ github.ref_name }}.tar.gz .
 
       - name: Create Release
         id: create_release
