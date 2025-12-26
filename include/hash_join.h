@@ -39,6 +39,19 @@ inline UnchainedHashtable build_from_columnar(const JoinInput &input,
     return hash_table;
 }
 
+inline UnchainedHashtable build_from_columnar_parallel(const JoinInput &input,
+                                                       size_t attr_idx) {
+    auto *table = std::get<const ColumnarTable *>(input.data);
+    auto [actual_col_idx, _] = input.node->output_attrs[attr_idx];
+    const Column &column = table->columns[actual_col_idx];
+
+    size_t row_count = input.row_count(attr_idx);
+    UnchainedHashtable hash_table(row_count);
+    hash_table.build_parallel(column);
+
+    return hash_table;
+}
+
 /**
  *
  *  builds hash table from column_t intermediate results
@@ -54,6 +67,18 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
     hash_table.build(column);
+
+    return hash_table;
+}
+
+inline UnchainedHashtable build_from_intermediate_parallel(const JoinInput &input,
+                                                           size_t attr_idx) {
+    const auto &result = std::get<ExecuteResult>(input.data);
+    const auto &column = result[attr_idx];
+
+    size_t row_count = input.row_count(attr_idx);
+    UnchainedHashtable hash_table(row_count);
+    hash_table.build_parallel(column);
 
     return hash_table;
 }

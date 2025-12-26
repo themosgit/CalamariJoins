@@ -155,15 +155,38 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
         /* hash join path */
     } else {
         /* building hash table based on columnar or intermediate */
-        auto build_start = std::chrono::high_resolution_clock::now();
-        UnchainedHashtable hash_table =
+        // Serial build timing
+        auto serial_build_start = std::chrono::high_resolution_clock::now();
+        UnchainedHashtable hash_table_serial =
             build_is_columnar
                 ? build_from_columnar(build_input, config.build_attr)
                 : build_from_intermediate(build_input, config.build_attr);
-        auto build_end = std::chrono::high_resolution_clock::now();
-        auto build_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            build_end - build_start);
-        current_query_build_time_us += build_duration.count();
+        auto serial_build_end = std::chrono::high_resolution_clock::now();
+        auto serial_build_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            serial_build_end - serial_build_start);
+        
+        // Parallel build timing
+        auto parallel_build_start = std::chrono::high_resolution_clock::now();
+        UnchainedHashtable hash_table_parallel =
+            build_is_columnar
+                ? build_from_columnar_parallel(build_input, config.build_attr)
+                : build_from_intermediate_parallel(build_input, config.build_attr);
+        auto parallel_build_end = std::chrono::high_resolution_clock::now();
+        auto parallel_build_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            parallel_build_end - parallel_build_start);
+        
+        // Print comparison
+        // std::cout << "Hashtable build time - Serial: " << serial_build_duration.count() 
+        //           << " us (" << serial_build_duration.count() / 1000.0 << " ms), "
+        //           << "Parallel: " << parallel_build_duration.count() 
+        //           << " us (" << parallel_build_duration.count() / 1000.0 << " ms), "
+        //           << "Speedup: " << (double)serial_build_duration.count() / parallel_build_duration.count() 
+        //           << "x" << std::endl;
+        
+        current_query_build_time_us += parallel_build_duration.count();
+        
+        // Use parallel build for execution
+        UnchainedHashtable &hash_table = hash_table_parallel;
 
         /* selecting proper probe */
         MatchCollector collector;
