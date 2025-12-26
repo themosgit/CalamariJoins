@@ -4,11 +4,13 @@
 #include <hardware.h>
 #endif
 
+#include <chrono>
 #include <columnar_reader.h>
 #include <construct_intermediate.h>
 #include <hash_join.h>
 #include <hashtable.h>
 #include <intermediate.h>
+#include <iostream>
 #include <join_setup.h>
 #include <materialize.h>
 #include <nested_loop.h>
@@ -18,6 +20,10 @@ namespace Contest {
 
 using ExecuteResult = std::vector<mema::column_t>;
 using JoinResult = std::variant<ExecuteResult, ColumnarTable>;
+
+// Static variables to track hashtable build times
+static thread_local int64_t current_query_build_time_us = 0;
+static thread_local int64_t total_build_time_us = 0;
 
 /**
  * NOTE: intermediate means the column_t representation
@@ -149,10 +155,15 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
         /* hash join path */
     } else {
         /* building hash table based on columnar or intermediate */
+        auto build_start = std::chrono::high_resolution_clock::now();
         UnchainedHashtable hash_table =
             build_is_columnar
                 ? build_from_columnar(build_input, config.build_attr)
                 : build_from_intermediate(build_input, config.build_attr);
+        auto build_end = std::chrono::high_resolution_clock::now();
+        auto build_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            build_end - build_start);
+        current_query_build_time_us += build_duration.count();
 
         /* selecting proper probe */
         MatchCollector collector;
@@ -175,12 +186,31 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
 }
 
 ColumnarTable execute(const Plan &plan, void *context) {
+    // Reset per-query build time at the start of each query
+    current_query_build_time_us = 0;
+    
     auto result = execute_impl(plan, plan.root, true);
+    
+    // Print total build time for this query
+    total_build_time_us += current_query_build_time_us;
+    std::cout << "Total hashtable build time for query: " 
+              << current_query_build_time_us << " microseconds ("
+              << current_query_build_time_us / 1000.0 << " ms)" << std::endl;
+    
     return std::move(std::get<ColumnarTable>(result));
 }
 
-void *build_context() { return nullptr; }
+void *build_context() { 
+    // Reset total build time when context is built
+    total_build_time_us = 0;
+    return nullptr; 
+}
 
-void destroy_context(void *context) {}
+void destroy_context(void *context) {
+    // Print grand total build time across all queries
+    std::cout << "Total hashtable build time for all queries: " 
+              << total_build_time_us << " microseconds ("
+              << total_build_time_us / 1000.0 << " ms)" << std::endl;
+}
 
 } // namespace Contest
