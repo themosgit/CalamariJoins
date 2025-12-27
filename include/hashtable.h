@@ -30,7 +30,7 @@ class UnchainedHashtable {
     static inline uint64_t hash_key(uint32_t key) noexcept {
         uint64_t k = 0x8648DBDB;
         #if defined(__aarch64__)
-            uint32_t crc = __builtin_arm_crc32w(0, key);
+            uint32_t crc = __builtin_arm_crc32w(1, key);
         #else
             uint32_t crc = __builtin_ia32_crc32si(0, key);
         #endif
@@ -82,11 +82,7 @@ class UnchainedHashtable {
     }
 
     void build(const mema::column_t &column) {
-        if (column.has_direct_access()) {
             build_dense(column);
-        } else {
-            build_sparse(column);
-        }
     }
 
     void build(const Column &column) { build_from_column(column); }
@@ -136,54 +132,6 @@ class UnchainedHashtable {
             keys[pos] = val;
             row_ids[pos] = (uint32_t)i;
             directory[slot] |= compute_bloom(h);
-        }
-
-        finalize_directory(counts);
-    }
-
-    /* build hash table from a column with null values */
-    void build_sparse(const mema::column_t &column) {
-        const size_t rows = column.row_count();
-        std::vector<uint32_t> counts(directory.size(), 0);
-
-        /**
-         *
-         *  two-pass approach to avoid temp_input buffer
-         *  pass 1 count per bucket
-         *  pass 2 directly populate
-         *
-         **/
-
-        for (size_t i = 0; i < rows; ++i) {
-            const mema::value_t *val = column.get_by_row(i);
-            if (val) {
-                uint64_t h = hash_key(val->value);
-                counts[h >> shift]++;
-            }
-        }
-
-        /* prefix sum */
-        uint32_t current_offset = 0;
-        for (size_t i = 0; i < counts.size(); ++i) {
-            uint32_t count = counts[i];
-            counts[i] = current_offset;
-            current_offset += count;
-        }
-
-        keys.resize(current_offset);
-        row_ids.resize(current_offset);
-
-        for (size_t i = 0; i < rows; ++i) {
-            const mema::value_t *val = column.get_by_row(i);
-            if (val) {
-                int32_t key_val = val->value;
-                uint64_t h = hash_key(key_val);
-                size_t slot = h >> shift;
-                uint32_t pos = counts[slot]++;
-                keys[pos] = key_val;
-                row_ids[pos] = (uint32_t)i;
-                directory[slot] |= compute_bloom(h);
-            }
         }
 
         finalize_directory(counts);
