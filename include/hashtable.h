@@ -13,6 +13,10 @@
 
 enum class BuildType { DENSE, SPARSE, COLUMN };
 
+#if defined(__x86_64__)
+    #include  <immintrin.h>
+#endif
+
 class UnchainedHashtable {
   public:
     struct Tuple {
@@ -29,9 +33,15 @@ class UnchainedHashtable {
 
     int shift;
 
-    static inline uint64_t hash_key(int32_t k) {
-        uint64_t key = (uint64_t)k;
-        return (key * 0x85ebca6b) ^ ((key * 0xc2b2ae35) << 32);
+
+    static inline uint64_t hash_key(uint32_t key) noexcept {
+        uint64_t k = 0x8648DBDB;
+        #if defined(__aarch64__)
+            uint32_t crc = __builtin_arm_crc32w(0, key);
+        #else
+            uint32_t crc = __builtin_ia32_crc32si(0, key);
+        #endif
+        return crc * ((k << 32) + 1);
     }
 
     /**
