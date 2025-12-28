@@ -4,11 +4,13 @@
 #include <hardware.h>
 #endif
 
+#include <chrono>
 #include <columnar_reader.h>
 #include <construct_intermediate.h>
 #include <hash_join.h>
 #include <hashtable.h>
 #include <intermediate.h>
+#include <iostream>
 #include <join_setup.h>
 #include <materialize.h>
 #include <nested_loop.h>
@@ -20,6 +22,10 @@ namespace Contest {
 
 using ExecuteResult = std::vector<mema::column_t>;
 using JoinResult = std::variant<ExecuteResult, ColumnarTable>;
+
+// Static variables to track hashtable build times
+static thread_local int64_t current_query_build_time_us = 0;
+static thread_local int64_t total_build_time_us = 0;
 
 /**
  * NOTE: intermediate means the column_t representation
@@ -229,8 +235,17 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out, b
     return std::move(std::get<ColumnarTable>(result));
 }
 
-void *build_context() { return nullptr; }
+void *build_context() { 
+    // Reset total build time when context is built
+    total_build_time_us = 0;
+    return nullptr; 
+}
 
-void destroy_context(void *context) {}
+void destroy_context(void *context) {
+    // Print grand total build time across all queries
+    std::cout << "Total hashtable build time for all queries: " 
+              << total_build_time_us << " microseconds ("
+              << total_build_time_us / 1000.0 << " ms)" << std::endl;
+}
 
 } // namespace Contest
