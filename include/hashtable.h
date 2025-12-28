@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <deque>
-#include <future>
+#include <thread>
 #include <algorithm>
 #include <bloom_tags.h>
 #include <intermediate.h>
@@ -240,12 +240,13 @@ public:
 
         /* partitions data to every thread based on hash */
         size_t batch = (row_count + num_threads - 1) / num_threads;
-        std::vector<std::future<void>> futures;
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
         for (int t = 0; t < num_threads; ++t) {
             size_t start = t * batch;
             size_t end = std::min(start + batch, row_count);
             if (start >= end) continue;
-            futures.push_back(std::async(std::launch::async, [&, t, start, end, partition_bits] {
+            workers.emplace_back([&, t, start, end, partition_bits] {
                 const int shift = 64 - partition_bits;
                 for (size_t i = start; i < end; ++i) {
                     int32_t val = column[i].value;
@@ -253,9 +254,9 @@ public:
                     size_t p = (partition_bits == 0) ? 0 : (h >> shift);
                     thread_parts[t][p].append(allocators[t], {val, static_cast<uint32_t>(i)});
                 }
-            }));
+            });
         }
-        for (auto& f : futures) f.get();
+        for (auto& w : workers) w.join();
 
         /* compute offsets partition data from every thread */
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
@@ -270,18 +271,19 @@ public:
         if (total == 0) return;
         keys_.resize(total);
         row_ids_.resize(total);
-        futures.clear();
 
         /* accumulates and builds partitions from all threads */
+        workers.clear();
+        workers.reserve(num_threads);
         for (int t = 0; t < num_threads; ++t) {
-            futures.push_back(std::async(std::launch::async, [&, t] {
+            workers.emplace_back([&, t] {
                 for (size_t p = t; p < num_partitions; p += num_threads) {
                     build_partition(thread_parts, p, slots_per_partition, global_offsets[p],
                                     global_offsets[p + 1] - global_offsets[p], num_threads);
                 }
-            }));
+            });
         }
-        for (auto& f : futures) f.get();
+        for (auto& w : workers) w.join();
     }
 
     /* same for ColumnarTable */
@@ -311,14 +313,15 @@ public:
         for (auto& tp : thread_parts) tp.resize(num_partitions);
 
         size_t batch = (num_pages + num_threads - 1) / num_threads;
-        std::vector<std::future<void>> futures;
+        std::vector<std::thread> workers;
+        workers.reserve(num_threads);
 
         for (int t = 0; t < num_threads; ++t) {
             size_t pg_start = t * batch;
             size_t pg_end = std::min(pg_start + batch, num_pages);
             if (pg_start >= pg_end) continue;
 
-            futures.push_back(std::async(std::launch::async, [&, t, pg_start, pg_end, partition_bits] {
+            workers.emplace_back([&, t, pg_start, pg_end, partition_bits] {
                 const int shift = 64 - partition_bits;
                 for (size_t pg = pg_start; pg < pg_end; ++pg) {
                     const auto* page = reinterpret_cast<const uint8_t*>(column.pages[pg]->data);
@@ -347,9 +350,9 @@ public:
                         }
                     }
                 }
-            }));
+            });
         }
-        for (auto& f : futures) f.get();
+        for (auto& w : workers) w.join();
 
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
         for (size_t p = 0; p < num_partitions; ++p) {
@@ -364,15 +367,16 @@ public:
         keys_.resize(total);
         row_ids_.resize(total);
 
-        futures.clear();
+        workers.clear();
+        workers.reserve(num_threads);
         for (int t = 0; t < num_threads; ++t) {
-            futures.push_back(std::async(std::launch::async, [&, t] {
+            workers.emplace_back([&, t] {
                 for (size_t p = t; p < num_partitions; p += num_threads) {
                     build_partition(thread_parts, p, slots_per_partition, global_offsets[p],
                                     global_offsets[p + 1] - global_offsets[p], num_threads);
                 }
-            }));
+            });
         }
-        for (auto& f : futures) f.get();
+        for (auto& w : workers) w.join();
     }
 };
