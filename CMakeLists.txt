@@ -70,15 +70,21 @@ file(GLOB ALL_SRC
 
 set(MANOLATES_SRC ${ALL_SRC})
 
+# Enable Link Time Optimization
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+
 # Enable server-specific compiler optimizations.
 # Use march=native for all but Power servers, which results in the following error:
 #    clang++-18: error: unsupported option '-march=' for target 'powerpc64le-unknown-linux-gnu'
 # This flag works on other Power systems, but for now, we disable march=native on all Power machines.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
-    add_compile_options(-O3 -mcpu=apple-m1)
+    add_compile_options(-O3 -mcpu=apple-m1 -flto)
 else()
-    add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive)
+    add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive -flto)
 endif()
+
+# Add LTO linker flags
+add_link_options(-flto)
 
 add_executable(unit_tests ${MANOLATES_SRC} tests/unit_tests.cpp)
 

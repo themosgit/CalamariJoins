@@ -1530,6 +1530,11 @@ int main(int argc, char *argv[]) {
         }
         fmt::println("Total runtime: {} ms", runtime);
 
+        int64_t accounted = cumulative_stats.hashtable_build_ms + cumulative_stats.hash_join_probe_ms +
+                           cumulative_stats.nested_loop_join_ms + cumulative_stats.materialize_ms +
+                           cumulative_stats.setup_ms;
+        int64_t other_overhead = cumulative_stats.total_execution_ms - accounted;
+
         fmt::println("\nCumulative Timings Across All Queries:");
         fmt::println("  Total Execution Time: {} ms", cumulative_stats.total_execution_ms);
         fmt::println("  Hashtable Build Time: {} ms", cumulative_stats.hashtable_build_ms);
@@ -1537,6 +1542,7 @@ int main(int argc, char *argv[]) {
         fmt::println("  Nested Loop Join Time: {} ms", cumulative_stats.nested_loop_join_ms);
         fmt::println("  Materialization Time: {} ms", cumulative_stats.materialize_ms);
         fmt::println("  Setup Time: {} ms", cumulative_stats.setup_ms);
+        fmt::println("  Other Overhead: {} ms", other_overhead);
 
         if (all_queries_succeeded && write_output_file) {
             auto output_file = std::ofstream(output_filename);

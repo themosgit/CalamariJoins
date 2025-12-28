@@ -72,29 +72,24 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
     const auto &left_node = plan.nodes[join.left];
     const auto &right_node = plan.nodes[join.right];
 
-    bool left_is_columnar = std::holds_alternative<ScanNode>(left_node.data);
-    bool right_is_columnar = std::holds_alternative<ScanNode>(right_node.data);
-
     /* determine intermediate and columnar tables */
     JoinInput left_input, right_input;
     left_input.node = &left_node;
     right_input.node = &right_node;
 
     /* if it is a columnar node we are at a leaf */
-    if (left_is_columnar) {
-        const auto &left_scan = std::get<ScanNode>(left_node.data);
-        left_input.data = &plan.inputs[left_scan.base_table_id];
-        left_input.table_id = left_scan.base_table_id;
+    if (const auto *left_scan = std::get_if<ScanNode>(&left_node.data)) {
+        left_input.data = &plan.inputs[left_scan->base_table_id];
+        left_input.table_id = left_scan->base_table_id;
     } else {
         auto result = execute_impl(plan, join.left, false, stats);
         left_input.data = std::get<ExecuteResult>(std::move(result));
         left_input.table_id = 0;
     }
 
-    if (right_is_columnar) {
-        const auto &right_scan = std::get<ScanNode>(right_node.data);
-        right_input.data = &plan.inputs[right_scan.base_table_id];
-        right_input.table_id = right_scan.base_table_id;
+    if (const auto *right_scan = std::get_if<ScanNode>(&right_node.data)) {
+        right_input.data = &plan.inputs[right_scan->base_table_id];
+        right_input.table_id = right_scan->base_table_id;
     } else {
         auto result = execute_impl(plan, join.right, false, stats);
         right_input.data = std::get<ExecuteResult>(std::move(result));
@@ -214,11 +209,16 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out, b
     stats.total_execution_ms = total_elapsed.count();
 
     if (show_detailed_timing) {
+        int64_t accounted = stats.hashtable_build_ms + stats.hash_join_probe_ms +
+                           stats.nested_loop_join_ms + stats.materialize_ms + stats.setup_ms;
+        int64_t other = stats.total_execution_ms - accounted;
+
         std::cout << "Hashtable Build Time: " << stats.hashtable_build_ms << " ms\n";
         std::cout << "Hash Join Probe Time: " << stats.hash_join_probe_ms << " ms\n";
         std::cout << "Nested Loop Join Time: " << stats.nested_loop_join_ms << " ms\n";
         std::cout << "Materialization Time: " << stats.materialize_ms << " ms\n";
         std::cout << "Setup Time: " << stats.setup_ms << " ms\n";
+        std::cout << "Other Overhead: " << other << " ms\n";
         std::cout << "Total Execution Time: " << stats.total_execution_ms << " ms\n";
     }
 
