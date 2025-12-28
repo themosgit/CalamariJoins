@@ -1366,7 +1366,9 @@ run(const std::unordered_map<std::string, std::vector<std::string>>
 #ifdef TEAMOPT_USE_DUCKDB
     duckdb::Connection &conn,
 #endif
-    [[maybe_unused]] void *context) {
+    [[maybe_unused]] void *context,
+    Contest::TimingStats *cumulative_stats = nullptr,
+    bool show_detailed_timing = false) {
     ParsedSQL parsed_sql(column_to_tables);
     parsed_sql.parse_sql(sql, name);
 
@@ -1375,7 +1377,18 @@ run(const std::unordered_map<std::string, std::vector<std::string>>
 
     auto start = std::chrono::steady_clock::now();
 #ifndef TEAMOPT_BUILD_CACHE
-    auto results = Contest::execute(plan, context);
+    Contest::TimingStats query_stats;
+    auto results = Contest::execute(plan, context, &query_stats, show_detailed_timing);
+
+    // Accumulate into cumulative stats
+    if (cumulative_stats) {
+        cumulative_stats->hashtable_build_ms += query_stats.hashtable_build_ms;
+        cumulative_stats->hash_join_probe_ms += query_stats.hash_join_probe_ms;
+        cumulative_stats->nested_loop_join_ms += query_stats.nested_loop_join_ms;
+        cumulative_stats->materialize_ms += query_stats.materialize_ms;
+        cumulative_stats->setup_ms += query_stats.setup_ms;
+        cumulative_stats->total_execution_ms += query_stats.total_execution_ms;
+    }
 #endif
     auto end = std::chrono::steady_clock::now();
 
@@ -1457,6 +1470,8 @@ int main(int argc, char *argv[]) {
         }
 
         auto runtime = size_t{0};
+        Contest::TimingStats cumulative_stats;
+        bool show_detailed_timing = std::getenv("SHOW_DETAILED_TIMING") != nullptr;
 
         // Build context. Context creation time is included in the measured
         // runtime.
@@ -1503,16 +1518,25 @@ int main(int argc, char *argv[]) {
 #ifdef TEAMOPT_USE_DUCKDB
                 const auto [result_is_correct, query_runtime] =
                     run(column_to_tables, name, std::move(sql), plan_json, conn,
-                        context);
+                        context, &cumulative_stats, show_detailed_timing);
 #else
                 const auto [result_is_correct, query_runtime] = run(
-                    column_to_tables, name, std::move(sql), plan_json, context);
+                    column_to_tables, name, std::move(sql), plan_json, context,
+                    &cumulative_stats, show_detailed_timing);
 #endif
                 runtime += query_runtime;
                 all_queries_succeeded &= result_is_correct;
             }
         }
         fmt::println("Total runtime: {} ms", runtime);
+
+        fmt::println("\nCumulative Timings Across All Queries:");
+        fmt::println("  Total Execution Time: {} ms", cumulative_stats.total_execution_ms);
+        fmt::println("  Hashtable Build Time: {} ms", cumulative_stats.hashtable_build_ms);
+        fmt::println("  Hash Join Probe Time: {} ms", cumulative_stats.hash_join_probe_ms);
+        fmt::println("  Nested Loop Join Time: {} ms", cumulative_stats.nested_loop_join_ms);
+        fmt::println("  Materialization Time: {} ms", cumulative_stats.materialize_ms);
+        fmt::println("  Setup Time: {} ms", cumulative_stats.setup_ms);
 
         if (all_queries_succeeded && write_output_file) {
             auto output_file = std::ofstream(output_filename);
