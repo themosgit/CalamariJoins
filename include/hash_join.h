@@ -52,7 +52,7 @@ inline UnchainedHashtable build_from_columnar_parallel(const JoinInput &input,
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
-    hash_table.build_parallel(column);
+    hash_table.build_columnar(column);
 
     return hash_table;
 }
@@ -83,7 +83,7 @@ inline UnchainedHashtable build_from_intermediate_parallel(const JoinInput &inpu
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
-    hash_table.build_parallel(column);
+    hash_table.build_intermediate(column);
 
     return hash_table;
 }
