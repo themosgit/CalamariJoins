@@ -15,6 +15,8 @@
 #include <materialize.h>
 #include <nested_loop.h>
 #include <variant>
+#include <chrono>
+#include <iostream>
 
 namespace Contest {
 
@@ -64,7 +66,7 @@ static thread_local int64_t total_build_time_us = 0;
  *
  **/
 
-JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
+JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingStats &stats) {
     auto &node = plan.nodes[node_idx];
 
     if (!std::holds_alternative<JoinNode>(node.data)) {
@@ -76,36 +78,32 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
     const auto &left_node = plan.nodes[join.left];
     const auto &right_node = plan.nodes[join.right];
 
-    bool left_is_columnar = std::holds_alternative<ScanNode>(left_node.data);
-    bool right_is_columnar = std::holds_alternative<ScanNode>(right_node.data);
-
     /* determine intermediate and columnar tables */
     JoinInput left_input, right_input;
     left_input.node = &left_node;
     right_input.node = &right_node;
 
     /* if it is a columnar node we are at a leaf */
-    if (left_is_columnar) {
-        const auto &left_scan = std::get<ScanNode>(left_node.data);
-        left_input.data = &plan.inputs[left_scan.base_table_id];
-        left_input.table_id = left_scan.base_table_id;
+    if (const auto *left_scan = std::get_if<ScanNode>(&left_node.data)) {
+        left_input.data = &plan.inputs[left_scan->base_table_id];
+        left_input.table_id = left_scan->base_table_id;
     } else {
-        auto result = execute_impl(plan, join.left, false);
+        auto result = execute_impl(plan, join.left, false, stats);
         left_input.data = std::get<ExecuteResult>(std::move(result));
         left_input.table_id = 0;
     }
 
-    if (right_is_columnar) {
-        const auto &right_scan = std::get<ScanNode>(right_node.data);
-        right_input.data = &plan.inputs[right_scan.base_table_id];
-        right_input.table_id = right_scan.base_table_id;
+    if (const auto *right_scan = std::get_if<ScanNode>(&right_node.data)) {
+        right_input.data = &plan.inputs[right_scan->base_table_id];
+        right_input.table_id = right_scan->base_table_id;
     } else {
-        auto result = execute_impl(plan, join.right, false);
+        auto result = execute_impl(plan, join.right, false, stats);
         right_input.data = std::get<ExecuteResult>(std::move(result));
         right_input.table_id = 0;
     }
 
     /* select build probe sides based on table size and configure proper args */
+    auto setup_start = std::chrono::high_resolution_clock::now();
     auto config =
         select_build_probe_side(join, left_input, right_input, output_attrs);
     const JoinInput &build_input = config.build_left ? left_input : right_input;
@@ -125,11 +123,15 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
     JoinSetup setup = setup_join(build_input, probe_input, build_node,
                                  probe_node, left_node, right_node, left_input,
                                  right_input, output_attrs, build_rows);
+    auto setup_end = std::chrono::high_resolution_clock::now();
+    auto setup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(setup_end - setup_start);
+    stats.setup_ms += setup_elapsed.count();
 
     /* nested loop join path */
     if (use_nested_loop) {
         MatchCollector collector;
 
+        auto nested_loop_start = std::chrono::high_resolution_clock::now();
         if (build_is_columnar && probe_is_columnar) {
             nested_loop_from_columnar(build_input, probe_input,
                                       config.build_attr, config.probe_attr,
@@ -147,51 +149,37 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
                               config.probe_attr, setup.columnar_reader,
                               collector);
         }
+        auto nested_loop_end = std::chrono::high_resolution_clock::now();
+        auto nested_loop_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(nested_loop_end - nested_loop_start);
+        stats.nested_loop_join_ms += nested_loop_elapsed.count();
 
-        return materialize_join_results(collector, build_input, probe_input,
-                                        config, build_node, probe_node, setup,
-                                        plan, is_root);
+        auto materialize_start = std::chrono::high_resolution_clock::now();
+        auto result = materialize_join_results(collector, build_input, probe_input,
+                                               config, build_node, probe_node, setup,
+                                               plan, is_root);
+        auto materialize_end = std::chrono::high_resolution_clock::now();
+        auto materialize_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(materialize_end - materialize_start);
+        stats.materialize_ms += materialize_elapsed.count();
+
+        return result;
 
         /* hash join path */
     } else {
         /* building hash table based on columnar or intermediate */
-        // Serial build timing
-        auto serial_build_start = std::chrono::high_resolution_clock::now();
-        UnchainedHashtable hash_table_serial =
+        auto build_start = std::chrono::high_resolution_clock::now();
+        UnchainedHashtable hash_table =
             build_is_columnar
                 ? build_from_columnar(build_input, config.build_attr)
                 : build_from_intermediate(build_input, config.build_attr);
-        auto serial_build_end = std::chrono::high_resolution_clock::now();
-        auto serial_build_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            serial_build_end - serial_build_start);
-        
-        // Parallel build timing
-        auto parallel_build_start = std::chrono::high_resolution_clock::now();
-        UnchainedHashtable hash_table_parallel =
-            build_is_columnar
-                ? build_from_columnar_parallel(build_input, config.build_attr)
-                : build_from_intermediate_parallel(build_input, config.build_attr);
-        auto parallel_build_end = std::chrono::high_resolution_clock::now();
-        auto parallel_build_duration = std::chrono::duration_cast<std::chrono::microseconds>(
-            parallel_build_end - parallel_build_start);
-        
-        // Print comparison
-        // std::cout << "Hashtable build time - Serial: " << serial_build_duration.count() 
-        //           << " us (" << serial_build_duration.count() / 1000.0 << " ms), "
-        //           << "Parallel: " << parallel_build_duration.count() 
-        //           << " us (" << parallel_build_duration.count() / 1000.0 << " ms), "
-        //           << "Speedup: " << (double)serial_build_duration.count() / parallel_build_duration.count() 
-        //           << "x" << std::endl;
-        
-        current_query_build_time_us += parallel_build_duration.count();
-        
-        // Use parallel build for execution
-        UnchainedHashtable &hash_table = hash_table_parallel;
+        auto build_end = std::chrono::high_resolution_clock::now();
+        auto build_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(build_end - build_start);
+        stats.hashtable_build_ms += build_elapsed.count();
 
         /* selecting proper probe */
         MatchCollector collector;
         collector.reserve(build_rows);
 
+        auto probe_start = std::chrono::high_resolution_clock::now();
         if (probe_is_columnar) {
             probe_columnar(hash_table, probe_input, config.probe_attr,
                            collector);
@@ -201,25 +189,49 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root) {
             probe_intermediate(hash_table, probe_result[config.probe_attr],
                                collector);
         }
+        auto probe_end = std::chrono::high_resolution_clock::now();
+        auto probe_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(probe_end - probe_start);
+        stats.hash_join_probe_ms += probe_elapsed.count();
 
-        return materialize_join_results(collector, build_input, probe_input,
+        auto materialize_start = std::chrono::high_resolution_clock::now();
+        auto result = materialize_join_results(collector, build_input, probe_input,
                                         config, build_node, probe_node, setup,
                                         plan, is_root);
+        auto materialize_end = std::chrono::high_resolution_clock::now();
+        auto materialize_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(materialize_end - materialize_start);
+        stats.materialize_ms += materialize_elapsed.count();
+        return  result;
     }
 }
 
-ColumnarTable execute(const Plan &plan, void *context) {
-    // Reset per-query build time at the start of each query
-    current_query_build_time_us = 0;
-    
-    auto result = execute_impl(plan, plan.root, true);
-    
-    // Print total build time for this query
-    total_build_time_us += current_query_build_time_us;
-    std::cout << "Total hashtable build time for query: " 
-              << current_query_build_time_us << " microseconds ("
-              << current_query_build_time_us / 1000.0 << " ms)" << std::endl;
-    
+ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out, bool show_detailed_timing) {
+    auto total_start = std::chrono::high_resolution_clock::now();
+
+    TimingStats stats;
+    auto result = execute_impl(plan, plan.root, true, stats);
+
+    auto total_end = std::chrono::high_resolution_clock::now();
+    auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(total_end - total_start);
+    stats.total_execution_ms = total_elapsed.count();
+
+    if (show_detailed_timing) {
+        int64_t accounted = stats.hashtable_build_ms + stats.hash_join_probe_ms +
+                           stats.nested_loop_join_ms + stats.materialize_ms + stats.setup_ms;
+        int64_t other = stats.total_execution_ms - accounted;
+
+        std::cout << "Hashtable Build Time: " << stats.hashtable_build_ms << " ms\n";
+        std::cout << "Hash Join Probe Time: " << stats.hash_join_probe_ms << " ms\n";
+        std::cout << "Nested Loop Join Time: " << stats.nested_loop_join_ms << " ms\n";
+        std::cout << "Materialization Time: " << stats.materialize_ms << " ms\n";
+        std::cout << "Setup Time: " << stats.setup_ms << " ms\n";
+        std::cout << "Other Overhead: " << other << " ms\n";
+        std::cout << "Total Execution Time: " << stats.total_execution_ms << " ms\n";
+    }
+
+    if (stats_out) {
+        *stats_out = stats;
+    }
+
     return std::move(std::get<ColumnarTable>(result));
 }
 

@@ -1,6 +1,11 @@
 #pragma once
 
 #include <construct_intermediate.h>
+#if defined(__aarch64__)
+    #include <hardware_darwin.h>
+#else
+    #include <hardware.h>
+#endif
 #include <hashtable.h>
 #include <intermediate.h>
 #include <join_setup.h>
@@ -34,7 +39,7 @@ inline UnchainedHashtable build_from_columnar(const JoinInput &input,
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
-    hash_table.build(column);
+    hash_table.build_columnar(column, 8);
 
     return hash_table;
 }
@@ -66,7 +71,7 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
-    hash_table.build(column);
+    hash_table.build_intermediate(column, 8);
 
     return hash_table;
 }
@@ -94,8 +99,10 @@ inline UnchainedHashtable build_from_intermediate_parallel(const JoinInput &inpu
 inline void probe_columnar(const UnchainedHashtable &hash_table,
                            const JoinInput &probe_input, size_t probe_attr,
                            MatchCollector &collector) {
-    const int32_t *keys = hash_table.get_keys();
-    const uint32_t *row_ids = hash_table.get_row_ids();
+
+    const auto *keys = hash_table.keys();
+    const auto *row_ids = hash_table.row_ids();
+
 
     auto *table = std::get<const ColumnarTable *>(probe_input.data);
     auto [actual_col_idx, _] = probe_input.node->output_attrs[probe_attr];
@@ -154,8 +161,8 @@ inline void probe_columnar(const UnchainedHashtable &hash_table,
 inline void probe_intermediate(const UnchainedHashtable &hash_table,
                                const mema::column_t &probe_column,
                                MatchCollector &collector) {
-    const int32_t *keys = hash_table.get_keys();
-    const uint32_t *row_ids = hash_table.get_row_ids();
+    const auto *keys = hash_table.keys();
+    const auto *row_ids = hash_table.row_ids();
 
     const size_t probe_count = probe_column.row_count();
     const bool probe_direct = probe_column.has_direct_access();
