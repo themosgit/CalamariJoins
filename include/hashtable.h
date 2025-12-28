@@ -40,7 +40,13 @@ public:
         uint32_t row_id;
     };
 
-    /* Chunk size to fit in l2 cache */
+    /** 
+     *
+     *  Chunks are the smallest possible
+     *  memory allocation unit, designed
+     *  to fit in L2 cache.
+     *
+     **/
     static constexpr size_t CHUNK_SIZE = 4096;
     static constexpr size_t CHUNK_HEADER = 16;
     static constexpr size_t TUPLES_PER_CHUNK = (CHUNK_SIZE - CHUNK_HEADER) / sizeof(Tuple);
@@ -61,7 +67,17 @@ public:
         }
     };
 
-    /* linked list of chunks for a partition */
+    /** 
+     *
+     *  A partition is a set of continuous directory
+     *  entries of the hashtable used to enable lock-free
+     *  parallel execution they consist of a linked list
+     *  of chunks for data storage enabling optimized
+     *  memory layout and allocations per thread.
+     *
+     *  Designed to fit in LLC.
+     *
+     **/
     struct Partition {
         Chunk* head = nullptr;
         Chunk* tail = nullptr;
@@ -85,6 +101,7 @@ private:
     std::vector<uint32_t> row_ids_;
     int shift = 0;
 
+    /* crc32 hash function with large mix value */
     static uint64_t hash_key(int32_t key) noexcept {
         constexpr uint64_t k = 0x8648DBDB;
         #if defined(__aarch64__)
@@ -95,6 +112,7 @@ private:
         return crc * ((k << 32) + 1);
     }
 
+    /* tags can be found at bloom_tags.h */
     static uint16_t bloom_tag(uint64_t h) noexcept {
         return BLOOM_TAGS[(h >> 32) & 0x7FF];
     }
@@ -103,7 +121,7 @@ private:
         return h >> (64 - shift);
     }
 
-    /* compute number of partinions required */
+    /* compute number of partitions required */
     size_t compute_num_partitions(size_t tuple_count, int num_threads) const {
         size_t per_core_cache = LAST_LEVEL_CACHE / NUM_CORES;
         size_t target_bytes = per_core_cache / 2;
@@ -118,22 +136,26 @@ private:
         return std::min(p, directory.size());
     }
 
-    /* merges results belonging to one partition from all thread partitions */
+    /** 
+     *
+     * processes the same partition from
+     * all threads follows the same workflow
+     * as the single threaded build
+     *
+     **/
     void build_partition(const std::vector<std::vector<Partition>>& thread_parts,
-                        size_t p, size_t slots_per_partition, size_t base_offset, int num_threads) {
-        const size_t slot_start = p * slots_per_partition;
+                        size_t p, size_t slots_per_partition, size_t base_offset,
+                        size_t partition_size, int num_threads) {
 
-        /* same steps as before*/
-        size_t total = 0;
-        for (int t = 0; t < num_threads; ++t) {
-            total += thread_parts[t][p].total_count;
-        }
-        if (total == 0) {
+        const size_t slot_start = p * slots_per_partition;
+        /* write offset to empty partitions */
+        if (partition_size == 0) {
             for (size_t s = 0; s < slots_per_partition; ++s) {
                 directory[slot_start + s] = base_offset << 16;
             }
             return;
         }
+        /* hash all keys and find counts for partition slots */ 
         std::vector<uint32_t> counts(slots_per_partition, 0);
         for (int t = 0; t < num_threads; ++t) {
             for (Chunk* c = thread_parts[t][p].head; c; c = c->next) {
@@ -142,6 +164,7 @@ private:
                 }
             }
         }
+        /* prefix sum of counts in partition */
         std::vector<uint32_t> offsets(slots_per_partition);
         uint32_t running = base_offset;
         for (size_t s = 0; s < slots_per_partition; ++s) {
@@ -149,6 +172,7 @@ private:
             running += counts[s];
             counts[s] = 0;
         }
+        /* write values to correct slots update bloom filter */
         for (int t = 0; t < num_threads; ++t) {
             for (Chunk* c = thread_parts[t][p].head; c; c = c->next) {
                 for (size_t i = 0; i < c->count; ++i) {
@@ -162,6 +186,7 @@ private:
                 }
             }
         }
+        /* finalize directory write pointer and bloom filter */
         for (size_t s = 0; s < slots_per_partition; ++s) {
             uint64_t end = offsets[s] + counts[s];
             directory[slot_start + s] = (end << 16) | (directory[slot_start + s] & 0xFFFF);
@@ -196,24 +221,24 @@ public:
         return {start, end};
     }
 
-    void build_parallel(const mema::column_t& column, int num_threads = 4) {
+    void build_intermediate(const mema::column_t& column, int num_threads = 4) {
         const size_t row_count = column.row_count();
         if (row_count == 0) return;
 
-        num_threads = std::clamp(num_threads, 1, NUM_CORES);
-        if (row_count < 1000) num_threads = 1;
+        num_threads = NUM_CORES;
+        if (row_count < 10000) num_threads = 1;
 
         const size_t num_slots = directory.size();
         const size_t num_partitions = compute_num_partitions(row_count, num_threads);
         const int partition_bits = __builtin_ctzll(num_partitions);
         const size_t slots_per_partition = num_slots / num_partitions;
 
-        /* thread local storage */
+        /* all threads have a private instance of all partitions */
         std::vector<ChunkAllocator> allocators(num_threads);
         std::vector<std::vector<Partition>> thread_parts(num_threads);
         for (auto& tp : thread_parts) tp.resize(num_partitions);
 
-        /* partitions data to every thread */
+        /* partitions data to every thread based on hash */
         size_t batch = (row_count + num_threads - 1) / num_threads;
         std::vector<std::future<void>> futures;
         for (int t = 0; t < num_threads; ++t) {
@@ -232,6 +257,7 @@ public:
         }
         for (auto& f : futures) f.get();
 
+        /* compute offsets partition data from every thread */
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
         for (size_t p = 0; p < num_partitions; ++p) {
             for (int t = 0; t < num_threads; ++t) {
@@ -244,13 +270,14 @@ public:
         if (total == 0) return;
         keys_.resize(total);
         row_ids_.resize(total);
-
-        /* builds each partition */
         futures.clear();
+
+        /* accumulates and builds partitions from all threads */
         for (int t = 0; t < num_threads; ++t) {
             futures.push_back(std::async(std::launch::async, [&, t] {
                 for (size_t p = t; p < num_partitions; p += num_threads) {
-                    build_partition(thread_parts, p, slots_per_partition, global_offsets[p], num_threads);
+                    build_partition(thread_parts, p, slots_per_partition, global_offsets[p],
+                                    global_offsets[p + 1] - global_offsets[p], num_threads);
                 }
             }));
         }
@@ -341,7 +368,8 @@ public:
         for (int t = 0; t < num_threads; ++t) {
             futures.push_back(std::async(std::launch::async, [&, t] {
                 for (size_t p = t; p < num_partitions; p += num_threads) {
-                    build_partition(thread_parts, p, slots_per_partition, global_offsets[p], num_threads);
+                    build_partition(thread_parts, p, slots_per_partition, global_offsets[p],
+                                    global_offsets[p + 1] - global_offsets[p], num_threads);
                 }
             }));
         }

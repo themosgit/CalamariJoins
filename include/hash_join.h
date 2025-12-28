@@ -58,7 +58,7 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
-    hash_table.build_parallel(column, 8);
+    hash_table.build_intermediate(column, 8);
 
     return hash_table;
 }
