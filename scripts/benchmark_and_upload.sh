@@ -19,7 +19,7 @@ cd ../project-site
 
 git pull
 
-python3 update_entries.py --part part2
+python3 update_entries.py --part part3
 
 git add .
 
