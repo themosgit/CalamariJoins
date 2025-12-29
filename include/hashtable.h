@@ -1,4 +1,6 @@
 #pragma once
+#ifndef HARDWARE_H_INCLUDED
+#define HARDWARE_H_INCLUDED
 
 #include <cstddef>
 #include <cstdint>
@@ -15,10 +17,11 @@
     #include <hardware.h>
 #endif
 
-#if defined(__x86_64__)
-    #include <immintrin.h>
-#elif defined(__aarch64__)
-    #include <arm_acle.h>
+    #if defined(__x86_64__)
+        #include <immintrin.h>
+    #elif defined(__aarch64__)
+        #include <arm_acle.h>
+    #endif
 #endif
 
 /* some systems do not have L3 cache ao L2 is set as LLC */

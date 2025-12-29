@@ -6,7 +6,7 @@
 #include <plan.h>
 #include <vector>
 #include <thread>
-#include <hardware_darwin.h>
+// #include <hardware_darwin.h>
 #include <sys/mman.h>
 
 namespace Contest {
