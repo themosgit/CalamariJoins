@@ -89,6 +89,19 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_include_directories(faster PRIVATE include)
 endif()
 
+# OPTIONAL
+# For unit_tests, use more portable CPU flags to avoid "Illegal instruction" errors
+# Use native architecture to match the build machine's CPU capabilities
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
+    # Keep ARM settings as is for unit_tests
+    target_compile_options(unit_tests PRIVATE -O3 -mcpu=native -flto)
+else()
+    # Override the global znver4 flag for unit_tests with native CPU detection
+    # This ensures unit_tests work on the machine they're compiled on
+    target_compile_options(unit_tests PRIVATE -O3 -march=native -m64 -fpermissive -flto)
+endif()
+# END OPTIONAL
+
 target_compile_definitions(unit_tests PRIVATE)
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
 target_include_directories(unit_tests PRIVATE include)
