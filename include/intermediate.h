@@ -5,6 +5,7 @@
 #include <plan.h>
 #include <table.h>
 #include <vector>
+#include <memory>
 
 namespace mema {
 
@@ -66,6 +67,8 @@ struct column_t {
     };
 
     size_t num_values = 0;
+    bool owns_pages = true;
+    std::shared_ptr<void> external_memory;
 
   public:
     std::vector<Page *> pages;
@@ -75,8 +78,10 @@ struct column_t {
   public:
     column_t() = default;
     ~column_t() {
-        for (auto *page : pages)
-            delete page;
+        if (owns_pages) {
+            for (auto *page : pages)
+                delete page;
+        }
     }
 
     /* if we know the size we can pre allocate */
@@ -100,7 +105,22 @@ struct column_t {
         for (size_t i = 0; i < pages_needed; ++i) {
             pages.push_back(new Page());
         }
-        num_values = count;  // set final size upfront
+        num_values = count;
+    }
+
+    /* pre-allocate from a contiguous memory block (batch allocation) */
+    inline void pre_allocate_from_block(void* block, size_t& offset, size_t count,
+                                        std::shared_ptr<void> memory_keeper) {
+        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
+        pages.reserve(pages_needed);
+        char* base = static_cast<char*>(block);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            pages.push_back(reinterpret_cast<Page*>(base + offset));
+            offset += sizeof(Page);
+        }
+        num_values = count;
+        owns_pages = false;
+        external_memory = memory_keeper;
     }
 
     /* thread-safe random write to pre-allocated pages */

@@ -7,6 +7,7 @@
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
+#include <thread>
 
 namespace Contest {
 
@@ -33,17 +34,37 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
 
 /**
  *
- *  materializes int32 column directly to ColumnarTable format
- *  builds pages incrementally with bitmap for nulls
- *  reader function abstracts source type either column_t [] or get_by_row
- *  or ColumnarTable via columnar_reader read_value_build/probe
- *  flushes page when space runs out
+ *  computes chunk size for materialization parallelization
+ *  balances cache-optimal size with enough tasks per thread
+ *
+ **/
+inline size_t compute_materialization_chunk_size(size_t total_matches) {
+    constexpr int NUM_CORES = SPC__CORE_COUNT;
+
+    // calculate per-core L2 cache optimal size
+    constexpr size_t L2_CACHE_SIZE = SPC__LEVEL2_CACHE_SIZE;
+    size_t per_core_l2 = L2_CACHE_SIZE / NUM_CORES;
+    size_t target_bytes = per_core_l2 / 2;
+
+    // estimate bytes per match (conservative for VARCHAR)
+    size_t bytes_per_match = 8 + 64;  // match + avg string overhead
+    size_t cache_optimal = target_bytes / bytes_per_match;
+
+    // ensure at least 4 chunks per thread
+    size_t min_chunk = (total_matches + NUM_CORES * 4 - 1) / (NUM_CORES * 4);
+
+    return std::max(cache_optimal, min_chunk);
+}
+
+/**
+ *
+ *  serial int32 materialization (for small joins)
  *
  **/
 template <typename ReaderFunc>
-inline void materialize_int32_column(Column &dest_col,
-                                     const MatchCollector &collector,
-                                     ReaderFunc &&read_value, bool from_build) {
+inline void materialize_int32_column_serial(Column &dest_col,
+                                            const MatchCollector &collector,
+                                            ReaderFunc &&read_value, bool from_build) {
 
     uint16_t num_rows = 0;
     std::vector<int32_t> data;
@@ -118,17 +139,132 @@ inline void materialize_int32_column(Column &dest_col,
 
 /**
  *
- *  materializes varchar column directly to ColumnarTable format
- *  handles normal strings and long strings spanning multiple pages
- *  reader function same as int32 columns
- *  copies long string pages directly without repacking
+ *  parallel int32 materialization
+ *  each thread builds local pages then merges at end
  *
  **/
 template <typename ReaderFunc>
-inline void materialize_varchar_column(Column &dest_col,
-                                       const MatchCollector &collector,
-                                       ReaderFunc &&read_value,
-                                       const Column &src_col, bool from_build) {
+inline void materialize_int32_column(Column &dest_col,
+                                     const MatchCollector &collector,
+                                     ReaderFunc &&read_value, bool from_build) {
+    const size_t total_matches = collector.size();
+    if (total_matches == 0) return;
+
+    constexpr size_t PARALLEL_THRESHOLD = 5000;
+    if (total_matches < PARALLEL_THRESHOLD) {
+        materialize_int32_column_serial(dest_col, collector, read_value, from_build);
+        return;
+    }
+
+    const uint64_t *matches_ptr = collector.matches.data();
+    const size_t chunk_size = compute_materialization_chunk_size(total_matches);
+    constexpr int num_threads = SPC__CORE_COUNT;
+
+    std::vector<Column> thread_columns;
+    thread_columns.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        thread_columns.emplace_back(DataType::INT32);
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            size_t start = t * total_matches / num_threads;
+            size_t end = (t + 1) * total_matches / num_threads;
+            if (start >= total_matches) return;
+
+            Column &local_col = thread_columns[t];
+
+            uint16_t num_rows = 0;
+            std::vector<int32_t> data;
+            std::vector<uint8_t> bitmap;
+            data.reserve(2048);
+            bitmap.reserve(256);
+
+            uint8_t pending_bits = 0;
+            int bit_count = 0;
+
+            auto flush_bitmap = [&]() {
+                if (bit_count > 0) {
+                    bitmap.push_back(pending_bits);
+                    pending_bits = 0;
+                    bit_count = 0;
+                }
+            };
+
+            auto save_page = [&]() {
+                flush_bitmap();
+                auto *page = local_col.new_page()->data;
+                *reinterpret_cast<uint16_t *>(page) = num_rows;
+                *reinterpret_cast<uint16_t *>(page + 2) = static_cast<uint16_t>(data.size());
+                std::memcpy(page + 4, data.data(), data.size() * 4);
+                std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(), bitmap.size());
+                num_rows = 0;
+                data.clear();
+                bitmap.clear();
+                pending_bits = 0;
+                bit_count = 0;
+            };
+
+            auto run_loop = [&](auto get_row_id) {
+                for (size_t i = start; i < end; ++i) {
+                    uint32_t row_id = get_row_id(matches_ptr[i]);
+                    mema::value_t val = read_value(row_id);
+                    if (4 + (data.size() + 1) * 4 + (bitmap.size() + 2) > PAGE_SIZE) {
+                        save_page();
+                    }
+                    if (!val.is_null()) {
+                        pending_bits |= (1u << bit_count);
+                        data.emplace_back(val.value);
+                    }
+                    bit_count++;
+                    if (bit_count == 8) {
+                        bitmap.push_back(pending_bits);
+                        pending_bits = 0;
+                        bit_count = 0;
+                    }
+                    ++num_rows;
+                }
+            };
+
+            if (from_build) {
+                run_loop([](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
+            } else {
+                run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+            }
+
+            if (num_rows != 0)
+                save_page();
+        });
+    }
+
+    for (auto &w : workers) {
+        w.join();
+    }
+
+    // merge phase: move pages from thread-local columns to dest_col
+    for (auto &thread_col : thread_columns) {
+        for (auto *page : thread_col.pages) {
+            dest_col.pages.push_back(page);
+        }
+        thread_col.pages.clear();  // don't delete in destructor
+    }
+}
+
+/**
+ *
+ *  serial version of varchar materialization
+ *  kept as fallback for small result sets
+ *
+ **/
+template <typename ReaderFunc>
+inline void materialize_varchar_column_serial(Column &dest_col,
+                                               const MatchCollector &collector,
+                                               ReaderFunc &&read_value,
+                                               const Column &src_col,
+                                               bool from_build) {
 
     uint16_t num_rows = 0;
     std::vector<char> char_data;
@@ -284,6 +420,227 @@ inline void materialize_varchar_column(Column &dest_col,
 
     if (num_rows != 0)
         save_page();
+}
+
+/**
+ *
+ *  parallel varchar column materialization
+ *  each thread builds its own Column with local pages
+ *  merge pages at end via pointer moves
+ *
+ **/
+template <typename ReaderFunc>
+inline void materialize_varchar_column(Column &dest_col,
+                                       const MatchCollector &collector,
+                                       ReaderFunc &&read_value,
+                                       const Column &src_col, bool from_build) {
+    const size_t total_matches = collector.size();
+    if (total_matches == 0)
+        return;
+
+    constexpr size_t PARALLEL_THRESHOLD = 5000;
+    if (total_matches < PARALLEL_THRESHOLD) {
+        materialize_varchar_column_serial(dest_col, collector, read_value,
+                                          src_col, from_build);
+        return;
+    }
+
+    const uint64_t *matches_ptr = collector.matches.data();
+    const size_t chunk_size = compute_materialization_chunk_size(total_matches);
+    constexpr int num_threads = SPC__CORE_COUNT;
+
+    std::vector<Column> thread_columns;
+    thread_columns.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        thread_columns.emplace_back(DataType::VARCHAR);
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            size_t start = t * total_matches / num_threads;
+            size_t end = (t + 1) * total_matches / num_threads;
+            if (start >= total_matches)
+                return;
+
+            Column &local_col = thread_columns[t];
+
+            uint16_t num_rows = 0;
+            std::vector<char> char_data;
+            std::vector<uint16_t> offsets;
+            std::vector<uint8_t> bitmap;
+            size_t current_char_size = 0;
+
+            size_t chunk_matches = end - start;
+            size_t estimated_char_size =
+                std::min(chunk_matches * 16, size_t(PAGE_SIZE));
+            char_data.reserve(estimated_char_size);
+            offsets.reserve(std::min(chunk_matches, size_t(2048)));
+            bitmap.reserve(std::min(chunk_matches / 8 + 1, size_t(512)));
+
+            uint8_t pending_bits = 0;
+            int bit_count = 0;
+
+            auto flush_bitmap = [&]() {
+                if (bit_count > 0) {
+                    bitmap.push_back(pending_bits);
+                    pending_bits = 0;
+                    bit_count = 0;
+                }
+            };
+
+            auto save_long_string_buffer = [&](const std::string &str) {
+                size_t offset = 0;
+                bool first_page = true;
+                while (offset < str.size()) {
+                    auto *page = local_col.new_page()->data;
+                    *reinterpret_cast<uint16_t *>(page) =
+                        first_page ? 0xffff : 0xfffe;
+                    first_page = false;
+                    size_t len = std::min(str.size() - offset, PAGE_SIZE - 4);
+                    *reinterpret_cast<uint16_t *>(page + 2) =
+                        static_cast<uint16_t>(len);
+                    std::memcpy(page + 4, str.data() + offset, len);
+                    offset += len;
+                }
+            };
+
+            auto copy_long_string_pages = [&](int32_t start_page_idx) {
+                int32_t curr_idx = start_page_idx;
+                while (true) {
+                    auto *src_page_data = src_col.pages[curr_idx]->data;
+                    auto *dest_page_data = local_col.new_page()->data;
+                    std::memcpy(dest_page_data, src_page_data, PAGE_SIZE);
+
+                    curr_idx++;
+                    if (curr_idx >= static_cast<int32_t>(src_col.pages.size()))
+                        break;
+                    auto *next_p = src_col.pages[curr_idx]->data;
+                    if (*reinterpret_cast<uint16_t *>(next_p) != 0xfffe)
+                        break;
+                }
+            };
+
+            auto save_page = [&]() {
+                flush_bitmap();
+                auto *page = local_col.new_page()->data;
+                *reinterpret_cast<uint16_t *>(page) = num_rows;
+                *reinterpret_cast<uint16_t *>(page + 2) =
+                    static_cast<uint16_t>(offsets.size());
+                std::memcpy(page + 4, offsets.data(), offsets.size() * 2);
+                std::memcpy(page + 4 + offsets.size() * 2, char_data.data(),
+                            current_char_size);
+                std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
+                            bitmap.size());
+                num_rows = 0;
+                current_char_size = 0;
+                offsets.clear();
+                bitmap.clear();
+                pending_bits = 0;
+                bit_count = 0;
+            };
+
+            auto add_normal_string =
+                [&](int32_t page_idx, int32_t offset_idx) -> bool {
+                auto [str_ptr, str_len] =
+                    get_string_view(src_col, page_idx, offset_idx);
+
+                if (str_len > PAGE_SIZE - 7) {
+                    if (num_rows > 0)
+                        save_page();
+                    save_long_string_buffer(std::string(str_ptr, str_len));
+                    return false;
+                }
+
+                size_t needed = 4 + (offsets.size() + 1) * 2 +
+                                (current_char_size + str_len) +
+                                (bitmap.size() + 2);
+                if (needed > PAGE_SIZE)
+                    save_page();
+
+                if (current_char_size + str_len > char_data.size()) {
+                    char_data.resize(std::max(char_data.size() * 2,
+                                              current_char_size + str_len +
+                                                  4096));
+                }
+
+                std::memcpy(char_data.data() + current_char_size, str_ptr,
+                            str_len);
+                current_char_size += str_len;
+                offsets.emplace_back(current_char_size);
+                return true;
+            };
+
+            auto run_loop = [&](auto get_row_id) {
+                for (size_t i = start; i < end; ++i) {
+                    uint32_t row_id = get_row_id(matches_ptr[i]);
+                    mema::value_t val = read_value(row_id);
+
+                    if (val.is_null()) {
+                        if (4 + offsets.size() * 2 + current_char_size +
+                                (bitmap.size() + 2) >
+                            PAGE_SIZE) {
+                            save_page();
+                        }
+                        bit_count++;
+                        if (bit_count == 8) {
+                            bitmap.push_back(pending_bits);
+                            pending_bits = 0;
+                            bit_count = 0;
+                        }
+                        num_rows++;
+                    } else {
+                        int32_t page_idx, offset_idx;
+                        mema::value_t::decode_string(val.value, page_idx,
+                                                      offset_idx);
+
+                        if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
+                            if (num_rows > 0)
+                                save_page();
+                            copy_long_string_pages(page_idx);
+                        } else {
+                            if (add_normal_string(page_idx, offset_idx)) {
+                                pending_bits |= (1u << bit_count);
+                                bit_count++;
+                                if (bit_count == 8) {
+                                    bitmap.push_back(pending_bits);
+                                    pending_bits = 0;
+                                    bit_count = 0;
+                                }
+                                num_rows++;
+                            }
+                        }
+                    }
+                }
+            };
+
+            if (from_build) {
+                run_loop([](uint64_t m) {
+                    return static_cast<uint32_t>(m & 0xFFFFFFFF);
+                });
+            } else {
+                run_loop(
+                    [](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+            }
+
+            if (num_rows != 0)
+                save_page();
+        });
+    }
+
+    for (auto &w : workers) {
+        w.join();
+    }
+
+    /* merge phase: move pages from thread-local columns to dest_col */
+    for (auto &thread_col : thread_columns) {
+        for (auto *page : thread_col.pages) {
+            dest_col.pages.push_back(page);
+        }
+        thread_col.pages.clear();
+    }
 }
 
 /**

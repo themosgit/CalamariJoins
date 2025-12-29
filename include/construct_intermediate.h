@@ -7,8 +7,47 @@
 #include <vector>
 #include <thread>
 #include <hardware_darwin.h>
+#include <sys/mman.h>
 
 namespace Contest {
+
+/* batch-allocated memory using mmap */
+class BatchAllocator {
+private:
+    void* memory_block = nullptr;
+    size_t total_size = 0;
+
+public:
+    BatchAllocator() = default;
+    /* allocate all pages */
+    void allocate(size_t total_pages) {
+        total_size = total_pages * PAGE_SIZE;
+        memory_block = mmap(nullptr, total_size,
+                           PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (memory_block == MAP_FAILED) {
+            memory_block = nullptr;
+            throw std::bad_alloc();
+        }
+    }
+
+    void* get_block() { return memory_block; }
+
+    ~BatchAllocator() {
+        if (memory_block) {
+            munmap(memory_block, total_size);
+        }
+    }
+
+    BatchAllocator(const BatchAllocator&) = delete;
+    BatchAllocator& operator=(const BatchAllocator&) = delete;
+
+    BatchAllocator(BatchAllocator&& other) noexcept
+        : memory_block(other.memory_block), total_size(other.total_size) {
+        other.memory_block = nullptr;
+        other.total_size = 0;
+    }
+};
 
 using ExecuteResult = std::vector<mema::column_t>;
 
@@ -23,20 +62,27 @@ struct ColumnSource {
     uint32_t shift;
 };
 
-inline size_t compute_chunk_size(size_t num_columns) {
-    constexpr size_t LAST_LEVEL_CACHE =
-        #if defined(SPC__LEVEL3_CACHE_SIZE) && SPC__LEVEL3_CACHE_SIZE > 0
-            SPC__LEVEL3_CACHE_SIZE;
-        #else
-            SPC__LEVEL2_CACHE_SIZE;
-        #endif
-
+inline size_t compute_chunk_size(size_t num_columns, size_t total_matches) {
     constexpr int NUM_CORES = SPC__CORE_COUNT;
-    size_t per_core_cache = LAST_LEVEL_CACHE / NUM_CORES;
-    size_t target_bytes = per_core_cache / 2;
+    constexpr size_t L2_CACHE_SIZE = SPC__LEVEL2_CACHE_SIZE;
+    size_t per_core_l2 = L2_CACHE_SIZE / NUM_CORES;
+    size_t target_bytes_l2 = per_core_l2 / 2;
     size_t bytes_per_match = 8 + 4 + (num_columns * 4);
-    size_t chunk_size = target_bytes / bytes_per_match;
-    return std::clamp(chunk_size, size_t(1024), size_t(200000));
+    size_t l2_optimal = target_bytes_l2 / bytes_per_match;
+    #if defined(SPC__LEVEL3_CACHE_SIZE) && SPC__LEVEL3_CACHE_SIZE > 0
+        constexpr size_t L3_CACHE_SIZE = SPC__LEVEL3_CACHE_SIZE;
+        size_t per_core_l3 = L3_CACHE_SIZE / NUM_CORES;
+        size_t target_bytes_l3 = per_core_l3 / 2;
+        size_t l3_optimal = target_bytes_l3 / bytes_per_match;
+        size_t cache_optimal = std::max(l2_optimal, l3_optimal);
+    #else
+        size_t cache_optimal = l2_optimal;
+    #endif
+    size_t min_total_tasks = NUM_CORES * 4;
+    size_t total_work_items = total_matches * num_columns;
+    size_t max_chunk_for_tasks = (total_work_items + min_total_tasks - 1) / min_total_tasks;
+    size_t chunk_size = std::min(cache_optimal, max_chunk_for_tasks);
+    return std::max(chunk_size, size_t(1024));
 }
 
 inline std::vector<ChunkTask> compute_tasks(
@@ -239,23 +285,32 @@ inline void construct_intermediate_from_intermediate(
 
     const uint64_t *matches_ptr = collector.matches.data();
     const size_t build_size = build.size();
-    const size_t chunk_size = compute_chunk_size(output_attrs.size());
+    const size_t chunk_size = compute_chunk_size(output_attrs.size(), total_matches);
     const auto tasks = compute_tasks(output_attrs.size(), total_matches, chunk_size);
     const auto sources = prepare_sources(output_attrs, build, probe, build_size);
 
+    size_t total_pages = 0;
     for (auto& col : results) {
-        col.pre_allocate(total_matches);
+        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
+    }
+
+    auto allocator = std::make_shared<BatchAllocator>();
+    allocator->allocate(total_pages);
+    void* block = allocator->get_block();
+    size_t offset = 0;
+
+    for (auto& col : results) {
+        col.pre_allocate_from_block(block, offset, total_matches, allocator);
     }
 
     constexpr int num_threads = SPC__CORE_COUNT;
-    const int actual_threads = std::min(num_threads, static_cast<int>(tasks.size()));
 
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
     for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t, actual_threads] {
-            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += actual_threads) {
+        workers.emplace_back([&, t] {
+            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
                 const auto& task = tasks[task_idx];
                 const auto& src = sources[task.col_idx];
                 auto& dest = results[task.col_idx];
@@ -290,15 +345,29 @@ inline void construct_intermediate_from_columnar(
         return;
 
     const uint64_t *matches_ptr = collector.matches.data();
-    const size_t chunk_size = compute_chunk_size(remapped_attrs.size());
+    const size_t chunk_size = compute_chunk_size(remapped_attrs.size(), total_matches);
     const auto tasks = compute_tasks(remapped_attrs.size(), total_matches, chunk_size);
     const auto sources = prepare_columnar_sources(remapped_attrs, build_input, probe_input,
                                                    build_node, probe_node, build_size);
+
+    size_t total_pages = 0;
     for (auto& col : results) {
-        col.pre_allocate(total_matches);
+        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
     }
+
+    auto allocator = std::make_shared<BatchAllocator>();
+    allocator->allocate(total_pages);
+    void* block = allocator->get_block();
+    size_t offset = 0;
+
+    for (auto& col : results) {
+        col.pre_allocate_from_block(block, offset, total_matches, allocator);
+    }
+
     constexpr int num_threads = SPC__CORE_COUNT;
     std::vector<ColumnarReader> thread_readers(num_threads);
+
+    // prepare column lists for readers
     std::vector<const Column*> build_columns;
     auto* build_table = std::get<const ColumnarTable*>(build_input.data);
     for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
@@ -311,16 +380,15 @@ inline void construct_intermediate_from_columnar(
         auto [actual_col_idx, _] = probe_node.output_attrs[i];
         probe_columns.push_back(&probe_table->columns[actual_col_idx]);
     }
-    for (auto& reader : thread_readers) {
-        reader.prepare_build(build_columns);
-        reader.prepare_probe(probe_columns);
-    }
 
     std::vector<std::thread> workers;
     workers.reserve(num_threads);
 
     for (int t = 0; t < num_threads; ++t) {
         workers.emplace_back([&, t] {
+            thread_readers[t].prepare_build(build_columns);
+            thread_readers[t].prepare_probe(probe_columns);
+
             auto& reader = thread_readers[t];
             for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
                 const auto& task = tasks[task_idx];
@@ -365,35 +433,44 @@ inline void construct_intermediate_mixed(
         return;
 
     const uint64_t *matches_ptr = collector.matches.data();
-    const size_t chunk_size = compute_chunk_size(remapped_attrs.size());
+    const size_t chunk_size = compute_chunk_size(remapped_attrs.size(), total_matches);
     const auto tasks = compute_tasks(remapped_attrs.size(), total_matches, chunk_size);
     const auto sources = prepare_mixed_sources(remapped_attrs, build_input, probe_input,
                                                 build_node, probe_node, build_size);
+
+    size_t total_pages = 0;
     for (auto& col : results) {
-        col.pre_allocate(total_matches);
+        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
     }
+
+    auto allocator = std::make_shared<BatchAllocator>();
+    allocator->allocate(total_pages);
+    void* block = allocator->get_block();
+    size_t offset = 0;
+
+    for (auto& col : results) {
+        col.pre_allocate_from_block(block, offset, total_matches, allocator);
+    }
+
     constexpr int num_threads = SPC__CORE_COUNT;
     std::vector<ColumnarReader> thread_readers(num_threads);
-    if (build_input.is_columnar()) {
-        std::vector<const Column*> build_columns;
+    std::vector<const Column*> build_columns;
+    std::vector<const Column*> probe_columns;
+    bool has_build_columnar = build_input.is_columnar();
+    bool has_probe_columnar = probe_input.is_columnar();
+
+    if (has_build_columnar) {
         auto* build_table = std::get<const ColumnarTable*>(build_input.data);
         for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
             auto [actual_col_idx, _] = build_node.output_attrs[i];
             build_columns.push_back(&build_table->columns[actual_col_idx]);
         }
-        for (auto& reader : thread_readers) {
-            reader.prepare_build(build_columns);
-        }
     }
-    if (probe_input.is_columnar()) {
-        std::vector<const Column*> probe_columns;
+    if (has_probe_columnar) {
         auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
         for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
             auto [actual_col_idx, _] = probe_node.output_attrs[i];
             probe_columns.push_back(&probe_table->columns[actual_col_idx]);
-        }
-        for (auto& reader : thread_readers) {
-            reader.prepare_probe(probe_columns);
         }
     }
 
@@ -401,7 +478,14 @@ inline void construct_intermediate_mixed(
     workers.reserve(num_threads);
 
     for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t] {
+        workers.emplace_back([&, t, has_build_columnar, has_probe_columnar] {
+            if (has_build_columnar) {
+                thread_readers[t].prepare_build(build_columns);
+            }
+            if (has_probe_columnar) {
+                thread_readers[t].prepare_probe(probe_columns);
+            }
+
             auto& reader = thread_readers[t];
             for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
                 const auto& task = tasks[task_idx];

@@ -209,12 +209,18 @@ class ColumnarReader {
     }
 
     inline mema::value_t read_value_build(const Column &column, size_t col_idx,
-                                          uint32_t row_id, DataType data_type) {
-        if (col_idx == build_cached_col && row_id >= build_cached_start &&
-            row_id < build_cached_end) {
+                                          uint32_t row_id, DataType data_type) const {
+        /* thread-local cache for parallel materialization */
+        thread_local size_t tl_build_cached_col = ~0u;
+        thread_local size_t tl_build_cached_page = ~0u;
+        thread_local uint32_t tl_build_cached_start = 0;
+        thread_local uint32_t tl_build_cached_end = 0;
+
+        if (col_idx == tl_build_cached_col && row_id >= tl_build_cached_start &&
+            row_id < tl_build_cached_end) {
             return read_from_page(column, build_page_indices[col_idx],
-                                  build_cached_page,
-                                  row_id - build_cached_start, data_type);
+                                  tl_build_cached_page,
+                                  row_id - tl_build_cached_start, data_type);
         }
 
         const PageIndex &page_index = build_page_indices[col_idx];
@@ -222,22 +228,28 @@ class ColumnarReader {
         uint32_t page_start = page_index.page_start_row(page_num);
         uint32_t page_end = page_index.cumulative_rows[page_num];
 
-        build_cached_col = col_idx;
-        build_cached_page = page_num;
-        build_cached_start = page_start;
-        build_cached_end = page_end;
+        tl_build_cached_col = col_idx;
+        tl_build_cached_page = page_num;
+        tl_build_cached_start = page_start;
+        tl_build_cached_end = page_end;
 
         return read_from_page(column, page_index, page_num, row_id - page_start,
                               data_type);
     }
 
     inline mema::value_t read_value_probe(const Column &column, size_t col_idx,
-                                          uint32_t row_id, DataType data_type) {
-        if (col_idx == probe_cached_col && row_id >= probe_cached_start &&
-            row_id < probe_cached_end) {
+                                          uint32_t row_id, DataType data_type) const {
+        /* thread-local cache for parallel materialization */
+        thread_local size_t tl_probe_cached_col = ~0u;
+        thread_local size_t tl_probe_cached_page = ~0u;
+        thread_local uint32_t tl_probe_cached_start = 0;
+        thread_local uint32_t tl_probe_cached_end = 0;
+
+        if (col_idx == tl_probe_cached_col && row_id >= tl_probe_cached_start &&
+            row_id < tl_probe_cached_end) {
             return read_from_page(column, probe_page_indices[col_idx],
-                                  probe_cached_page,
-                                  row_id - probe_cached_start, data_type);
+                                  tl_probe_cached_page,
+                                  row_id - tl_probe_cached_start, data_type);
         }
 
         const PageIndex &page_index = probe_page_indices[col_idx];
@@ -245,10 +257,10 @@ class ColumnarReader {
         uint32_t page_start = page_index.page_start_row(page_num);
         uint32_t page_end = page_index.cumulative_rows[page_num];
 
-        probe_cached_col = col_idx;
-        probe_cached_page = page_num;
-        probe_cached_start = page_start;
-        probe_cached_end = page_end;
+        tl_probe_cached_col = col_idx;
+        tl_probe_cached_page = page_num;
+        tl_probe_cached_start = page_start;
+        tl_probe_cached_end = page_end;
 
         return read_from_page(column, page_index, page_num, row_id - page_start,
                               data_type);
