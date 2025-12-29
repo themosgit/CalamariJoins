@@ -41,7 +41,6 @@ class ColumnarReader;
  *
  *  constructs intermediate results from column_t intermediate format
  *  both build and probe are intermediate results
- *  detects sequential runs to enable bulk copy
  *  shift extracts correct row id from packed match
  *
  **/
@@ -110,21 +109,17 @@ inline void construct_intermediate_from_columnar(
         auto [actual_col_idx, _] = src_node->output_attrs[remapped_col_idx];
         const Column &src_col = src_table->columns[actual_col_idx];
 
-        if (from_build) {
-            for (size_t i = 0; i < total_matches; ++i) {
-                uint32_t row_id =
-                    static_cast<uint32_t>(matches_ptr[i] & 0xFFFFFFFF);
-                mema::value_t value = columnar_reader.read_value_build(
-                    src_col, remapped_col_idx, row_id, src_col.type);
-                results[out_idx].append(value);
-            }
-        } else {
-            for (size_t i = 0; i < total_matches; ++i) {
-                uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> 32);
-                mema::value_t value = columnar_reader.read_value_probe(
-                    src_col, remapped_col_idx, row_id, src_col.type);
-                results[out_idx].append(value);
-            }
+        const uint32_t shift = from_build ? 0 : 32;
+        for (size_t i = 0; i < total_matches; ++i) {
+            uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> shift);
+            mema::value_t value = from_build
+                                      ? columnar_reader.read_value_build(
+                                            src_col, remapped_col_idx, row_id,
+                                            src_col.type)
+                                      : columnar_reader.read_value_probe(
+                                            src_col, remapped_col_idx, row_id,
+                                            src_col.type);
+            results[out_idx].append(value);
         }
     }
 }
@@ -189,41 +184,25 @@ inline void construct_intermediate_mixed(
             }
         }
 
+        const uint32_t shift = from_build ? 0 : 32;
+
         if (source_is_columnar) {
-            if (from_build) {
-                for (size_t i = 0; i < total_matches; ++i) {
-                    uint32_t row_id =
-                        static_cast<uint32_t>(matches_ptr[i] & 0xFFFFFFFF);
-                    mema::value_t value = columnar_reader.read_value_build(
-                        *columnar_src_col, remapped_col_idx, row_id,
-                        columnar_src_col->type);
-                    results[out_idx].append(value);
-                }
-            } else {
-                for (size_t i = 0; i < total_matches; ++i) {
-                    uint32_t row_id =
-                        static_cast<uint32_t>(matches_ptr[i] >> 32);
-                    mema::value_t value = columnar_reader.read_value_probe(
-                        *columnar_src_col, remapped_col_idx, row_id,
-                        columnar_src_col->type);
-                    results[out_idx].append(value);
-                }
+            for (size_t i = 0; i < total_matches; ++i) {
+                uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> shift);
+                mema::value_t value = from_build
+                                          ? columnar_reader.read_value_build(
+                                                *columnar_src_col, remapped_col_idx,
+                                                row_id, columnar_src_col->type)
+                                          : columnar_reader.read_value_probe(
+                                                *columnar_src_col, remapped_col_idx,
+                                                row_id, columnar_src_col->type);
+                results[out_idx].append(value);
             }
         } else {
             const mema::column_t &col = *intermediate_src_col;
-
-            if (from_build) {
-                for (size_t i = 0; i < total_matches; ++i) {
-                    uint32_t row_id =
-                        static_cast<uint32_t>(matches_ptr[i] & 0xFFFFFFFF);
-                    results[out_idx].append(col[row_id]);
-                }
-            } else {
-                for (size_t i = 0; i < total_matches; ++i) {
-                    uint32_t row_id =
-                        static_cast<uint32_t>(matches_ptr[i] >> 32);
-                    results[out_idx].append(col[row_id]);
-                }
+            for (size_t i = 0; i < total_matches; ++i) {
+                uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> shift);
+                results[out_idx].append(col[row_id]);
             }
         }
     }

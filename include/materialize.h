@@ -575,13 +575,9 @@ inline ColumnarTable materialize_from_intermediate(
             const auto &src_table = plan.inputs[column->source_table];
             const auto &src_col = src_table.columns[column->source_column];
 
-            auto read_val = [&](uint32_t row_id) {
-                return (*column)[row_id];
-            };
-
             materialize_varchar_column(
                 dest_col, collector,
-                [&](uint32_t rid) { return read_val(rid); }, src_col,
+                [&](uint32_t row_id) { return (*column)[row_id]; }, src_col,
                 from_build);
         }
     }

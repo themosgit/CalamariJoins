@@ -84,7 +84,7 @@ struct column_t {
         pages.reserve((expected_rows + CAP_PER_PAGE - 1) / CAP_PER_PAGE);
     }
 
-    /* appends value to page,creates new page if current page is full */
+    /* appends value to page, creates new page if current page is full */
     inline void append(const value_t &val) {
         if (num_values % CAP_PER_PAGE == 0) {
             pages.push_back(new Page());
@@ -93,17 +93,10 @@ struct column_t {
         num_values++;
     }
 
-    /* when the value is null
-     * we append the NULL_VALUE sentinel */
-    inline void append_null() {
-        append(value_t{value_t::NULL_VALUE});
-    }
-
     const value_t &operator[](size_t idx) const {
         return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
     }
 
-    size_t size() const { return num_values; }
     size_t row_count() const { return num_values; }
 };
 
