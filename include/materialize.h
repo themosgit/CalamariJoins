@@ -372,12 +372,7 @@ inline ColumnarTable materialize_mixed(
 
     auto read_from_intermediate = [](const mema::column_t &column,
                                      uint32_t row_id) {
-        if (column.has_direct_access()) {
-            return column[row_id];
-        } else {
-            const mema::value_t *val = column.get_by_row(row_id);
-            return val ? *val : mema::value_t{mema::value_t::NULL_VALUE};
-        }
+        return column[row_id];
     };
 
     for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
@@ -556,51 +551,23 @@ inline ColumnarTable materialize_from_intermediate(
                 bitmap.clear();
             };
 
-            if (column->has_direct_access()) {
-                size_t match_idx = 0;
-                while (match_idx < total_matches) {
-                    uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                    size_t run_end = match_idx + 1;
-                    uint32_t expected_row = row_id + 1;
-                    while (run_end < total_matches &&
-                           (matches_ptr[run_end] >> shift) == expected_row) {
-                        ++expected_row;
-                        ++run_end;
-                    }
-                    size_t run_length = run_end - match_idx;
-                    for (size_t i = 0; i < run_length; ++i) {
-                        uint32_t r = row_id + i;
-                        const mema::value_t &val = (*column)[r];
-                        if (4 + (data.size() + 1) * 4 + (num_rows / 8 + 1) >
-                            PAGE_SIZE)
-                            save_page();
-                        size_t byte_idx = num_rows / 8;
-                        uint8_t bit_idx = num_rows % 8;
-                        set_bitmap_bit(bitmap, byte_idx, bit_idx);
-                        data.emplace_back(val.value);
-                        ++num_rows;
-                    }
-                    match_idx = run_end;
+            for (size_t match_idx = 0; match_idx < total_matches;
+                 ++match_idx) {
+                uint32_t row_id = (matches_ptr[match_idx] >> shift);
+                const mema::value_t &val = (*column)[row_id];
+                if (4 + (!val.is_null() ? data.size() + 1 : data.size()) * 4 +
+                        (num_rows / 8 + 1) >
+                    PAGE_SIZE)
+                    save_page();
+                size_t byte_idx = num_rows / 8;
+                uint8_t bit_idx = num_rows % 8;
+                if (!val.is_null()) {
+                    set_bitmap_bit(bitmap, byte_idx, bit_idx);
+                    data.emplace_back(val.value);
+                } else {
+                    ensure_bitmap_size(bitmap, byte_idx);
                 }
-            } else {
-                for (size_t match_idx = 0; match_idx < total_matches;
-                     ++match_idx) {
-                    uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                    const mema::value_t *val = column->get_by_row(row_id);
-                    if (4 + (val ? data.size() + 1 : data.size()) * 4 +
-                            (num_rows / 8 + 1) >
-                        PAGE_SIZE)
-                        save_page();
-                    size_t byte_idx = num_rows / 8;
-                    uint8_t bit_idx = num_rows % 8;
-                    if (val) {
-                        set_bitmap_bit(bitmap, byte_idx, bit_idx);
-                        data.emplace_back(val->value);
-                    } else {
-                        ensure_bitmap_size(bitmap, byte_idx);
-                    }
-                    ++num_rows;
-                }
+                ++num_rows;
             }
             if (num_rows != 0)
                 save_page();
@@ -609,10 +576,7 @@ inline ColumnarTable materialize_from_intermediate(
             const auto &src_col = src_table.columns[column->source_column];
 
             auto read_val = [&](uint32_t row_id) {
-                if (column->has_direct_access())
-                    return (*column)[row_id];
-                const mema::value_t *v = column->get_by_row(row_id);
-                return v ? *v : mema::value_t{mema::value_t::NULL_VALUE};
+                return (*column)[row_id];
             };
 
             materialize_varchar_column(
@@ -705,10 +669,6 @@ inline std::variant<ExecuteResult, ColumnarTable> materialize_join_results(
                               config.remapped_attrs, build_node, probe_node,
                               build_input.output_size(), setup.columnar_reader,
                               setup.results);
-        }
-
-        for (auto &col : setup.results) {
-            col.build_cache();
         }
 
         return std::move(setup.results);

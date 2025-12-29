@@ -165,30 +165,16 @@ inline void probe_intermediate(const UnchainedHashtable &hash_table,
     const auto *row_ids = hash_table.row_ids();
 
     const size_t probe_count = probe_column.row_count();
-    const bool probe_direct = probe_column.has_direct_access();
 
-    if (probe_direct) {
-        for (size_t idx = 0; idx < probe_count; ++idx) {
-            int32_t key_val = probe_column[idx].value;
+    for (size_t idx = 0; idx < probe_count; ++idx) {
+        const mema::value_t &key = probe_column[idx];
+        if (!key.is_null()) {
+            int32_t key_val = key.value;
             auto [start_idx, end_idx] = hash_table.find_indices(key_val);
 
             for (uint64_t i = start_idx; i < end_idx; ++i) {
                 if (keys[i] == key_val) {
                     collector.add_match(row_ids[i], idx);
-                }
-            }
-        }
-    } else {
-        for (size_t idx = 0; idx < probe_count; ++idx) {
-            const mema::value_t *key = probe_column.get_by_row(idx);
-            if (key != nullptr) {
-                int32_t key_val = key->value;
-                auto [start_idx, end_idx] = hash_table.find_indices(key_val);
-
-                for (uint64_t i = start_idx; i < end_idx; ++i) {
-                    if (keys[i] == key_val) {
-                        collector.add_match(row_ids[i], idx);
-                    }
                 }
             }
         }

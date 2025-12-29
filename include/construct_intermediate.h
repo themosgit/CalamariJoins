@@ -67,84 +67,10 @@ inline void construct_intermediate_from_intermediate(
 
         results[out_idx].reserve(total_matches);
 
-        if (column->has_direct_access()) {
-            size_t match_idx = 0;
-
-            while (match_idx < total_matches) {
-                uint32_t row_id = (matches_ptr[match_idx] >> shift);
-
-                size_t run_end = match_idx + 1;
-                uint32_t expected_row = row_id + 1;
-                while (run_end < total_matches &&
-                       (matches_ptr[run_end] >> shift) == expected_row) {
-                    ++expected_row;
-                    ++run_end;
-                }
-                size_t total_run_length = run_end - match_idx;
-
-                size_t processed = 0;
-                while (processed < total_run_length) {
-                    uint32_t current_row = row_id + processed;
-                    size_t page_offset = current_row % mema::CAP_PER_PAGE;
-                    size_t rows_in_page =
-                        std::min(mema::CAP_PER_PAGE - page_offset,
-                                 total_run_length - processed);
-
-                    if (page_offset == 0 &&
-                        rows_in_page == mema::CAP_PER_PAGE) {
-                        results[out_idx].append_bulk(
-                            &(*column)[current_row].value, rows_in_page);
-                    } else if (rows_in_page >= 4) {
-                        results[out_idx].append_consecutive(
-                            &(*column)[current_row], rows_in_page);
-                    } else {
-                        for (size_t i = 0; i < rows_in_page; ++i) {
-                            results[out_idx].append((*column)[current_row + i]);
-                        }
-                    }
-                    processed += rows_in_page;
-                }
-                match_idx = run_end;
-            }
-        } else {
-            size_t match_idx = 0;
-            while (match_idx < total_matches) {
-                uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                const mema::value_t *first_value = column->get_by_row(row_id);
-
-                if (first_value == nullptr) {
-                    results[out_idx].append_null();
-                    ++match_idx;
-                    continue;
-                }
-
-                size_t run_end = match_idx + 1;
-                uint32_t expected_row = row_id + 1;
-                while (run_end < total_matches) {
-                    uint32_t next_row = (matches_ptr[run_end] >> shift);
-                    if (next_row != expected_row)
-                        break;
-                    if (column->get_by_row(next_row) == nullptr)
-                        break;
-                    ++expected_row;
-                    ++run_end;
-                }
-
-                size_t run_length = run_end - match_idx;
-
-                if (run_length >= 4) {
-                    results[out_idx].append_consecutive(first_value,
-                                                        run_length);
-                } else {
-                    results[out_idx].append(*first_value);
-                    for (size_t i = 1; i < run_length; ++i) {
-                        uint32_t r = row_id + i;
-                        const mema::value_t *val = column->get_by_row(r);
-                        results[out_idx].append(*val);
-                    }
-                }
-                match_idx = run_end;
-            }
+        for (size_t match_idx = 0; match_idx < total_matches; ++match_idx) {
+            uint32_t row_id = (matches_ptr[match_idx] >> shift);
+            const mema::value_t &val = (*column)[row_id];
+            results[out_idx].append(val);
         }
     }
 }
@@ -284,38 +210,19 @@ inline void construct_intermediate_mixed(
                 }
             }
         } else {
-            bool direct_access = intermediate_src_col->has_direct_access();
             const mema::column_t &col = *intermediate_src_col;
 
             if (from_build) {
-                if (direct_access) {
-                    for (size_t i = 0; i < total_matches; ++i) {
-                        uint32_t row_id =
-                            static_cast<uint32_t>(matches_ptr[i] & 0xFFFFFFFF);
-                        results[out_idx].append(col[row_id]);
-                    }
-                } else {
-                    for (size_t i = 0; i < total_matches; ++i) {
-                        uint32_t row_id =
-                            static_cast<uint32_t>(matches_ptr[i] & 0xFFFFFFFF);
-                        const mema::value_t *val = col.get_by_row(row_id);
-                        results[out_idx].append(val ? *val : mema::value_t{});
-                    }
+                for (size_t i = 0; i < total_matches; ++i) {
+                    uint32_t row_id =
+                        static_cast<uint32_t>(matches_ptr[i] & 0xFFFFFFFF);
+                    results[out_idx].append(col[row_id]);
                 }
             } else {
-                if (direct_access) {
-                    for (size_t i = 0; i < total_matches; ++i) {
-                        uint32_t row_id =
-                            static_cast<uint32_t>(matches_ptr[i] >> 32);
-                        results[out_idx].append(col[row_id]);
-                    }
-                } else {
-                    for (size_t i = 0; i < total_matches; ++i) {
-                        uint32_t row_id =
-                            static_cast<uint32_t>(matches_ptr[i] >> 32);
-                        const mema::value_t *val = col.get_by_row(row_id);
-                        results[out_idx].append(val ? *val : mema::value_t{});
-                    }
+                for (size_t i = 0; i < total_matches; ++i) {
+                    uint32_t row_id =
+                        static_cast<uint32_t>(matches_ptr[i] >> 32);
+                    results[out_idx].append(col[row_id]);
                 }
             }
         }

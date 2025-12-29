@@ -137,31 +137,16 @@ inline void nested_loop_from_intermediate(const ExecuteResult &build,
     const size_t build_count = build_column.row_count();
     const size_t probe_count = probe_column.row_count();
 
-    const bool build_direct = build_column.has_direct_access();
-    const bool probe_direct = probe_column.has_direct_access();
-
     collector.reserve(build_count * probe_count / 2);
 
-    if (build_direct && probe_direct) {
-        for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
-            int build_value = build_column[build_idx].value;
-            for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
-                if (probe_column[probe_idx].value == build_value) {
-                    collector.add_match(build_idx, probe_idx);
-                }
-            }
-        }
-    } else {
-        for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
-            const mema::value_t *build_key = build_column.get_by_row(build_idx);
-            if (!build_key)
-                continue;
-            for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
-                const mema::value_t *probe_key =
-                    probe_column.get_by_row(probe_idx);
-                if (probe_key && probe_key->value == build_key->value) {
-                    collector.add_match(build_idx, probe_idx);
-                }
+    for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
+        const mema::value_t &build_key = build_column[build_idx];
+        if (build_key.is_null())
+            continue;
+        for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
+            const mema::value_t &probe_key = probe_column[probe_idx];
+            if (!probe_key.is_null() && probe_key.value == build_key.value) {
+                collector.add_match(build_idx, probe_idx);
             }
         }
     }
@@ -232,21 +217,11 @@ inline void nested_loop_mixed(const JoinInput &build_input,
                 }
 
                 if (build_valid) {
-                    if (probe_column.has_direct_access()) {
-                        for (size_t probe_idx = 0; probe_idx < probe_rows;
-                             ++probe_idx) {
-                            if (probe_column[probe_idx].value == build_value) {
-                                collector.add_match(build_row_id, probe_idx);
-                            }
-                        }
-                    } else {
-                        for (size_t probe_idx = 0; probe_idx < probe_rows;
-                             ++probe_idx) {
-                            const mema::value_t *probe_key =
-                                probe_column.get_by_row(probe_idx);
-                            if (probe_key && probe_key->value == build_value) {
-                                collector.add_match(build_row_id, probe_idx);
-                            }
+                    for (size_t probe_idx = 0; probe_idx < probe_rows;
+                         ++probe_idx) {
+                        const mema::value_t &probe_key = probe_column[probe_idx];
+                        if (!probe_key.is_null() && probe_key.value == build_value) {
+                            collector.add_match(build_row_id, probe_idx);
                         }
                     }
                 }
@@ -262,87 +237,44 @@ inline void nested_loop_mixed(const JoinInput &build_input,
         auto [probe_col_idx, _] = probe_input.node->output_attrs[probe_attr];
         const Column &probe_col = probe_table->columns[probe_col_idx];
 
-        if (build_column.has_direct_access()) {
-            for (size_t build_idx = 0; build_idx < build_rows; ++build_idx) {
-                int build_value = build_column[build_idx].value;
+        for (size_t build_idx = 0; build_idx < build_rows; ++build_idx) {
+            const mema::value_t &build_key = build_column[build_idx];
+            if (build_key.is_null())
+                continue;
+            int build_value = build_key.value;
 
-                uint32_t probe_row_id = 0;
-                for (auto *probe_page_obj : probe_col.pages) {
-                    auto *probe_page = probe_page_obj->data;
-                    auto probe_num_rows =
-                        *reinterpret_cast<const uint16_t *>(probe_page);
-                    auto probe_num_values =
-                        *reinterpret_cast<const uint16_t *>(probe_page + 2);
-                    auto *probe_data =
-                        reinterpret_cast<const int32_t *>(probe_page + 4);
+            uint32_t probe_row_id = 0;
+            for (auto *probe_page_obj : probe_col.pages) {
+                auto *probe_page = probe_page_obj->data;
+                auto probe_num_rows =
+                    *reinterpret_cast<const uint16_t *>(probe_page);
+                auto probe_num_values =
+                    *reinterpret_cast<const uint16_t *>(probe_page + 2);
+                auto *probe_data =
+                    reinterpret_cast<const int32_t *>(probe_page + 4);
 
-                    if (probe_num_rows == probe_num_values) {
-                        for (uint16_t j = 0; j < probe_num_rows; ++j) {
-                            if (probe_data[j] == build_value) {
-                                collector.add_match(build_idx, probe_row_id);
-                            }
-                            probe_row_id++;
+                if (probe_num_rows == probe_num_values) {
+                    for (uint16_t j = 0; j < probe_num_rows; ++j) {
+                        if (probe_data[j] == build_value) {
+                            collector.add_match(build_idx, probe_row_id);
                         }
-                    } else {
-                        auto *probe_bitmap = reinterpret_cast<const uint8_t *>(
-                            probe_page + PAGE_SIZE - (probe_num_rows + 7) / 8);
-                        uint16_t data_idx = 0;
-                        for (uint16_t j = 0; j < probe_num_rows; ++j) {
-                            bool probe_valid =
-                                probe_bitmap[j / 8] & (1u << (j % 8));
-                            if (probe_valid) {
-                                if (probe_data[data_idx] == build_value) {
-                                    collector.add_match(build_idx,
-                                                        probe_row_id);
-                                }
-                                data_idx++;
-                            }
-                            probe_row_id++;
-                        }
+                        probe_row_id++;
                     }
-                }
-            }
-        } else {
-            for (size_t build_idx = 0; build_idx < build_rows; ++build_idx) {
-                const mema::value_t *build_key =
-                    build_column.get_by_row(build_idx);
-                if (!build_key)
-                    continue;
-                int build_value = build_key->value;
-
-                uint32_t probe_row_id = 0;
-                for (auto *probe_page_obj : probe_col.pages) {
-                    auto *probe_page = probe_page_obj->data;
-                    auto probe_num_rows =
-                        *reinterpret_cast<const uint16_t *>(probe_page);
-                    auto probe_num_values =
-                        *reinterpret_cast<const uint16_t *>(probe_page + 2);
-                    auto *probe_data =
-                        reinterpret_cast<const int32_t *>(probe_page + 4);
-
-                    if (probe_num_rows == probe_num_values) {
-                        for (uint16_t j = 0; j < probe_num_rows; ++j) {
-                            if (probe_data[j] == build_value) {
-                                collector.add_match(build_idx, probe_row_id);
+                } else {
+                    auto *probe_bitmap = reinterpret_cast<const uint8_t *>(
+                        probe_page + PAGE_SIZE - (probe_num_rows + 7) / 8);
+                    uint16_t data_idx = 0;
+                    for (uint16_t j = 0; j < probe_num_rows; ++j) {
+                        bool probe_valid =
+                            probe_bitmap[j / 8] & (1u << (j % 8));
+                        if (probe_valid) {
+                            if (probe_data[data_idx] == build_value) {
+                                collector.add_match(build_idx,
+                                                    probe_row_id);
                             }
-                            probe_row_id++;
+                            data_idx++;
                         }
-                    } else {
-                        auto *probe_bitmap = reinterpret_cast<const uint8_t *>(
-                            probe_page + PAGE_SIZE - (probe_num_rows + 7) / 8);
-                        uint16_t data_idx = 0;
-                        for (uint16_t j = 0; j < probe_num_rows; ++j) {
-                            bool probe_valid =
-                                probe_bitmap[j / 8] & (1u << (j % 8));
-                            if (probe_valid) {
-                                if (probe_data[data_idx] == build_value) {
-                                    collector.add_match(build_idx,
-                                                        probe_row_id);
-                                }
-                                data_idx++;
-                            }
-                            probe_row_id++;
-                        }
+                        probe_row_id++;
                     }
                 }
             }
