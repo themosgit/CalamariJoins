@@ -181,7 +181,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
 
         auto probe_start = std::chrono::high_resolution_clock::now();
         if (probe_is_columnar) {
-            probe_columnar(hash_table, probe_input, config.probe_attr,
+            probe_columnar_parallel(hash_table, probe_input, config.probe_attr,
                            collector);
         } else {
             const auto &probe_result =
