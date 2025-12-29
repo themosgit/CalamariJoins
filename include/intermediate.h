@@ -93,6 +93,21 @@ struct column_t {
         num_values++;
     }
 
+    /* pre-allocate all pages for parallel writing - call before spawning threads */
+    inline void pre_allocate(size_t count) {
+        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            pages.push_back(new Page());
+        }
+        num_values = count;  // set final size upfront
+    }
+
+    /* thread-safe random write to pre-allocated pages */
+    inline void write_at(size_t idx, const value_t &val) {
+        pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE] = val;
+    }
+
     const value_t &operator[](size_t idx) const {
         return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
     }

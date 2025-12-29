@@ -5,10 +5,175 @@
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
+#include <thread>
+#include <hardware_darwin.h>
 
 namespace Contest {
 
 using ExecuteResult = std::vector<mema::column_t>;
+
+struct ChunkTask {
+    size_t col_idx;
+    size_t chunk_start;
+    size_t chunk_end;
+};
+
+struct ColumnSource {
+    const mema::column_t* column;
+    uint32_t shift;
+};
+
+inline size_t compute_chunk_size(size_t num_columns) {
+    constexpr size_t LAST_LEVEL_CACHE =
+        #if defined(SPC__LEVEL3_CACHE_SIZE) && SPC__LEVEL3_CACHE_SIZE > 0
+            SPC__LEVEL3_CACHE_SIZE;
+        #else
+            SPC__LEVEL2_CACHE_SIZE;
+        #endif
+
+    constexpr int NUM_CORES = SPC__CORE_COUNT;
+    size_t per_core_cache = LAST_LEVEL_CACHE / NUM_CORES;
+    size_t target_bytes = per_core_cache / 2;
+    size_t bytes_per_match = 8 + 4 + (num_columns * 4);
+    size_t chunk_size = target_bytes / bytes_per_match;
+    return std::clamp(chunk_size, size_t(1024), size_t(200000));
+}
+
+inline std::vector<ChunkTask> compute_tasks(
+    size_t num_columns,
+    size_t total_matches,
+    size_t chunk_size)
+{
+    std::vector<ChunkTask> tasks;
+
+    for (size_t col_idx = 0; col_idx < num_columns; ++col_idx) {
+        for (size_t start = 0; start < total_matches; start += chunk_size) {
+            size_t end = std::min(start + chunk_size, total_matches);
+            tasks.push_back({col_idx, start, end});
+        }
+    }
+
+    return tasks;
+}
+
+inline std::vector<ColumnSource> prepare_sources(
+    const std::vector<std::tuple<size_t, DataType>>& output_attrs,
+    const ExecuteResult& build,
+    const ExecuteResult& probe,
+    size_t build_size)
+{
+    std::vector<ColumnSource> sources;
+    sources.reserve(output_attrs.size());
+
+    for (const auto& [col_idx, _] : output_attrs) {
+        bool from_build = (col_idx < build_size);
+        const mema::column_t* src_col = from_build
+            ? &build[col_idx]
+            : &probe[col_idx - build_size];
+        uint32_t shift = from_build ? 0 : 32;
+
+        sources.push_back({src_col, shift});
+    }
+
+    return sources;
+}
+
+struct ColumnarSource {
+    const Column* column;
+    size_t remapped_col_idx;
+    uint32_t shift;
+    bool from_build;
+};
+
+inline std::vector<ColumnarSource> prepare_columnar_sources(
+    const std::vector<std::tuple<size_t, DataType>>& remapped_attrs,
+    const JoinInput& build_input,
+    const JoinInput& probe_input,
+    const PlanNode& build_node,
+    const PlanNode& probe_node,
+    size_t build_size)
+{
+    std::vector<ColumnarSource> sources;
+    sources.reserve(remapped_attrs.size());
+
+    auto* build_table = std::get<const ColumnarTable*>(build_input.data);
+    auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
+
+    for (const auto& [col_idx, data_type] : remapped_attrs) {
+        bool from_build = col_idx < build_size;
+        size_t remapped_col_idx = from_build ? col_idx : col_idx - build_size;
+
+        const ColumnarTable* src_table = from_build ? build_table : probe_table;
+        const PlanNode* src_node = from_build ? &build_node : &probe_node;
+        auto [actual_col_idx, _] = src_node->output_attrs[remapped_col_idx];
+        const Column& src_col = src_table->columns[actual_col_idx];
+
+        uint32_t shift = from_build ? 0 : 32;
+
+        sources.push_back({&src_col, remapped_col_idx, shift, from_build});
+    }
+
+    return sources;
+}
+
+struct MixedSource {
+    const mema::column_t* intermediate_col;
+    const Column* columnar_col;
+    size_t remapped_col_idx;
+
+    bool is_columnar;
+    bool from_build;
+    uint32_t shift;
+};
+
+inline std::vector<MixedSource> prepare_mixed_sources(
+    const std::vector<std::tuple<size_t, DataType>>& remapped_attrs,
+    const JoinInput& build_input,
+    const JoinInput& probe_input,
+    const PlanNode& build_node,
+    const PlanNode& probe_node,
+    size_t build_size)
+{
+    std::vector<MixedSource> sources;
+    sources.reserve(remapped_attrs.size());
+
+    for (const auto& [col_idx, data_type] : remapped_attrs) {
+        bool from_build = col_idx < build_size;
+        size_t remapped_col_idx = from_build ? col_idx : col_idx - build_size;
+        uint32_t shift = from_build ? 0 : 32;
+
+        bool source_is_columnar = false;
+        const Column* columnar_src_col = nullptr;
+        const mema::column_t* intermediate_src_col = nullptr;
+
+        if (from_build) {
+            if (build_input.is_columnar()) {
+                source_is_columnar = true;
+                auto* build_table = std::get<const ColumnarTable*>(build_input.data);
+                auto [actual_col_idx, _] = build_node.output_attrs[remapped_col_idx];
+                columnar_src_col = &build_table->columns[actual_col_idx];
+            } else {
+                const auto& build_result = std::get<ExecuteResult>(build_input.data);
+                intermediate_src_col = &build_result[remapped_col_idx];
+            }
+        } else {
+            if (probe_input.is_columnar()) {
+                source_is_columnar = true;
+                auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
+                auto [actual_col_idx, _] = probe_node.output_attrs[remapped_col_idx];
+                columnar_src_col = &probe_table->columns[actual_col_idx];
+            } else {
+                const auto& probe_result = std::get<ExecuteResult>(probe_input.data);
+                intermediate_src_col = &probe_result[remapped_col_idx];
+            }
+        }
+
+        sources.push_back({intermediate_src_col, columnar_src_col, remapped_col_idx,
+                          source_is_columnar, from_build, shift});
+    }
+
+    return sources;
+}
 
 /**
  *
@@ -41,7 +206,7 @@ class ColumnarReader;
  *
  *  constructs intermediate results from column_t intermediate format
  *  both build and probe are intermediate results
- *  shift extracts correct row id from packed match
+ *  parallel implementation using multiple threads
  *
  **/
 inline void construct_intermediate_from_intermediate(
@@ -53,24 +218,56 @@ inline void construct_intermediate_from_intermediate(
     if (total_matches == 0)
         return;
 
+    constexpr size_t PARALLEL_THRESHOLD = 5000;
+    if (total_matches < PARALLEL_THRESHOLD) {
+        const uint64_t *matches_ptr = collector.matches.data();
+        const size_t build_size = build.size();
+        for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
+            auto [col_idx, _] = output_attrs[out_idx];
+            const bool from_build = col_idx < build_size;
+            const mema::column_t *column = from_build ? &build[col_idx] : &probe[col_idx - build_size];
+            const uint32_t shift = from_build ? 0 : 32;
+            results[out_idx].reserve(total_matches);
+            for (size_t match_idx = 0; match_idx < total_matches; ++match_idx) {
+                uint32_t row_id = (matches_ptr[match_idx] >> shift);
+                const mema::value_t &val = (*column)[row_id];
+                results[out_idx].append(val);
+            }
+        }
+        return;
+    }
+
     const uint64_t *matches_ptr = collector.matches.data();
     const size_t build_size = build.size();
+    const size_t chunk_size = compute_chunk_size(output_attrs.size());
+    const auto tasks = compute_tasks(output_attrs.size(), total_matches, chunk_size);
+    const auto sources = prepare_sources(output_attrs, build, probe, build_size);
 
-    for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
-        auto [col_idx, _] = output_attrs[out_idx];
+    for (auto& col : results) {
+        col.pre_allocate(total_matches);
+    }
 
-        const bool from_build = col_idx < build_size;
-        const mema::column_t *column =
-            from_build ? &build[col_idx] : &probe[col_idx - build_size];
-        const uint32_t shift = from_build ? 0 : 32;
+    constexpr int num_threads = SPC__CORE_COUNT;
+    const int actual_threads = std::min(num_threads, static_cast<int>(tasks.size()));
 
-        results[out_idx].reserve(total_matches);
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
 
-        for (size_t match_idx = 0; match_idx < total_matches; ++match_idx) {
-            uint32_t row_id = (matches_ptr[match_idx] >> shift);
-            const mema::value_t &val = (*column)[row_id];
-            results[out_idx].append(val);
-        }
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t, actual_threads] {
+            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += actual_threads) {
+                const auto& task = tasks[task_idx];
+                const auto& src = sources[task.col_idx];
+                auto& dest = results[task.col_idx];
+                for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
+                    const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
+                    dest.write_at(i, (*src.column)[row_id]);
+                }
+            }
+        });
+    }
+    for (auto& w : workers) {
+        w.join();
     }
 }
 
@@ -78,8 +275,7 @@ inline void construct_intermediate_from_intermediate(
  *
  *  constructs intermediate results directly from ColumnarTable columnar inputs
  *  both build and probe are reading from original page format
- *  uses columnar_reader to efficiently read from pages
- *  avoids intermediate column_t conversion
+ *  parallel implementation using multiple threads
  *
  **/
 inline void construct_intermediate_from_columnar(
@@ -94,33 +290,59 @@ inline void construct_intermediate_from_columnar(
         return;
 
     const uint64_t *matches_ptr = collector.matches.data();
-    auto *build_table = std::get<const ColumnarTable *>(build_input.data);
-    auto *probe_table = std::get<const ColumnarTable *>(probe_input.data);
+    const size_t chunk_size = compute_chunk_size(remapped_attrs.size());
+    const auto tasks = compute_tasks(remapped_attrs.size(), total_matches, chunk_size);
+    const auto sources = prepare_columnar_sources(remapped_attrs, build_input, probe_input,
+                                                   build_node, probe_node, build_size);
+    for (auto& col : results) {
+        col.pre_allocate(total_matches);
+    }
+    constexpr int num_threads = SPC__CORE_COUNT;
+    std::vector<ColumnarReader> thread_readers(num_threads);
+    std::vector<const Column*> build_columns;
+    auto* build_table = std::get<const ColumnarTable*>(build_input.data);
+    for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
+        auto [actual_col_idx, _] = build_node.output_attrs[i];
+        build_columns.push_back(&build_table->columns[actual_col_idx]);
+    }
+    std::vector<const Column*> probe_columns;
+    auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
+    for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
+        auto [actual_col_idx, _] = probe_node.output_attrs[i];
+        probe_columns.push_back(&probe_table->columns[actual_col_idx]);
+    }
+    for (auto& reader : thread_readers) {
+        reader.prepare_build(build_columns);
+        reader.prepare_probe(probe_columns);
+    }
 
-    for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
-        auto [col_idx, data_type] = remapped_attrs[out_idx];
-        bool from_build = col_idx < build_size;
-        size_t remapped_col_idx = from_build ? col_idx : col_idx - build_size;
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
 
-        results[out_idx].reserve(total_matches);
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            auto& reader = thread_readers[t];
+            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
+                const auto& task = tasks[task_idx];
+                const auto& src = sources[task.col_idx];
+                auto& dest = results[task.col_idx];
+                for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
+                    const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
+                    mema::value_t value = src.from_build
+                                              ? reader.read_value_build(
+                                                    *src.column, src.remapped_col_idx, row_id,
+                                                    src.column->type)
+                                              : reader.read_value_probe(
+                                                    *src.column, src.remapped_col_idx, row_id,
+                                                    src.column->type);
+                    dest.write_at(i, value);
+                }
+            }
+        });
+    }
 
-        const ColumnarTable *src_table = from_build ? build_table : probe_table;
-        const PlanNode *src_node = from_build ? &build_node : &probe_node;
-        auto [actual_col_idx, _] = src_node->output_attrs[remapped_col_idx];
-        const Column &src_col = src_table->columns[actual_col_idx];
-
-        const uint32_t shift = from_build ? 0 : 32;
-        for (size_t i = 0; i < total_matches; ++i) {
-            uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> shift);
-            mema::value_t value = from_build
-                                      ? columnar_reader.read_value_build(
-                                            src_col, remapped_col_idx, row_id,
-                                            src_col.type)
-                                      : columnar_reader.read_value_probe(
-                                            src_col, remapped_col_idx, row_id,
-                                            src_col.type);
-            results[out_idx].append(value);
-        }
+    for (auto& w : workers) {
+        w.join();
     }
 }
 
@@ -128,8 +350,7 @@ inline void construct_intermediate_from_columnar(
  *
  *  constructs intermediate results from mixed input types
  *  one side is ColumnarTable columnar other is column_t intermediate
- *  dispatches to appropriate reader based on source type
- *  handles all combinations of intermediate and columnar inputs
+ *  parallel implementation using multiple threads
  *
  **/
 inline void construct_intermediate_mixed(
@@ -144,67 +365,70 @@ inline void construct_intermediate_mixed(
         return;
 
     const uint64_t *matches_ptr = collector.matches.data();
-
-    for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
-        auto [col_idx, data_type] = remapped_attrs[out_idx];
-        bool from_build = col_idx < build_size;
-        size_t remapped_col_idx = from_build ? col_idx : col_idx - build_size;
-
-        results[out_idx].reserve(total_matches);
-
-        bool source_is_columnar = false;
-        const Column *columnar_src_col = nullptr;
-        const mema::column_t *intermediate_src_col = nullptr;
-
-        if (from_build) {
-            if (build_input.is_columnar()) {
-                source_is_columnar = true;
-                auto *build_table =
-                    std::get<const ColumnarTable *>(build_input.data);
-                auto [actual_col_idx, _] =
-                    build_node.output_attrs[remapped_col_idx];
-                columnar_src_col = &build_table->columns[actual_col_idx];
-            } else {
-                const auto &build_result =
-                    std::get<ExecuteResult>(build_input.data);
-                intermediate_src_col = &build_result[remapped_col_idx];
-            }
-        } else {
-            if (probe_input.is_columnar()) {
-                source_is_columnar = true;
-                auto *probe_table =
-                    std::get<const ColumnarTable *>(probe_input.data);
-                auto [actual_col_idx, _] =
-                    probe_node.output_attrs[remapped_col_idx];
-                columnar_src_col = &probe_table->columns[actual_col_idx];
-            } else {
-                const auto &probe_result =
-                    std::get<ExecuteResult>(probe_input.data);
-                intermediate_src_col = &probe_result[remapped_col_idx];
-            }
+    const size_t chunk_size = compute_chunk_size(remapped_attrs.size());
+    const auto tasks = compute_tasks(remapped_attrs.size(), total_matches, chunk_size);
+    const auto sources = prepare_mixed_sources(remapped_attrs, build_input, probe_input,
+                                                build_node, probe_node, build_size);
+    for (auto& col : results) {
+        col.pre_allocate(total_matches);
+    }
+    constexpr int num_threads = SPC__CORE_COUNT;
+    std::vector<ColumnarReader> thread_readers(num_threads);
+    if (build_input.is_columnar()) {
+        std::vector<const Column*> build_columns;
+        auto* build_table = std::get<const ColumnarTable*>(build_input.data);
+        for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
+            auto [actual_col_idx, _] = build_node.output_attrs[i];
+            build_columns.push_back(&build_table->columns[actual_col_idx]);
         }
-
-        const uint32_t shift = from_build ? 0 : 32;
-
-        if (source_is_columnar) {
-            for (size_t i = 0; i < total_matches; ++i) {
-                uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> shift);
-                mema::value_t value = from_build
-                                          ? columnar_reader.read_value_build(
-                                                *columnar_src_col, remapped_col_idx,
-                                                row_id, columnar_src_col->type)
-                                          : columnar_reader.read_value_probe(
-                                                *columnar_src_col, remapped_col_idx,
-                                                row_id, columnar_src_col->type);
-                results[out_idx].append(value);
-            }
-        } else {
-            const mema::column_t &col = *intermediate_src_col;
-            for (size_t i = 0; i < total_matches; ++i) {
-                uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> shift);
-                results[out_idx].append(col[row_id]);
-            }
+        for (auto& reader : thread_readers) {
+            reader.prepare_build(build_columns);
         }
+    }
+    if (probe_input.is_columnar()) {
+        std::vector<const Column*> probe_columns;
+        auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
+        for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
+            auto [actual_col_idx, _] = probe_node.output_attrs[i];
+            probe_columns.push_back(&probe_table->columns[actual_col_idx]);
+        }
+        for (auto& reader : thread_readers) {
+            reader.prepare_probe(probe_columns);
+        }
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&, t] {
+            auto& reader = thread_readers[t];
+            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
+                const auto& task = tasks[task_idx];
+                const auto& src = sources[task.col_idx];
+                auto& dest = results[task.col_idx];
+                for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
+                    const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
+
+                    mema::value_t value;
+                    if (src.is_columnar) {
+                        value = src.from_build
+                                    ? reader.read_value_build(
+                                          *src.columnar_col, src.remapped_col_idx,
+                                          row_id, src.columnar_col->type)
+                                    : reader.read_value_probe(
+                                          *src.columnar_col, src.remapped_col_idx,
+                                          row_id, src.columnar_col->type);
+                    } else {
+                        value = (*src.intermediate_col)[row_id];
+                    }
+                    dest.write_at(i, value);
+                }
+            }
+        });
+    }
+    for (auto& w : workers) {
+        w.join();
     }
 }
 
