@@ -272,7 +272,7 @@ public:
         row_ids_.resize(total);
 
         /* accumulates and builds partitions from all threads */
-        const int nt = num_threads;  // Capture for use in build_partition
+        const int nt = num_threads;
         worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
             for (size_t p = t; p < num_partitions; p += pool_threads) {
                 build_partition(thread_parts, p, slots_per_partition,
@@ -358,7 +358,7 @@ public:
         keys_.resize(total);
         row_ids_.resize(total);
 
-        const int nt = num_threads;  // Capture for use in build_partition
+        const int nt = num_threads;
         worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
             for (size_t p = t; p < num_partitions; p += pool_threads) {
                 build_partition(thread_parts, p, slots_per_partition,

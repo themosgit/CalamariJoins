@@ -132,23 +132,10 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
         MatchCollector collector;
 
         auto nested_loop_start = std::chrono::high_resolution_clock::now();
-        if (build_is_columnar && probe_is_columnar) {
-            nested_loop_from_columnar(build_input, probe_input,
-                                      config.build_attr, config.probe_attr,
-                                      setup.columnar_reader, collector);
-        } else if (!build_is_columnar && !probe_is_columnar) {
-            const auto &build_result =
-                std::get<ExecuteResult>(build_input.data);
-            const auto &probe_result =
-                std::get<ExecuteResult>(probe_input.data);
-            nested_loop_from_intermediate(build_result, probe_result,
-                                          config.build_attr, config.probe_attr,
-                                          collector);
-        } else {
-            nested_loop_mixed(build_input, probe_input, config.build_attr,
+
+        nested_loop_join(build_input, probe_input, config.build_attr,
                               config.probe_attr, setup.columnar_reader,
                               collector);
-        }
         auto nested_loop_end = std::chrono::high_resolution_clock::now();
         auto nested_loop_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(nested_loop_end - nested_loop_start);
         stats.nested_loop_join_ms += nested_loop_elapsed.count();
@@ -177,7 +164,6 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
 
         /* selecting proper probe */
         MatchCollector collector;
-        collector.reserve(build_rows);
 
         auto probe_start = std::chrono::high_resolution_clock::now();
         if (probe_is_columnar) {

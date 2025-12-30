@@ -6,279 +6,183 @@
 #include <intermediate.h>
 #include <join_setup.h>
 #include <plan.h>
+#include <vector>
+#include <atomic>
+#include "worker_pool.h"
 
 namespace Contest {
 
-/**
- *
- *  performs nested loop join between two ColumnarTable columnar inputs
- *  collects matches into MatchCollector for later materialization
- *  uses prefix sums for efficient sparse page bitmap navigation
- *  iterates all build rows against all probe rows
- *
- **/
-inline void nested_loop_from_columnar(const JoinInput &build_input,
-                                      const JoinInput &probe_input,
-                                      size_t build_attr, size_t probe_attr,
-                                      ColumnarReader &columnar_reader,
-                                      MatchCollector &collector) {
+// Align thread-local storage to cache line (64 bytes) to prevent False Sharing
+struct alignas(64) ThreadMatchBuffer {
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+};
 
-    auto *build_table = std::get<const ColumnarTable *>(build_input.data);
-    auto *probe_table = std::get<const ColumnarTable *>(probe_input.data);
-
-    auto [build_col_idx, _] = build_input.node->output_attrs[build_attr];
-    auto [probe_col_idx, __] = probe_input.node->output_attrs[probe_attr];
-
-    const Column &build_col = build_table->columns[build_col_idx];
-    const Column &probe_col = probe_table->columns[probe_col_idx];
-
-    const auto &build_prefix = columnar_reader.get_build_page_index(build_attr);
-    const auto &probe_prefix = columnar_reader.get_probe_page_index(probe_attr);
-
+inline void nested_loop_join(const JoinInput &build_input,
+                             const JoinInput &probe_input, size_t build_attr,
+                             size_t probe_attr, ColumnarReader &columnar_reader,
+                             MatchCollector &collector) {
     size_t build_rows = build_input.row_count(build_attr);
     size_t probe_rows = probe_input.row_count(probe_attr);
-    collector.reserve(build_rows * probe_rows / 2);
 
-    uint32_t build_row_id = 0;
-    size_t build_page_idx = 0;
-    for (auto *build_page_obj : build_col.pages) {
-        auto *build_page = build_page_obj->data;
-        auto build_num_rows = *reinterpret_cast<uint16_t *>(build_page);
-        auto build_num_values = *reinterpret_cast<uint16_t *>(build_page + 2);
-        auto *build_data = reinterpret_cast<const int32_t *>(build_page + 4);
-        const auto &build_page_prefix =
-            build_prefix.page_prefix_sums[build_page_idx];
+    if (build_rows == 0 || probe_rows == 0) return;
 
-        for (uint16_t i = 0; i < build_num_rows; i++) {
-            int32_t build_value;
-            bool build_valid = true;
+    // -------------------------------------------------------------
+    // 1. FAST PATH: Materialize Build Side into Stack Arrays
+    // -------------------------------------------------------------
+    // Split values and IDs for better cache locality (Structure of Arrays)
+    // Using fixed size arrays since build is known to be small (4-8)
+    constexpr size_t MAX_BUILD_SIZE = 64; 
+    int32_t b_vals[MAX_BUILD_SIZE];
+    uint32_t b_ids[MAX_BUILD_SIZE];
+    size_t b_count = 0;
 
-            if (build_num_rows == build_num_values) {
-                build_value = build_data[i];
-            } else {
-                auto *build_bitmap = reinterpret_cast<const uint8_t *>(
-                    build_page + PAGE_SIZE - (build_num_rows + 7) / 8);
-                build_valid = build_bitmap[i / 8] & (1u << (i % 8));
-                if (build_valid) {
-                    size_t chunk_idx = i >> 6;
-                    size_t bit_offset = i & 0x3F;
-                    uint16_t data_idx = build_page_prefix[chunk_idx];
-                    auto *bitmap64 =
-                        reinterpret_cast<const uint64_t *>(build_bitmap);
-                    uint64_t mask = (1ULL << bit_offset) - 1;
-                    data_idx +=
-                        __builtin_popcountll(bitmap64[chunk_idx] & mask);
-                    build_value = build_data[data_idx];
-                }
-            }
-            if (!build_valid) {
-                build_row_id++;
-                continue;
-            }
-
-            uint32_t probe_row_id = 0;
-            for (auto *probe_page_obj : probe_col.pages) {
-                auto *probe_page = probe_page_obj->data;
-                auto probe_num_rows =
-                    *reinterpret_cast<const uint16_t *>(probe_page);
-                auto probe_num_values =
-                    *reinterpret_cast<const uint16_t *>(probe_page + 2);
-                auto *probe_data =
-                    reinterpret_cast<const int32_t *>(probe_page + 4);
-
-                if (probe_num_rows == probe_num_values) {
-                    for (uint16_t j = 0; j < probe_num_rows; j++) {
-                        if (probe_data[j] == build_value) {
-                            collector.add_match(build_row_id, probe_row_id);
-                        }
-                        probe_row_id++;
-                    }
-                } else {
-                    auto *probe_bitmap = reinterpret_cast<const uint8_t *>(
-                        probe_page + PAGE_SIZE - (probe_num_rows + 7) / 8);
-                    uint16_t data_idx = 0;
-                    for (uint16_t j = 0; j < probe_num_rows; j++) {
-                        bool probe_valid =
-                            probe_bitmap[j / 8] & (1u << (j % 8));
-                        if (probe_valid) {
-                            if (probe_data[data_idx] == build_value) {
-                                collector.add_match(build_row_id, probe_row_id);
-                            }
-                            data_idx++;
-                        }
-                        probe_row_id++;
-                    }
-                }
-            }
-            build_row_id++;
+    auto collect_build = [&](uint32_t id, int32_t val) {
+        if (b_count < MAX_BUILD_SIZE) {
+            b_ids[b_count] = id;
+            b_vals[b_count] = val;
+            b_count++;
         }
-        build_page_idx++;
-    }
-}
+    };
 
-/**
- *
- *  performs nested loop join between two column_t intermediate inputs
- *  collects matches into MatchCollector for later materialization
- *  handles both direct access and sparse column_t formats
- *
- **/
-inline void nested_loop_from_intermediate(const ExecuteResult &build,
-                                          const ExecuteResult &probe,
-                                          size_t build_col, size_t probe_col,
-                                          MatchCollector &collector) {
-    if (build.size() == 0 || probe.size() == 0 || build_col >= build.size() ||
-        probe_col >= probe.size()) {
-        return;
-    }
+    // Serial scan of tiny build side
+    if (build_input.is_columnar()) {
+        auto *table = std::get<const ColumnarTable *>(build_input.data);
+        auto [col_idx, _] = build_input.node->output_attrs[build_attr];
+        const Column &col = table->columns[col_idx];
+        const auto &prefix = columnar_reader.get_build_page_index(build_attr);
 
-    const mema::column_t &build_column = build[build_col];
-    const mema::column_t &probe_column = probe[probe_col];
-    const size_t build_count = build_column.row_count();
-    const size_t probe_count = probe_column.row_count();
+        uint32_t row_id = 0;
+        size_t page_idx = 0;
+        for (auto *page_obj : col.pages) {
+            auto *page = page_obj->data;
+            auto num_rows = *reinterpret_cast<uint16_t *>(page);
+            auto num_values = *reinterpret_cast<uint16_t *>(page + 2);
+            auto *data = reinterpret_cast<const int32_t *>(page + 4);
+            const auto &page_prefix = prefix.page_prefix_sums[page_idx];
 
-    collector.reserve(build_count * probe_count / 2);
-
-    for (size_t build_idx = 0; build_idx < build_count; build_idx++) {
-        const mema::value_t &build_key = build_column[build_idx];
-        if (build_key.is_null())
-            continue;
-        for (size_t probe_idx = 0; probe_idx < probe_count; probe_idx++) {
-            const mema::value_t &probe_key = probe_column[probe_idx];
-            if (!probe_key.is_null() && probe_key.value == build_key.value) {
-                collector.add_match(build_idx, probe_idx);
-            }
-        }
-    }
-}
-
-/**
- *
- *  performs nested loop join between mixed input types
- *  one side is ColumnarTable columnar other is column_t intermediate
- *  collects matches into MatchCollector for later materialization
- *
- **/
-inline void nested_loop_mixed(const JoinInput &build_input,
-                              const JoinInput &probe_input, size_t build_attr,
-                              size_t probe_attr,
-                              ColumnarReader &columnar_reader,
-                              MatchCollector &collector) {
-    bool build_is_columnar = build_input.is_columnar();
-    bool probe_is_columnar = probe_input.is_columnar();
-    size_t build_rows = build_input.row_count(build_attr);
-    size_t probe_rows = probe_input.row_count(probe_attr);
-    collector.reserve(build_rows * probe_rows / 2);
-
-    if (build_is_columnar && !probe_is_columnar) {
-        auto *build_table = std::get<const ColumnarTable *>(build_input.data);
-        auto [build_col_idx, _] = build_input.node->output_attrs[build_attr];
-        const Column &build_col = build_table->columns[build_col_idx];
-        const auto &build_prefix =
-            columnar_reader.get_build_page_index(build_attr);
-
-        const auto &probe_result = std::get<ExecuteResult>(probe_input.data);
-        const auto &probe_column = probe_result[probe_attr];
-
-        uint32_t build_row_id = 0;
-        size_t build_page_idx = 0;
-        for (auto *build_page_obj : build_col.pages) {
-            auto *build_page = build_page_obj->data;
-            auto build_num_rows =
-                *reinterpret_cast<const uint16_t *>(build_page);
-            auto build_num_values =
-                *reinterpret_cast<const uint16_t *>(build_page + 2);
-            auto *build_data =
-                reinterpret_cast<const int32_t *>(build_page + 4);
-            const auto &build_page_prefix =
-                build_prefix.page_prefix_sums[build_page_idx];
-
-            for (uint16_t i = 0; i < build_num_rows; ++i) {
-                int32_t build_value;
-                bool build_valid = true;
-
-                if (build_num_rows == build_num_values) {
-                    build_value = build_data[i];
+            for (uint16_t i = 0; i < num_rows; i++) {
+                if (num_rows == num_values) {
+                    collect_build(row_id++, data[i]);
                 } else {
-                    auto *build_bitmap = reinterpret_cast<const uint8_t *>(
-                        build_page + PAGE_SIZE - (build_num_rows + 7) / 8);
-                    build_valid = build_bitmap[i / 8] & (1u << (i % 8));
-                    if (build_valid) {
-                        size_t chunk_idx = i >> 6;
-                        size_t bit_offset = i & 0x3F;
-                        uint16_t data_idx = build_page_prefix[chunk_idx];
-                        auto *bitmap64 =
-                            reinterpret_cast<const uint64_t *>(build_bitmap);
-                        uint64_t mask = (1ULL << bit_offset) - 1;
-                        data_idx +=
-                            __builtin_popcountll(bitmap64[chunk_idx] & mask);
-                        build_value = build_data[data_idx];
+                    auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                    if (bitmap[i / 8] & (1u << (i % 8))) {
+                        size_t chunk = i >> 6;
+                        uint16_t idx = page_prefix[chunk] + __builtin_popcountll(((const uint64_t*)bitmap)[chunk] & ((1ULL << (i & 0x3F)) - 1));
+                        collect_build(row_id, data[idx]);
                     }
+                    row_id++;
                 }
-
-                if (build_valid) {
-                    for (size_t probe_idx = 0; probe_idx < probe_rows;
-                         ++probe_idx) {
-                        const mema::value_t &probe_key = probe_column[probe_idx];
-                        if (!probe_key.is_null() && probe_key.value == build_value) {
-                            collector.add_match(build_row_id, probe_idx);
-                        }
-                    }
-                }
-                build_row_id++;
             }
-            build_page_idx++;
+            page_idx++;
         }
     } else {
-        const auto &build_result = std::get<ExecuteResult>(build_input.data);
-        const auto &build_column = build_result[build_attr];
+        const auto &res = std::get<ExecuteResult>(build_input.data);
+        const mema::column_t &col = res[build_attr];
+        size_t count = col.row_count();
+        for (size_t i = 0; i < count; i++) {
+            const mema::value_t &val = col[i];
+            if (!val.is_null()) collect_build((uint32_t)i, val.value);
+        }
+    }
 
-        auto *probe_table = std::get<const ColumnarTable *>(probe_input.data);
-        auto [probe_col_idx, _] = probe_input.node->output_attrs[probe_attr];
-        const Column &probe_col = probe_table->columns[probe_col_idx];
+    // -------------------------------------------------------------
+    // 2. PARALLEL PROBE: Scan Probe Once, Check against Buffer
+    // -------------------------------------------------------------
+    
+    // Prepare thread buffers (aligned to avoid false sharing)
+    int num_threads = worker_pool.thread_count();
+    std::vector<ThreadMatchBuffer> buffers(num_threads);
 
-        for (size_t build_idx = 0; build_idx < build_rows; ++build_idx) {
-            const mema::value_t &build_key = build_column[build_idx];
-            if (build_key.is_null())
-                continue;
-            int build_value = build_key.value;
+    // Prepare Probe Metadata for random access
+    const Column *probe_col = nullptr;
+    std::vector<uint32_t> page_offsets;
+    if (probe_input.is_columnar()) {
+        auto *table = std::get<const ColumnarTable *>(probe_input.data);
+        auto [col_idx, _] = probe_input.node->output_attrs[probe_attr];
+        probe_col = &table->columns[col_idx];
+        
+        // Map global row IDs to pages
+        page_offsets.reserve(probe_col->pages.size() + 1);
+        uint32_t current = 0;
+        for (auto *p : probe_col->pages) {
+            page_offsets.push_back(current);
+            current += *reinterpret_cast<const uint16_t *>(p->data);
+        }
+        page_offsets.push_back(current);
+    }
 
-            uint32_t probe_row_id = 0;
-            for (auto *probe_page_obj : probe_col.pages) {
-                auto *probe_page = probe_page_obj->data;
-                auto probe_num_rows =
-                    *reinterpret_cast<const uint16_t *>(probe_page);
-                auto probe_num_values =
-                    *reinterpret_cast<const uint16_t *>(probe_page + 2);
-                auto *probe_data =
-                    reinterpret_cast<const int32_t *>(probe_page + 4);
+    worker_pool.execute([&](size_t t_id, size_t total_threads) {
+        auto &output = buffers[t_id].matches;
+        // Heuristic reservation to prevent re-allocs
+        output.reserve(1024); 
 
-                if (probe_num_rows == probe_num_values) {
-                    for (uint16_t j = 0; j < probe_num_rows; ++j) {
-                        if (probe_data[j] == build_value) {
-                            collector.add_match(build_idx, probe_row_id);
-                        }
-                        probe_row_id++;
+        // INLINED INNER LOOP: Compare one probe val against all build vals
+        // This encourages the compiler to use SIMD/Registers for b_vals
+        auto process_value = [&](uint32_t p_id, int32_t p_val) {
+            for (size_t k = 0; k < b_count; ++k) {
+                if (b_vals[k] == p_val) {
+                    output.emplace_back(b_ids[k], p_id);
+                }
+            }
+        };
+
+        if (probe_input.is_columnar()) {
+            size_t num_pages = probe_col->pages.size();
+            size_t start = (t_id * num_pages) / total_threads;
+            size_t end = ((t_id + 1) * num_pages) / total_threads;
+
+            for (size_t i = start; i < end; ++i) {
+                auto *page = probe_col->pages[i]->data;
+                auto num_rows = *reinterpret_cast<const uint16_t *>(page);
+                auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
+                auto *data = reinterpret_cast<const int32_t *>(page + 4);
+                uint32_t row_id = page_offsets[i];
+
+                if (num_rows == num_values) {
+                    // Fast path: No nulls
+                    for (uint16_t j = 0; j < num_rows; j++) {
+                        process_value(row_id++, data[j]);
                     }
                 } else {
-                    auto *probe_bitmap = reinterpret_cast<const uint8_t *>(
-                        probe_page + PAGE_SIZE - (probe_num_rows + 7) / 8);
-                    uint16_t data_idx = 0;
-                    for (uint16_t j = 0; j < probe_num_rows; ++j) {
-                        bool probe_valid =
-                            probe_bitmap[j / 8] & (1u << (j % 8));
-                        if (probe_valid) {
-                            if (probe_data[data_idx] == build_value) {
-                                collector.add_match(build_idx,
-                                                    probe_row_id);
-                            }
-                            data_idx++;
+                    // Bitmap path
+                    auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                    uint16_t val_idx = 0;
+                    for (uint16_t j = 0; j < num_rows; j++) {
+                        if (bitmap[j / 8] & (1u << (j % 8))) {
+                            process_value(row_id, data[val_idx++]);
                         }
-                        probe_row_id++;
+                        row_id++;
                     }
                 }
             }
+        } else {
+            const auto &res = std::get<ExecuteResult>(probe_input.data);
+            const mema::column_t &col = res[probe_attr];
+            size_t count = col.row_count();
+            size_t start = (t_id * count) / total_threads;
+            size_t end = ((t_id + 1) * count) / total_threads;
+
+            for (size_t i = start; i < end; i++) {
+                const mema::value_t &val = col[i];
+                if (!val.is_null()) {
+                    process_value((uint32_t)i, val.value);
+                }
+            }
+        }
+    });
+
+    // -------------------------------------------------------------
+    // 3. MERGE (Minimizing Resize Overhead)
+    // -------------------------------------------------------------
+    size_t total_matches = 0;
+    for (const auto &buf : buffers) total_matches += buf.matches.size();
+    
+    collector.reserve(total_matches);
+    for (const auto &buf : buffers) {
+        for (const auto &m : buf.matches) {
+            collector.add_match(m.first, m.second);
         }
     }
 }
+
 } // namespace Contest
