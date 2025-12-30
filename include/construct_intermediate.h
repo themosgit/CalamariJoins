@@ -187,14 +187,6 @@ inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
         /* Calculate how many logical chunks (mema::column_t::Page) are needed */
         total_chunks += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
     }
-
-    /* 
-     * FIX: Calculate total system pages required.
-     * Each mema::column_t::Page holds CAP_PER_PAGE * sizeof(value_t) bytes.
-     * CAP_PER_PAGE = 2048, sizeof(value_t) = 4, so Chunk Size = 8192 bytes.
-     * System PAGE_SIZE is typically 4096 bytes.
-     * We must allocate enough system pages to cover the chunk size.
-     */
     size_t bytes_per_chunk = mema::CAP_PER_PAGE * sizeof(mema::value_t);
     size_t total_bytes = total_chunks * bytes_per_chunk;
     size_t system_pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -303,16 +295,10 @@ inline void construct_intermediate(
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
 
-    /* 
-     * Pre-allocate memory using the batch allocator.
-     * This replaces the individual resize() calls which would do individual allocs.
-     * Note: This function now correctly handles 8KB chunks vs 4KB system pages.
-     */
     auto allocator = batch_allocate_for_results(results, total_matches);
-
     const uint64_t *matches_ptr = collector.matches.data();
-    constexpr int num_threads = SPC__CORE_COUNT;
 
+    constexpr int num_threads = SPC__CORE_COUNT;
     worker_pool.execute([&](size_t t, size_t num_threads) {
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
@@ -354,11 +340,6 @@ inline void construct_intermediate(
             /* inner tight loop for filling this column chunk */
             if (columnar_src_col) {
                 const auto& col = *columnar_src_col;
-                /* 
-                 * FIX: Use col.type (source physical type) instead of data_type (destination logical type).
-                 * ColumnarReader needs the physical type to interpret the page bits correctly (e.g. VARCHAR vs INT32).
-                 * If they mismatch, the Reader produces garbage which is then written to the result.
-                 */
                 if (from_build) {
                     for (size_t i = start; i < end; ++i) {
                         uint32_t rid = static_cast<uint32_t>(matches_ptr[i]);
