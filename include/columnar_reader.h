@@ -1,11 +1,16 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <intermediate.h>
 #include <plan.h>
 #include <vector>
 
 namespace Contest {
+
+/* global version counters to invalidate thread_local caches across different ColumnarReader instances */
+inline std::atomic<uint64_t> global_build_version{0};
+inline std::atomic<uint64_t> global_probe_version{0};
 
 /**
  *
@@ -95,65 +100,6 @@ struct PageIndex {
     }
 };
 
-namespace {
-
-/**
- *
- *  reads value_t from ColumnarTable page at given row id
- *  uses page index for fast page lookup
- *  handles dense and sparse pages with bitmaps
- *  returns encoded string metadata for varchar columns
- *
- **/
-inline mema::value_t read_value_from_columnar(const Column &column,
-                                              const PageIndex &page_index,
-                                              uint32_t row_id,
-                                              DataType data_type) {
-    size_t page_num = page_index.find_page(row_id);
-    uint32_t page_start = page_index.page_start_row(page_num);
-    uint32_t local_row = row_id - page_start;
-
-    auto *page = column.pages[page_num]->data;
-    auto num_rows = *reinterpret_cast<const uint16_t *>(page);
-    auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
-
-    if (num_rows == 0xffff) {
-        return mema::value_t::encode_string(page_num,
-                                            mema::value_t::LONG_STRING_OFFSET);
-    }
-
-    auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
-
-    if (num_rows == num_values) {
-        if (data_type == DataType::INT32) {
-            return mema::value_t{data_begin[local_row]};
-        } else {
-            return mema::value_t::encode_string(page_num, local_row);
-        }
-    } else {
-        auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE -
-                                                         (num_rows + 7) / 8);
-        bool is_valid = bitmap[local_row / 8] & (1u << (local_row % 8));
-
-        if (!is_valid) {
-            return mema::value_t{mema::value_t::NULL_VALUE};
-        }
-        uint16_t data_idx = 0;
-        for (uint16_t i = 0; i < local_row; ++i) {
-            if (bitmap[i / 8] & (1u << (i % 8))) {
-                data_idx++;
-            }
-        }
-
-        if (data_type == DataType::INT32) {
-            return mema::value_t{data_begin[data_idx]};
-        } else {
-            return mema::value_t::encode_string(page_num, data_idx);
-        }
-    }
-}
-} // anonymous namespace
-
 /**
  *
  *  efficient reader for ColumnarTable inputs during materialization
@@ -172,10 +118,7 @@ inline mema::value_t read_value_from_columnar(const Column &column,
  **/
 class ColumnarReader {
   public:
-    ColumnarReader()
-        : build_cached_col(~0u), build_cached_page(~0u), build_cached_start(0),
-          build_cached_end(0), probe_cached_col(~0u), probe_cached_page(~0u),
-          probe_cached_start(0), probe_cached_end(0) {}
+    ColumnarReader() = default;
 
     /**
      *
@@ -192,8 +135,8 @@ class ColumnarReader {
             page_idx.build(*column);
             build_page_indices.push_back(std::move(page_idx));
         }
-        build_cached_col = ~0u;
-        build_cached_page = ~0u;
+        /* increment global version to invalidate all thread_local caches */
+        global_build_version.fetch_add(1, std::memory_order_release);
     }
 
     inline void prepare_probe(const std::vector<const Column *> &columns) {
@@ -204,8 +147,8 @@ class ColumnarReader {
             page_idx.build(*column);
             probe_page_indices.push_back(std::move(page_idx));
         }
-        probe_cached_col = ~0u;
-        probe_cached_page = ~0u;
+        /* increment global version to invalidate all thread_local caches */
+        global_probe_version.fetch_add(1, std::memory_order_release);
     }
 
     inline mema::value_t read_value_build(const Column &column, size_t col_idx,
@@ -215,8 +158,12 @@ class ColumnarReader {
         thread_local size_t tl_build_cached_page = ~0u;
         thread_local uint32_t tl_build_cached_start = 0;
         thread_local uint32_t tl_build_cached_end = 0;
+        thread_local uint64_t tl_build_version = 0;
 
-        if (col_idx == tl_build_cached_col && row_id >= tl_build_cached_start &&
+        uint64_t current_version = global_build_version.load(std::memory_order_acquire);
+
+        if (tl_build_version == current_version &&
+            col_idx == tl_build_cached_col && row_id >= tl_build_cached_start &&
             row_id < tl_build_cached_end) {
             return read_from_page(column, build_page_indices[col_idx],
                                   tl_build_cached_page,
@@ -228,6 +175,7 @@ class ColumnarReader {
         uint32_t page_start = page_index.page_start_row(page_num);
         uint32_t page_end = page_index.cumulative_rows[page_num];
 
+        tl_build_version = current_version;
         tl_build_cached_col = col_idx;
         tl_build_cached_page = page_num;
         tl_build_cached_start = page_start;
@@ -244,8 +192,12 @@ class ColumnarReader {
         thread_local size_t tl_probe_cached_page = ~0u;
         thread_local uint32_t tl_probe_cached_start = 0;
         thread_local uint32_t tl_probe_cached_end = 0;
+        thread_local uint64_t tl_probe_version = 0;
 
-        if (col_idx == tl_probe_cached_col && row_id >= tl_probe_cached_start &&
+        uint64_t current_version = global_probe_version.load(std::memory_order_acquire);
+
+        if (tl_probe_version == current_version &&
+            col_idx == tl_probe_cached_col && row_id >= tl_probe_cached_start &&
             row_id < tl_probe_cached_end) {
             return read_from_page(column, probe_page_indices[col_idx],
                                   tl_probe_cached_page,
@@ -257,6 +209,7 @@ class ColumnarReader {
         uint32_t page_start = page_index.page_start_row(page_num);
         uint32_t page_end = page_index.cumulative_rows[page_num];
 
+        tl_probe_version = current_version;
         tl_probe_cached_col = col_idx;
         tl_probe_cached_page = page_num;
         tl_probe_cached_start = page_start;
@@ -323,17 +276,7 @@ class ColumnarReader {
         }
     }
 
-    /* caches for build and probe sides */
     std::vector<PageIndex> build_page_indices;
-    size_t build_cached_col;
-    size_t build_cached_page;
-    uint32_t build_cached_start;
-    uint32_t build_cached_end;
-
     std::vector<PageIndex> probe_page_indices;
-    size_t probe_cached_col;
-    size_t probe_cached_page;
-    uint32_t probe_cached_start;
-    uint32_t probe_cached_end;
 };
 } // namespace Contest

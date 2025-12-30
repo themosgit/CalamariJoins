@@ -5,7 +5,7 @@
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
-#include <thread>
+#include <worker_pool.h>
 #include <hardware_darwin.h>
 #include <sys/mman.h>
 
@@ -172,6 +172,33 @@ struct MixedSource {
     uint32_t shift;
 };
 
+/**
+ *
+ *  batch allocates memory for all result columns
+ *  uses single mmap call and distributes pages across columns
+ *  returns allocator that will be owned by columns for cleanup
+ *
+ **/
+inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
+    ExecuteResult& results, size_t total_matches) {
+
+    size_t total_pages = 0;
+    for (auto& col : results) {
+        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
+    }
+
+    auto allocator = std::make_shared<BatchAllocator>();
+    allocator->allocate(total_pages);
+    void* block = allocator->get_block();
+    size_t offset = 0;
+
+    for (auto& col : results) {
+        col.pre_allocate_from_block(block, offset, total_matches, allocator);
+    }
+
+    return allocator;
+}
+
 inline std::vector<MixedSource> prepare_mixed_sources(
     const std::vector<std::tuple<size_t, DataType>>& remapped_attrs,
     const JoinInput& build_input,
@@ -289,41 +316,19 @@ inline void construct_intermediate_from_intermediate(
     const auto tasks = compute_tasks(output_attrs.size(), total_matches, chunk_size);
     const auto sources = prepare_sources(output_attrs, build, probe, build_size);
 
-    size_t total_pages = 0;
-    for (auto& col : results) {
-        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
-    }
+    batch_allocate_for_results(results, total_matches);
 
-    auto allocator = std::make_shared<BatchAllocator>();
-    allocator->allocate(total_pages);
-    void* block = allocator->get_block();
-    size_t offset = 0;
-
-    for (auto& col : results) {
-        col.pre_allocate_from_block(block, offset, total_matches, allocator);
-    }
-
-    constexpr int num_threads = SPC__CORE_COUNT;
-
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
-
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t] {
-            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
-                const auto& task = tasks[task_idx];
-                const auto& src = sources[task.col_idx];
-                auto& dest = results[task.col_idx];
-                for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
-                    const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
-                    dest.write_at(i, (*src.column)[row_id]);
-                }
+    worker_pool.execute([&](size_t t, size_t pool_size) {
+        for (size_t task_idx = t; task_idx < tasks.size(); task_idx += pool_size) {
+            const auto& task = tasks[task_idx];
+            const auto& src = sources[task.col_idx];
+            auto& dest = results[task.col_idx];
+            for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
+                const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
+                dest.write_at(i, (*src.column)[row_id]);
             }
-        });
-    }
-    for (auto& w : workers) {
-        w.join();
-    }
+        }
+    });
 }
 
 /**
@@ -350,68 +355,26 @@ inline void construct_intermediate_from_columnar(
     const auto sources = prepare_columnar_sources(remapped_attrs, build_input, probe_input,
                                                    build_node, probe_node, build_size);
 
-    size_t total_pages = 0;
-    for (auto& col : results) {
-        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
-    }
+    batch_allocate_for_results(results, total_matches);
 
-    auto allocator = std::make_shared<BatchAllocator>();
-    allocator->allocate(total_pages);
-    void* block = allocator->get_block();
-    size_t offset = 0;
-
-    for (auto& col : results) {
-        col.pre_allocate_from_block(block, offset, total_matches, allocator);
-    }
-
-    constexpr int num_threads = SPC__CORE_COUNT;
-    std::vector<ColumnarReader> thread_readers(num_threads);
-
-    // prepare column lists for readers
-    std::vector<const Column*> build_columns;
-    auto* build_table = std::get<const ColumnarTable*>(build_input.data);
-    for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
-        auto [actual_col_idx, _] = build_node.output_attrs[i];
-        build_columns.push_back(&build_table->columns[actual_col_idx]);
-    }
-    std::vector<const Column*> probe_columns;
-    auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
-    for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
-        auto [actual_col_idx, _] = probe_node.output_attrs[i];
-        probe_columns.push_back(&probe_table->columns[actual_col_idx]);
-    }
-
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
-
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t] {
-            thread_readers[t].prepare_build(build_columns);
-            thread_readers[t].prepare_probe(probe_columns);
-
-            auto& reader = thread_readers[t];
-            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
-                const auto& task = tasks[task_idx];
-                const auto& src = sources[task.col_idx];
-                auto& dest = results[task.col_idx];
-                for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
-                    const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
-                    mema::value_t value = src.from_build
-                                              ? reader.read_value_build(
-                                                    *src.column, src.remapped_col_idx, row_id,
-                                                    src.column->type)
-                                              : reader.read_value_probe(
-                                                    *src.column, src.remapped_col_idx, row_id,
-                                                    src.column->type);
-                    dest.write_at(i, value);
-                }
+    worker_pool.execute([&](size_t t, size_t pool_size) {
+        for (size_t task_idx = t; task_idx < tasks.size(); task_idx += pool_size) {
+            const auto& task = tasks[task_idx];
+            const auto& src = sources[task.col_idx];
+            auto& dest = results[task.col_idx];
+            for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
+                const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
+                mema::value_t value = src.from_build
+                                          ? columnar_reader.read_value_build(
+                                                *src.column, src.remapped_col_idx, row_id,
+                                                src.column->type)
+                                          : columnar_reader.read_value_probe(
+                                                *src.column, src.remapped_col_idx, row_id,
+                                                src.column->type);
+                dest.write_at(i, value);
             }
-        });
-    }
-
-    for (auto& w : workers) {
-        w.join();
-    }
+        }
+    });
 }
 
 /**
@@ -438,82 +401,32 @@ inline void construct_intermediate_mixed(
     const auto sources = prepare_mixed_sources(remapped_attrs, build_input, probe_input,
                                                 build_node, probe_node, build_size);
 
-    size_t total_pages = 0;
-    for (auto& col : results) {
-        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
-    }
+    batch_allocate_for_results(results, total_matches);
 
-    auto allocator = std::make_shared<BatchAllocator>();
-    allocator->allocate(total_pages);
-    void* block = allocator->get_block();
-    size_t offset = 0;
+    worker_pool.execute([&](size_t t, size_t pool_size) {
+        for (size_t task_idx = t; task_idx < tasks.size(); task_idx += pool_size) {
+            const auto& task = tasks[task_idx];
+            const auto& src = sources[task.col_idx];
+            auto& dest = results[task.col_idx];
+            for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
+                const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
 
-    for (auto& col : results) {
-        col.pre_allocate_from_block(block, offset, total_matches, allocator);
-    }
-
-    constexpr int num_threads = SPC__CORE_COUNT;
-    std::vector<ColumnarReader> thread_readers(num_threads);
-    std::vector<const Column*> build_columns;
-    std::vector<const Column*> probe_columns;
-    bool has_build_columnar = build_input.is_columnar();
-    bool has_probe_columnar = probe_input.is_columnar();
-
-    if (has_build_columnar) {
-        auto* build_table = std::get<const ColumnarTable*>(build_input.data);
-        for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
-            auto [actual_col_idx, _] = build_node.output_attrs[i];
-            build_columns.push_back(&build_table->columns[actual_col_idx]);
-        }
-    }
-    if (has_probe_columnar) {
-        auto* probe_table = std::get<const ColumnarTable*>(probe_input.data);
-        for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
-            auto [actual_col_idx, _] = probe_node.output_attrs[i];
-            probe_columns.push_back(&probe_table->columns[actual_col_idx]);
-        }
-    }
-
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
-
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t, has_build_columnar, has_probe_columnar] {
-            if (has_build_columnar) {
-                thread_readers[t].prepare_build(build_columns);
-            }
-            if (has_probe_columnar) {
-                thread_readers[t].prepare_probe(probe_columns);
-            }
-
-            auto& reader = thread_readers[t];
-            for (size_t task_idx = t; task_idx < tasks.size(); task_idx += num_threads) {
-                const auto& task = tasks[task_idx];
-                const auto& src = sources[task.col_idx];
-                auto& dest = results[task.col_idx];
-                for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
-                    const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
-
-                    mema::value_t value;
-                    if (src.is_columnar) {
-                        value = src.from_build
-                                    ? reader.read_value_build(
-                                          *src.columnar_col, src.remapped_col_idx,
-                                          row_id, src.columnar_col->type)
-                                    : reader.read_value_probe(
-                                          *src.columnar_col, src.remapped_col_idx,
-                                          row_id, src.columnar_col->type);
-                    } else {
-                        value = (*src.intermediate_col)[row_id];
-                    }
-                    dest.write_at(i, value);
+                mema::value_t value;
+                if (src.is_columnar) {
+                    value = src.from_build
+                                ? columnar_reader.read_value_build(
+                                      *src.columnar_col, src.remapped_col_idx,
+                                      row_id, src.columnar_col->type)
+                                : columnar_reader.read_value_probe(
+                                      *src.columnar_col, src.remapped_col_idx,
+                                      row_id, src.columnar_col->type);
+                } else {
+                    value = (*src.intermediate_col)[row_id];
                 }
+                dest.write_at(i, value);
             }
-        });
-    }
-    for (auto& w : workers) {
-        w.join();
-    }
+        }
+    });
 }
 
 } // namespace Contest
