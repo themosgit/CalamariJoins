@@ -394,6 +394,7 @@ struct TimingStats {
     int64_t materialize_ms = 0;
     int64_t setup_ms = 0;
     int64_t total_execution_ms = 0;
+    int64_t intermediate_ms = 0;
 };
 
 void *build_context();

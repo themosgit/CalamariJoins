@@ -13,14 +13,11 @@
 #include <match_collector.h>
 
 
+/* work here will be done after match collector is optimized and finalized
+ * we mainly want to look at the memcpy happening in string reconstruction */
+
 namespace Contest {
 
-/**
- *
- *  extracts string view from ColumnarTable page
- *  decodes offset array to find string boundaries
- *
- **/
 inline std::pair<const char *, uint16_t>
 get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     auto *page = reinterpret_cast<uint8_t *>(src_col.pages[page_idx]->data);
@@ -34,11 +31,6 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     return {char_begin + start_off, static_cast<uint16_t>(end_off - start_off)};
 }
 
-/**
- *
- *  computes chunk size for materialization parallelization
- *
- **/
 inline size_t compute_materialization_chunk_size(size_t total_matches) {
     constexpr int NUM_CORES = SPC__CORE_COUNT;
     constexpr size_t L2_CACHE_SIZE = SPC__LEVEL2_CACHE_SIZE;
@@ -50,21 +42,13 @@ inline size_t compute_materialization_chunk_size(size_t total_matches) {
     return std::max(cache_optimal, min_chunk);
 }
 
-/**
- *
- *  helper for bitmap accumulation
- *  buffers bits until byte is full then flushes
- *
- **/
 struct BitmapAccumulator {
     std::vector<uint8_t> buffer;
     uint8_t pending_bits = 0;
     int bit_count = 0;
-
     void reserve(size_t count) {
         buffer.reserve((count + 7) / 8);
     }
-
     void add_bit(bool set) {
         if (set) pending_bits |= (1u << bit_count);
         if (++bit_count == 8) {
@@ -73,7 +57,6 @@ struct BitmapAccumulator {
             bit_count = 0;
         }
     }
-
     void flush() {
         if (bit_count > 0) {
             buffer.push_back(pending_bits);
@@ -81,7 +64,6 @@ struct BitmapAccumulator {
             bit_count = 0;
         }
     }
-
     void clear() {
         buffer.clear();
         pending_bits = 0;
@@ -89,24 +71,15 @@ struct BitmapAccumulator {
     }
 };
 
-/**
- *
- *  strategy for building int32 pages
- *  checks overflow via fixed row count heuristic
- *
- **/
 struct Int32PageBuilder {
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = (PAGE_SIZE - 4 - 256) / 5;
-    
     std::vector<int32_t> data;
     BitmapAccumulator bitmap;
     uint16_t num_rows = 0;
-
     void prepare(size_t chunk_matches) {
         data.reserve(chunk_matches);
         bitmap.reserve(chunk_matches);
     }
-
     bool add(mema::value_t val) {
         if (!val.is_null()) {
             bitmap.add_bit(true);
@@ -117,11 +90,9 @@ struct Int32PageBuilder {
         num_rows++;
         return false;
     }
-
     bool should_check_overflow() const {
         return 4 + (data.size() + 1) * 4 + (bitmap.buffer.size() + 2) > PAGE_SIZE;
     }
-
     void save_to_page(Page* page_ptr) {
         bitmap.flush();
         auto *page = page_ptr->data;
@@ -139,25 +110,15 @@ struct Int32PageBuilder {
     }
 };
 
-/**
- *
- *  strategy for building varchar pages
- *  handles long strings and page copying logic
- *
- **/
 struct VarcharPageBuilder {
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = 100;
-
     std::vector<char> char_data;
     std::vector<uint16_t> offsets;
     BitmapAccumulator bitmap;
-    
     uint16_t num_rows = 0;
     size_t current_char_size = 0;
-
     const Column& src_col;
     Column& local_col;
-
     VarcharPageBuilder(const Column& s, Column& l) : src_col(s), local_col(l) {}
 
     void prepare(size_t chunk_matches) {
@@ -166,47 +127,38 @@ struct VarcharPageBuilder {
         offsets.reserve(chunk_matches);
         bitmap.reserve(chunk_matches);
     }
-
     bool add(mema::value_t val) {
         if (val.is_null()) {
             bitmap.add_bit(false);
             num_rows++;
             return false;
         }
-
         int32_t page_idx, offset_idx;
         mema::value_t::decode_string(val.value, page_idx, offset_idx);
-
         if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
             if (num_rows > 0) save_to_page(local_col.new_page());
             copy_long_string_pages(page_idx);
             return true; 
         } 
-
         auto [str_ptr, str_len] = get_string_view(src_col, page_idx, offset_idx);
-
         if (str_len > PAGE_SIZE - 7) {
             if (num_rows > 0) save_to_page(local_col.new_page());
             save_long_string_buffer(std::string(str_ptr, str_len));
             return true;
         }
-
         size_t needed = 4 + (offsets.size() + 1) * 2 + 
                         (current_char_size + str_len) + (bitmap.buffer.size() + 2);
-        
         bool flushed = false;
         if (needed > PAGE_SIZE) {
             save_to_page(local_col.new_page());
             flushed = true;
         }
-
         if (current_char_size + str_len > char_data.size()) {
             char_data.resize(std::max(char_data.size() * 2, current_char_size + str_len + 4096));
         }
         std::memcpy(char_data.data() + current_char_size, str_ptr, str_len);
         current_char_size += str_len;
         offsets.push_back(static_cast<uint16_t>(current_char_size));
-        
         bitmap.add_bit(true);
         num_rows++;
         return flushed;
@@ -221,13 +173,10 @@ struct VarcharPageBuilder {
         auto *page = page_ptr->data;
         *reinterpret_cast<uint16_t *>(page) = num_rows;
         *reinterpret_cast<uint16_t *>(page + 2) = static_cast<uint16_t>(offsets.size());
-        
         std::memcpy(page + 4, offsets.data(), offsets.size() * 2);
         std::memcpy(page + 4 + offsets.size() * 2, char_data.data(), current_char_size);
-        
         size_t bmp_size = bitmap.buffer.size();
         std::memcpy(page + PAGE_SIZE - bmp_size, bitmap.buffer.data(), bmp_size);
-
         num_rows = 0;
         current_char_size = 0;
         offsets.clear();
@@ -241,7 +190,6 @@ private:
             auto *src = src_col.pages[curr_idx]->data;
             auto *dest = local_col.new_page()->data;
             std::memcpy(dest, src, PAGE_SIZE);
-
             if (++curr_idx >= static_cast<int32_t>(src_col.pages.size())) break;
             if (*reinterpret_cast<uint16_t *>(src_col.pages[curr_idx]->data) != 0xfffe) break;
         }
@@ -464,35 +412,4 @@ inline ColumnarTable create_empty_result(
     }
     return empty_result;
 }
-
-/**
- *
- *  dispatches materialization based on is_root flag
- *  root nodes produce ColumnarTable, others produce intermediate
- *
- **/
-inline std::variant<ExecuteResult, ColumnarTable> materialize_join_results(
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input, const BuildProbeConfig &config,
-    const PlanNode &build_node, const PlanNode &probe_node, JoinSetup &setup,
-    const Plan &plan, bool is_root) {
-
-    if (is_root) {
-        if (collector.size() == 0) {
-            return create_empty_result(config.remapped_attrs);
-        }
-        return materialize(collector, build_input, probe_input,
-                           config.remapped_attrs, build_node, probe_node,
-                           build_input.output_size(), setup.columnar_reader, plan);
-    } else {
-        if (collector.size() == 0) return std::move(setup.results);
-        
-        construct_intermediate(collector, build_input, probe_input,
-                               config.remapped_attrs, build_node, probe_node,
-                               build_input.output_size(), setup.columnar_reader,
-                               setup.results);
-        return std::move(setup.results);
-    }
-}
-
 } // namespace Contest

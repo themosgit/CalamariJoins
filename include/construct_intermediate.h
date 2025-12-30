@@ -1,23 +1,18 @@
 #pragma once
 
-
 #include <columnar_reader.h>
 #include <intermediate.h>
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
 #include <worker_pool.h>
-#include <hardware_darwin.h>
 #include <sys/mman.h>
 #include <match_collector.h>
 namespace Contest {
 
-/**
- *
- *  batch-allocated memory using mmap
- *  manages lifecycle of large memory blocks for column pages
- *
- **/
+/* this is a work in progress and will be finilized after match collector
+ * is finalized and optimized to produce proper job units */
+
 class BatchAllocator {
 private:
     void* memory_block = nullptr;
@@ -25,7 +20,6 @@ private:
 
 public:
     BatchAllocator() = default;
-
     void allocate(size_t total_pages) {
         total_size = total_pages * PAGE_SIZE;
         memory_block = mmap(nullptr, total_size,
@@ -36,15 +30,12 @@ public:
             throw std::bad_alloc();
         }
     }
-
     void* get_block() const { return memory_block; }
-
     ~BatchAllocator() {
         if (memory_block) {
             munmap(memory_block, total_size);
         }
     }
-
     BatchAllocator(const BatchAllocator&) = delete;
     BatchAllocator& operator=(const BatchAllocator&) = delete;
 };
@@ -60,10 +51,9 @@ using ExecuteResult = std::vector<mema::column_t>;
 struct SourceInfo {
     const mema::column_t* intermediate_col = nullptr;
     const Column* columnar_col = nullptr;
-    
     size_t remapped_col_idx = 0;
-    uint32_t shift = 0; // 0 for Build, 32 for Probe
-    
+    /* 0 for build , 32 for probe */
+    uint32_t shift = 0;
     bool is_columnar = false;
     bool from_build = false;
 };
@@ -84,17 +74,13 @@ inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
     
     size_t total_bytes = total_chunks * mema::CAP_PER_PAGE * sizeof(mema::value_t);
     size_t system_pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-
     auto allocator = std::make_shared<BatchAllocator>();
     allocator->allocate(system_pages);
-    
     void* block = allocator->get_block();
     size_t offset = 0;
-
     for (auto& col : results) {
         col.pre_allocate_from_block(block, offset, total_matches, allocator);
     }
-
     return allocator;
 }
 
@@ -110,21 +96,17 @@ inline std::vector<SourceInfo> prepare_sources(
     const JoinInput& probe_input,
     const PlanNode& build_node,
     const PlanNode& probe_node,
-    size_t build_size)
-{
+    size_t build_size){
     std::vector<SourceInfo> sources;
     sources.reserve(remapped_attrs.size());
-
     for (const auto& [col_idx, _] : remapped_attrs) {
         SourceInfo info;
         info.from_build = (col_idx < build_size);
         info.shift = info.from_build ? 0 : 32;
-        
         size_t local_idx = info.from_build ? col_idx : col_idx - build_size;
         info.remapped_col_idx = local_idx;
         const JoinInput& input = info.from_build ? build_input : probe_input;
         const PlanNode& node = info.from_build ? build_node : probe_node;
-
         if (input.is_columnar()) {
             info.is_columnar = true;
             auto* table = std::get<const ColumnarTable*>(input.data);
@@ -135,7 +117,6 @@ inline std::vector<SourceInfo> prepare_sources(
             const auto& res = std::get<ExecuteResult>(input.data);
             info.intermediate_col = &res[local_idx];
         }
-
         sources.push_back(info);
     }
     return sources;
@@ -153,10 +134,8 @@ inline void construct_intermediate(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, ExecuteResult &results) {
-
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
-
     const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
     const uint64_t *matches_ptr = matches_vec.data();
 
@@ -168,11 +147,9 @@ inline void construct_intermediate(
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
-
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto& src = sources[i];
             auto& dest_col = results[i];
-
             if (src.is_columnar) {
                 const auto& col = *src.columnar_col;
                 if (src.from_build) {

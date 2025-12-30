@@ -7,13 +7,8 @@
 #include <vector>
 #include <cstring>
 
-/* likely/unlikely macros for branch prediction optimization */
-#define SPC_LIKELY(x) __builtin_expect(!!(x), 1)
-#define SPC_UNLIKELY(x) __builtin_expect(!!(x), 0)
-
 namespace Contest {
 
-/* global version counters to invalidate thread_local caches across different ColumnarReader instances */
 inline std::atomic<uint64_t> global_build_version{0};
 inline std::atomic<uint64_t> global_probe_version{0};
 
@@ -42,10 +37,8 @@ struct PageIndex {
             auto *page = page_obj->data;
             auto num_rows = *reinterpret_cast<const uint16_t *>(page);
 
-            if (SPC_UNLIKELY(num_rows == 0xfffe)) {
-                /* long string continuation - contributes 0 logical rows */
-            } else if (SPC_UNLIKELY(num_rows == 0xffff)) {
-                /* long string start - contributes 1 row */
+            if (num_rows == 0xfffe) {
+            } else if (num_rows == 0xffff) {
                 total += 1;
             } else {
                 total += num_rows;
@@ -156,10 +149,10 @@ class ColumnarReader {
         }
 
         /* fast path: cache hit */
-        if (SPC_LIKELY(tl_version == current_version &&
+        if (tl_version == current_version &&
                        col_idx == tl_cached_col && 
                        row_id >= tl_cached_start &&
-                       row_id < tl_cached_end)) {
+                       row_id < tl_cached_end) {
             
             const auto& indices = IsBuild ? build_page_indices : probe_page_indices;
             return read_from_page(column, indices[col_idx],
@@ -212,8 +205,7 @@ class ColumnarReader {
         auto num_rows = *reinterpret_cast<const uint16_t *>(page);
         auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
 
-        /* check for long string continuation */
-        if (SPC_UNLIKELY(num_rows == 0xffff)) {
+        if (num_rows == 0xffff) {
             return mema::value_t::encode_string(
                 static_cast<int32_t>(page_num), mema::value_t::LONG_STRING_OFFSET);
         }
@@ -221,7 +213,7 @@ class ColumnarReader {
         auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
 
         /* dense page optimization (no nulls) */
-        if (SPC_LIKELY(num_rows == num_values)) {
+        if (num_rows == num_values) {
             if (data_type == DataType::INT32) {
                 return mema::value_t{data_begin[local_row]};
             } else {

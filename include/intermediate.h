@@ -62,7 +62,6 @@ constexpr size_t CAP_PER_PAGE = PAGE_SIZE / sizeof(value_t);
  **/
 struct column_t {
   private:
-    /* added page alignment */
     struct alignas(PAGE_SIZE) Page {
         value_t data[CAP_PER_PAGE];
     };

@@ -14,14 +14,6 @@
 
 namespace Contest {
 
-/**
- *
- *  Nested Loop Join Implementation
- *   Optimized for small build sides (broadcast join).
- *  Uses stack-allocated arrays for build data to maximize register usage
- *  and SIMD auto-vectorization during the probe phase.
- *
- **/
 inline void nested_loop_join(const JoinInput &build_input,
                              const JoinInput &probe_input, size_t build_attr,
                              size_t probe_attr, ColumnarReader &columnar_reader,
@@ -31,11 +23,6 @@ inline void nested_loop_join(const JoinInput &build_input,
 
     if (build_rows == 0 || probe_rows == 0) return;
 
-    // -------------------------------------------------------------
-    // 1. FAST PATH: Materialize Build Side into Stack Arrays
-    // -------------------------------------------------------------
-    // Split values and IDs for better cache locality (Structure of Arrays)
-    // Using fixed size arrays since build is known to be small (typically < 64)
     constexpr size_t MAX_BUILD_SIZE = 64; 
     int32_t b_vals[MAX_BUILD_SIZE];
     uint32_t b_ids[MAX_BUILD_SIZE];
@@ -49,7 +36,6 @@ inline void nested_loop_join(const JoinInput &build_input,
         }
     };
 
-    // Serial scan of tiny build side
     if (build_input.is_columnar()) {
         auto *table = std::get<const ColumnarTable *>(build_input.data);
         auto [col_idx, _] = build_input.node->output_attrs[build_attr];
@@ -89,16 +75,9 @@ inline void nested_loop_join(const JoinInput &build_input,
             if (!val.is_null()) collect_build((uint32_t)i, val.value);
         }
     }
-
-    // -------------------------------------------------------------
-    // 2. PARALLEL PROBE: Scan Probe Once, Check against Buffer
-    // -------------------------------------------------------------
-    
-    // Use the new slab-based thread local buffers
     int num_threads = worker_pool.thread_count();
     std::vector<ThreadLocalMatchBuffer> buffers(num_threads);
 
-    // Prepare Probe Metadata for random access
     const Column *probe_col = nullptr;
     std::vector<uint32_t> page_offsets;
     if (probe_input.is_columnar()) {
@@ -106,7 +85,6 @@ inline void nested_loop_join(const JoinInput &build_input,
         auto [col_idx, _] = probe_input.node->output_attrs[probe_attr];
         probe_col = &table->columns[col_idx];
         
-        // Map global row IDs to pages
         page_offsets.reserve(probe_col->pages.size() + 1);
         uint32_t current = 0;
         for (auto *p : probe_col->pages) {
@@ -119,8 +97,6 @@ inline void nested_loop_join(const JoinInput &build_input,
     worker_pool.execute([&](size_t t_id, size_t total_threads) {
         auto &local_buffer = buffers[t_id];
 
-        // INLINED INNER LOOP: Compare one probe val against all build vals
-        // This encourages the compiler to use SIMD/Registers for b_vals
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
             for (size_t k = 0; k < b_count; ++k) {
                 if (b_vals[k] == p_val) {
@@ -142,12 +118,10 @@ inline void nested_loop_join(const JoinInput &build_input,
                 uint32_t row_id = page_offsets[i];
 
                 if (num_rows == num_values) {
-                    // Fast path: No nulls
                     for (uint16_t j = 0; j < num_rows; j++) {
                         process_value(row_id++, data[j]);
                     }
                 } else {
-                    // Bitmap path
                     auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE - (num_rows + 7) / 8);
                     uint16_t val_idx = 0;
                     for (uint16_t j = 0; j < num_rows; j++) {
@@ -173,13 +147,8 @@ inline void nested_loop_join(const JoinInput &build_input,
             }
         }
     });
-
-    // -------------------------------------------------------------
-    // 3. MERGE (Zero-Copy Pointer Swapping)
-    // -------------------------------------------------------------
     for (auto &buf : buffers) {
         collector.merge_thread_buffer(buf);
     }
 }
-
 } // namespace Contest

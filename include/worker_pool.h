@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    #include <hardware_darwin.h>
+#else
+    #include <hardware.h>
+#endif
+
 #include <common.h>
 #include <condition_variable>
 #include <functional>
@@ -7,8 +13,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-#include <hardware_darwin.h>
-
 namespace Contest {
 
 /**
@@ -29,7 +33,7 @@ class WorkerThreadPool {
     std::vector<uint8_t> finished;
     std::vector<bool> should_exit;
 
-    std::mutex task_mutex;  // protects current_task
+    std::mutex task_mutex;
     std::function<void(size_t, size_t)> current_task;
 
     void worker_loop(size_t thread_id) {

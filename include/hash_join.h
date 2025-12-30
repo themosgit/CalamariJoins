@@ -99,7 +99,9 @@ inline void merge_local_collectors(
     for(auto& buf : local_buffers){
         global_collector.merge_thread_buffer(buf);
     }
-}/**
+}
+
+/**
  *
  *  parallel probing of hash table with intermediate column_t input using work stealing
  *  each thread processes pages via atomic counter for dynamic load balancing
@@ -107,19 +109,10 @@ inline void merge_local_collectors(
  *  thread-local collectors merged after join for lock-free execution
  *  skips null values during probing
  *
- *
- * */
-
-
-
-/**
- *  PROBE INTERMEDIATE: Uses ThreadLocalMatchBuffer
- */
+ **/
 inline void probe_intermediate(const UnchainedHashtable& hash_table,
                                const mema::column_t &probe_column,
-                               MatchCollector& collector,
-                               int /*num_threads*/ = NUM_CORES)
-{
+                               MatchCollector& collector) {
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
 
@@ -132,7 +125,6 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
     std::atomic<size_t> page_counter(0);
 
     worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
-        // Cache local reference
         auto& local_buf = local_buffers[thread_id];
         
         while(true){
@@ -163,14 +155,10 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
     merge_local_collectors(local_buffers, collector);
 }
 
-/**
- *  PROBE COLUMNAR: Uses ThreadLocalMatchBuffer
- */
 inline void probe_columnar(const UnchainedHashtable& hash_table,
                            const JoinInput& probe_input,
                            size_t probe_attr,
-                           MatchCollector& collector,
-                           int /*num_threads*/ = NUM_CORES) {
+                           MatchCollector& collector) {
 
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
@@ -201,7 +189,6 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
             size_t page_idx = page_counter.fetch_add(1);
             if(page_idx >= num_pages) break;
             
-            // ... (Reading logic remains identical) ...
             auto* page = probe_col.pages[page_idx]->data;
             auto num_rows = *reinterpret_cast<const uint16_t*>(page);
             auto num_values = *reinterpret_cast<const uint16_t*>(page + 2);
