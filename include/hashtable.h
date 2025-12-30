@@ -209,6 +209,13 @@ public:
     bool empty() const noexcept { return keys_.empty(); }
     const int32_t* keys() const noexcept { return keys_.data(); }
     const uint32_t* row_ids() const noexcept { return row_ids_.data(); }
+    inline void prefetch_bucket(int32_t key) const noexcept {
+        uint64_t h = hash_key(key);
+        size_t slot = slot_for(h);
+        // __builtin_prefetch is supported by GCC/Clang/ICC
+        // 0 = Read, 1 = Low temporal locality (streaming)
+        __builtin_prefetch(static_cast<const void*>(&directory[slot]), 0, 1);
+    }
 
     std::pair<uint64_t, uint64_t> find_indices(int32_t key) const noexcept {
         if (keys_.empty()) return {0, 0};

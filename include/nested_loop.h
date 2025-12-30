@@ -1,3 +1,4 @@
+/*nested_loop.h*/
 #pragma once
 
 #include <columnar_reader.h>
@@ -9,14 +10,18 @@
 #include <vector>
 #include <atomic>
 #include "worker_pool.h"
+#include "match_collector.h"
 
 namespace Contest {
 
-// Align thread-local storage to cache line (64 bytes) to prevent False Sharing
-struct alignas(64) ThreadMatchBuffer {
-    std::vector<std::pair<uint32_t, uint32_t>> matches;
-};
-
+/**
+ *
+ *  Nested Loop Join Implementation
+ *   Optimized for small build sides (broadcast join).
+ *  Uses stack-allocated arrays for build data to maximize register usage
+ *  and SIMD auto-vectorization during the probe phase.
+ *
+ **/
 inline void nested_loop_join(const JoinInput &build_input,
                              const JoinInput &probe_input, size_t build_attr,
                              size_t probe_attr, ColumnarReader &columnar_reader,
@@ -30,7 +35,7 @@ inline void nested_loop_join(const JoinInput &build_input,
     // 1. FAST PATH: Materialize Build Side into Stack Arrays
     // -------------------------------------------------------------
     // Split values and IDs for better cache locality (Structure of Arrays)
-    // Using fixed size arrays since build is known to be small (4-8)
+    // Using fixed size arrays since build is known to be small (typically < 64)
     constexpr size_t MAX_BUILD_SIZE = 64; 
     int32_t b_vals[MAX_BUILD_SIZE];
     uint32_t b_ids[MAX_BUILD_SIZE];
@@ -89,9 +94,9 @@ inline void nested_loop_join(const JoinInput &build_input,
     // 2. PARALLEL PROBE: Scan Probe Once, Check against Buffer
     // -------------------------------------------------------------
     
-    // Prepare thread buffers (aligned to avoid false sharing)
+    // Use the new slab-based thread local buffers
     int num_threads = worker_pool.thread_count();
-    std::vector<ThreadMatchBuffer> buffers(num_threads);
+    std::vector<ThreadLocalMatchBuffer> buffers(num_threads);
 
     // Prepare Probe Metadata for random access
     const Column *probe_col = nullptr;
@@ -112,16 +117,14 @@ inline void nested_loop_join(const JoinInput &build_input,
     }
 
     worker_pool.execute([&](size_t t_id, size_t total_threads) {
-        auto &output = buffers[t_id].matches;
-        // Heuristic reservation to prevent re-allocs
-        output.reserve(1024); 
+        auto &local_buffer = buffers[t_id];
 
         // INLINED INNER LOOP: Compare one probe val against all build vals
         // This encourages the compiler to use SIMD/Registers for b_vals
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
             for (size_t k = 0; k < b_count; ++k) {
                 if (b_vals[k] == p_val) {
-                    output.emplace_back(b_ids[k], p_id);
+                    local_buffer.add_match(b_ids[k], p_id);
                 }
             }
         };
@@ -172,16 +175,10 @@ inline void nested_loop_join(const JoinInput &build_input,
     });
 
     // -------------------------------------------------------------
-    // 3. MERGE (Minimizing Resize Overhead)
+    // 3. MERGE (Zero-Copy Pointer Swapping)
     // -------------------------------------------------------------
-    size_t total_matches = 0;
-    for (const auto &buf : buffers) total_matches += buf.matches.size();
-    
-    collector.reserve(total_matches);
-    for (const auto &buf : buffers) {
-        for (const auto &m : buf.matches) {
-            collector.add_match(m.first, m.second);
-        }
+    for (auto &buf : buffers) {
+        collector.merge_thread_buffer(buf);
     }
 }
 

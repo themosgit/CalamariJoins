@@ -5,6 +5,7 @@
 #include <intermediate.h>
 #include <join_setup.h>
 #include <worker_pool.h>
+#include <match_collector.h>
 
 /**
  *
@@ -93,24 +94,12 @@ inline UnchainedHashtable build_from_intermediate_parallel(const JoinInput &inpu
  **/
 
 inline void merge_local_collectors(
-    const std::vector<MatchCollector>& local_collectors,
-    MatchCollector& global_collector)
-{
-    size_t total = 0;
-    for(const auto& lc : local_collectors) total += lc.size();
-
-    global_collector.reserve(total);
-
-    for(const auto& lc : local_collectors){
-        global_collector.matches.insert(
-            global_collector.matches.end(),
-            lc.matches.begin(),
-            lc.matches.end()
-        );
-
+    std::vector<ThreadLocalMatchBuffer>& local_buffers,
+    MatchCollector& global_collector) {
+    for(auto& buf : local_buffers){
+        global_collector.merge_thread_buffer(buf);
     }
-}
-/**
+}/**
  *
  *  parallel probing of hash table with intermediate column_t input using work stealing
  *  each thread processes pages via atomic counter for dynamic load balancing
@@ -122,6 +111,10 @@ inline void merge_local_collectors(
  * */
 
 
+
+/**
+ *  PROBE INTERMEDIATE: Uses ThreadLocalMatchBuffer
+ */
 inline void probe_intermediate(const UnchainedHashtable& hash_table,
                                const mema::column_t &probe_column,
                                MatchCollector& collector,
@@ -130,16 +123,18 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
 
-    // Use the thread pool's actual size for local collectors
     size_t pool_size = worker_pool.thread_count();
-    std::vector<MatchCollector> local_collectors(pool_size);
+    // Use the new ThreadLocalMatchBuffer
+    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
     
     const size_t num_pages = probe_column.pages.size();
     const size_t probe_count = probe_column.row_count();
     std::atomic<size_t> page_counter(0);
 
-    // Execute using the global worker pool
     worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+        // Cache local reference
+        auto& local_buf = local_buffers[thread_id];
+        
         while(true){
             size_t page_idx = page_counter.fetch_add(1);
             if(page_idx >= num_pages) break;
@@ -156,7 +151,8 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
 
                     for(uint64_t i = start_idx; i < end_idx; ++i){
                         if(keys[i] == key_val){
-                            local_collectors[thread_id].add_match(row_ids[i], idx);
+                            // Optimized add
+                            local_buf.add_match(row_ids[i], idx);
                         }
                     }
                 }
@@ -164,16 +160,12 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
         }
     });
 
-    merge_local_collectors(local_collectors, collector);
+    merge_local_collectors(local_buffers, collector);
 }
+
 /**
- *
- *  parallel probing of hash table with columnar input using work stealing
- *  each thread processes pages independently via atomic counter
- *  handles both dense and sparse pages with null bitmaps
- *  thread-local collectors merged after join for lock-free execution
- *  
- **/
+ *  PROBE COLUMNAR: Uses ThreadLocalMatchBuffer
+ */
 inline void probe_columnar(const UnchainedHashtable& hash_table,
                            const JoinInput& probe_input,
                            size_t probe_attr,
@@ -199,18 +191,23 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
     }
 
     size_t pool_size = worker_pool.thread_count();
-    std::vector<MatchCollector> local_collectors(pool_size);
+    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
 
     std::atomic<size_t> page_counter(0);
     worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+        auto& local_buf = local_buffers[thread_id];
+
         while(true){
             size_t page_idx = page_counter.fetch_add(1);
             if(page_idx >= num_pages) break;
+            
+            // ... (Reading logic remains identical) ...
             auto* page = probe_col.pages[page_idx]->data;
             auto num_rows = *reinterpret_cast<const uint16_t*>(page);
             auto num_values = *reinterpret_cast<const uint16_t*>(page + 2);
             auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
             uint32_t probe_row_id = page_offsets[page_idx];
+
             if(num_rows == num_values) { 
                 for(uint16_t  i = 0; i < num_rows; ++i){
                     int32_t key_val = data_begin[i];
@@ -218,7 +215,7 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
 
                     for(uint64_t j = start_idx; j < end_idx; ++j){
                         if(keys[j] == key_val){
-                            local_collectors[thread_id].add_match(row_ids[j], probe_row_id);
+                            local_buf.add_match(row_ids[j], probe_row_id);
                         }
                     }
                     probe_row_id++;
@@ -236,7 +233,7 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
 
                         for(uint64_t j = start_idx; j < end_idx; ++j){
                             if(keys[j] == key_val){
-                                local_collectors[thread_id].add_match(row_ids[j], probe_row_id);
+                                local_buf.add_match(row_ids[j], probe_row_id);
                             }
                         }
                     }
@@ -246,6 +243,6 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
         }
     });
 
-    merge_local_collectors(local_collectors, collector);
+    merge_local_collectors(local_buffers, collector);
 }
 } // namespace Contest

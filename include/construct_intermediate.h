@@ -1,5 +1,6 @@
 #pragma once
 
+
 #include <columnar_reader.h>
 #include <intermediate.h>
 #include <join_setup.h>
@@ -8,7 +9,7 @@
 #include <worker_pool.h>
 #include <hardware_darwin.h>
 #include <sys/mman.h>
-
+#include <match_collector.h>
 namespace Contest {
 
 /**
@@ -69,27 +70,6 @@ struct SourceInfo {
 
 /**
  *
- *  stores join matches as packed 64-bit values
- *  lower 32 bits hold left row id, upper 32 bits hold right row id
- *
- **/
-struct MatchCollector {
-    std::vector<uint64_t> matches;
-
-    inline void reserve(size_t estimated_matches) {
-        matches.reserve(estimated_matches);
-    }
-
-    inline void add_match(uint32_t left, uint32_t right) {
-        matches.push_back(static_cast<uint64_t>(left) |
-                          (static_cast<uint64_t>(right) << 32));
-    }
-
-    inline size_t size() const { return matches.size(); }
-};
-
-/**
- *
  *  calculates total pages needed and allocates single memory block
  *  distributes pre-allocated pages to result columns
  *
@@ -140,10 +120,8 @@ inline std::vector<SourceInfo> prepare_sources(
         info.from_build = (col_idx < build_size);
         info.shift = info.from_build ? 0 : 32;
         
-        // Calculate the index in the source (build or probe) table/result
         size_t local_idx = info.from_build ? col_idx : col_idx - build_size;
         info.remapped_col_idx = local_idx;
-
         const JoinInput& input = info.from_build ? build_input : probe_input;
         const PlanNode& node = info.from_build ? build_node : probe_node;
 
@@ -179,13 +157,13 @@ inline void construct_intermediate(
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
 
-    // 1. Pre-calculate sources and allocate memory
+    const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
+    const uint64_t *matches_ptr = matches_vec.data();
+
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
     auto allocator = batch_allocate_for_results(results, total_matches);
-    const uint64_t *matches_ptr = collector.matches.data();
 
-    // 2. Parallel construction
     worker_pool.execute([&](size_t t, size_t num_threads) {
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
@@ -196,7 +174,6 @@ inline void construct_intermediate(
             auto& dest_col = results[i];
 
             if (src.is_columnar) {
-                // Specialized loops for ColumnarReader to avoid per-row branch
                 const auto& col = *src.columnar_col;
                 if (src.from_build) {
                     for (size_t k = start; k < end; ++k) {
@@ -212,7 +189,6 @@ inline void construct_intermediate(
                     }
                 }
             } else {
-                // Branchless loop for Intermediate results using shift
                 const auto& vec = *src.intermediate_col;
                 uint32_t shift = src.shift;
                 for (size_t k = start; k < end; ++k) {

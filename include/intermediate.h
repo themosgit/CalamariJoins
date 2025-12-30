@@ -11,36 +11,59 @@ namespace mema {
 
 /**
  *
- * value_t struct holding necessary metadata.
- * optimized bit packing for VARCHAR
+ *  value_t struct holding necessary metadata.
+ *  for INT32 we store the integer value directly
+ *  For VARCHAR we pack 19 bits for page_idx and
+ *  13 bits for offset_idx this fits all pages
+ *  and allows the neccesary offset index
  *
  **/
 struct alignas(4) value_t {
     int32_t value;
 
-    /* packed: offset_idx (13 bits) | page_idx (19 bits) */
+    /* encodes string metadata by packing bits */
     static inline value_t encode_string(int32_t page_idx, int32_t offset_idx) {
-        return { (offset_idx << 19) | (page_idx & 0x7FFFF) };
+        return {(offset_idx << 19) | (page_idx & 0x7FFFF)};
     }
 
+    /**
+     *
+     *  decodes first 19 bits for page_idx casts
+     *  to prevent sign extension when shifting
+     *  signed integer and decodes 13 bits for
+     *  offset idx
+     *
+     **/
     static inline void decode_string(int32_t encoded, int32_t &page_idx,
                                      int32_t &offset_idx) {
+
         page_idx = encoded & 0x7FFFF;
         offset_idx = (static_cast<uint32_t>(encoded) >> 19) & 0x1FFF;
     }
 
+    /* when we encounter long string all offset bits are set */
     static constexpr int32_t LONG_STRING_OFFSET = 0x1FFF;
+
+    /* sentinel value to represent NULL for both INT32 and VARCHAR */
     static constexpr int32_t NULL_VALUE = INT32_MIN;
 
     inline bool is_null() const { return value == NULL_VALUE; }
 };
 
-/* Ensuring this aligns with system page size is good for mmap */
-constexpr size_t CAP_PER_PAGE = 2048; 
+constexpr size_t CAP_PER_PAGE = PAGE_SIZE / sizeof(value_t);
 
+/**
+ *
+ *  CAP_PER_PAGE = 2048 to achieve 100% memory utilization per page
+ *  a simple vector of pages with value_t append function that  writes value
+ *  sequentially to the end,and also checks if new page is needed.
+ *  and also an operator to read the value from the idx
+ *
+ **/
 struct column_t {
   private:
-    struct alignas(4096) Page {
+    /* added page alignment */
+    struct alignas(PAGE_SIZE) Page {
         value_t data[CAP_PER_PAGE];
     };
 
@@ -55,83 +78,36 @@ struct column_t {
 
   public:
     column_t() = default;
-
-    column_t(column_t&& other) noexcept 
-        : num_values(other.num_values), owns_pages(other.owns_pages), 
-          external_memory(std::move(other.external_memory)), 
-          pages(std::move(other.pages)), 
-          source_table(other.source_table), source_column(other.source_column) {
-        other.owns_pages = false;
-        other.pages.clear();
-        other.num_values = 0;
-    }
-
-    column_t& operator=(column_t&& other) noexcept {
-        if (this != &other) {
-            if (owns_pages) { for (auto *p : pages) delete p; }
-            
-            num_values = other.num_values;
-            owns_pages = other.owns_pages;
-            external_memory = std::move(other.external_memory);
-            pages = std::move(other.pages);
-            source_table = other.source_table;
-            source_column = other.source_column;
-            
-            other.owns_pages = false;
-            other.pages.clear();
-            other.num_values = 0;
-        }
-        return *this;
-    }
-
-    column_t(const column_t&) = delete;
-    column_t& operator=(const column_t&) = delete;
-
     ~column_t() {
         if (owns_pages) {
-            for (auto *page : pages) delete page;
+            for (auto *page : pages)
+                delete page;
         }
     }
 
-    /**
-     *  
-     *  Resizes the column to hold `count` elements.
-     *  Allocates new pages if necessary. 
-     *  Crucial for parallel write_at access.
-     *
-     **/
-    inline void resize(size_t count) {
-        size_t current_capacity = pages.size() * CAP_PER_PAGE;
-        if (count > current_capacity) {
-            size_t needed = count - current_capacity;
-            size_t pages_needed = (needed + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
-            pages.reserve(pages.size() + pages_needed);
-            for (size_t i = 0; i < pages_needed; ++i) {
-                pages.push_back(new Page());
-            }
-        }
-        num_values = count;
+    /* if we know the size we can pre allocate */
+    inline void reserve(size_t expected_rows) {
+        pages.reserve((expected_rows + CAP_PER_PAGE - 1) / CAP_PER_PAGE);
     }
 
+    /* appends value to page, creates new page if current page is full */
     inline void append(const value_t &val) {
-        if ((num_values & (CAP_PER_PAGE - 1)) == 0) {
-             pages.push_back(new Page());
+        if (num_values % CAP_PER_PAGE == 0) {
+            pages.push_back(new Page());
         }
-        pages.back()->data[num_values & (CAP_PER_PAGE - 1)] = val;
+        pages.back()->data[num_values % CAP_PER_PAGE] = val;
         num_values++;
     }
 
-    /* thread-safe random write used by parallel construct_intermediate */
-    inline void write_at(size_t idx, const value_t &val) {
-        pages[idx >> 11]->data[idx & 0x7FF] = val;
+    /* pre-allocate all pages for parallel writing called before spawning threads */
+    inline void pre_allocate(size_t count) {
+        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            pages.push_back(new Page());
+        }
+        num_values = count;
     }
-
-    /* read operator */
-    const value_t &operator[](size_t idx) const {
-        return pages[idx >> 11]->data[idx & 0x7FF];
-    }
-    
-    size_t row_count() const { return num_values; }
 
     /* pre-allocate from a contiguous memory block (batch allocation) */
     inline void pre_allocate_from_block(void* block, size_t& offset, size_t count,
@@ -147,6 +123,19 @@ struct column_t {
         owns_pages = false;
         external_memory = memory_keeper;
     }
+
+
+
+    /* thread-safe random write to pre-allocated pages */
+    inline void write_at(size_t idx, const value_t &val) {
+        pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE] = val;
+    }
+
+    const value_t &operator[](size_t idx) const {
+        return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
+    }
+
+    size_t row_count() const { return num_values; }
 };
 
 using Columnar = std::vector<column_t>;

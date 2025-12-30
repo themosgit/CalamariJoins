@@ -10,6 +10,8 @@
 #include <worker_pool.h>
 #include <sys/mman.h>
 #include <variant>
+#include <match_collector.h>
+
 
 namespace Contest {
 
@@ -267,7 +269,7 @@ private:
  *
  **/
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
-inline void materialize_column_parallel(Column &dest_col,
+inline void materialize_column(Column &dest_col,
                                         const MatchCollector &collector,
                                         ReaderFunc &&read_value,
                                         InitBuilderFunc &&init_builder,
@@ -275,8 +277,9 @@ inline void materialize_column_parallel(Column &dest_col,
                                         size_t est_bytes_per_row) {
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
+    const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
+    const uint64_t *matches_ptr = matches_vec.data();
 
-    const uint64_t *matches_ptr = collector.matches.data();
     constexpr int num_threads = SPC__CORE_COUNT;
 
     /* estimate pages per thread conservatively */
@@ -416,7 +419,7 @@ inline ColumnarTable materialize(
 
             auto init = [](Column&) { return Int32PageBuilder{}; };
 
-            materialize_column_parallel<Int32PageBuilder>(
+            materialize_column<Int32PageBuilder>(
                 dest_col, collector, reader, init, from_build, 4);
 
         } else {
@@ -439,7 +442,7 @@ inline ColumnarTable materialize(
                 return VarcharPageBuilder(*str_src_ptr, local); 
             };
 
-            materialize_column_parallel<VarcharPageBuilder>(
+            materialize_column<VarcharPageBuilder>(
                 dest_col, collector, reader, init, from_build, 35);
         }
     }
