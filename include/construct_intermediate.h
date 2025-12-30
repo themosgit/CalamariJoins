@@ -182,13 +182,25 @@ struct MixedSource {
 inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
     ExecuteResult& results, size_t total_matches) {
 
-    size_t total_pages = 0;
+    size_t total_chunks = 0;
     for (auto& col : results) {
-        total_pages += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
+        /* Calculate how many logical chunks (mema::column_t::Page) are needed */
+        total_chunks += (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
     }
 
+    /* 
+     * FIX: Calculate total system pages required.
+     * Each mema::column_t::Page holds CAP_PER_PAGE * sizeof(value_t) bytes.
+     * CAP_PER_PAGE = 2048, sizeof(value_t) = 4, so Chunk Size = 8192 bytes.
+     * System PAGE_SIZE is typically 4096 bytes.
+     * We must allocate enough system pages to cover the chunk size.
+     */
+    size_t bytes_per_chunk = mema::CAP_PER_PAGE * sizeof(mema::value_t);
+    size_t total_bytes = total_chunks * bytes_per_chunk;
+    size_t system_pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
     auto allocator = std::make_shared<BatchAllocator>();
-    allocator->allocate(total_pages);
+    allocator->allocate(system_pages);
     void* block = allocator->get_block();
     size_t offset = 0;
 
@@ -277,68 +289,11 @@ class ColumnarReader;
 
 /**
  *
- *  constructs intermediate results from column_t intermediate format
- *  both build and probe are intermediate results
- *  parallel implementation using multiple threads
+ * constructs intermediate results (vectors of values) from join matches
+ * parallelized construction of non-columnar intermediate results
  *
  **/
-inline void construct_intermediate_from_intermediate(
-    const MatchCollector &collector, const ExecuteResult &build,
-    const ExecuteResult &probe,
-    const std::vector<std::tuple<size_t, DataType>> &output_attrs,
-    ExecuteResult &results) {
-    const size_t total_matches = collector.size();
-    if (total_matches == 0)
-        return;
-
-    constexpr size_t PARALLEL_THRESHOLD = 5000;
-    if (total_matches < PARALLEL_THRESHOLD) {
-        const uint64_t *matches_ptr = collector.matches.data();
-        const size_t build_size = build.size();
-        for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
-            auto [col_idx, _] = output_attrs[out_idx];
-            const bool from_build = col_idx < build_size;
-            const mema::column_t *column = from_build ? &build[col_idx] : &probe[col_idx - build_size];
-            const uint32_t shift = from_build ? 0 : 32;
-            results[out_idx].reserve(total_matches);
-            for (size_t match_idx = 0; match_idx < total_matches; ++match_idx) {
-                uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                const mema::value_t &val = (*column)[row_id];
-                results[out_idx].append(val);
-            }
-        }
-        return;
-    }
-
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t build_size = build.size();
-    const size_t chunk_size = compute_chunk_size(output_attrs.size(), total_matches);
-    const auto tasks = compute_tasks(output_attrs.size(), total_matches, chunk_size);
-    const auto sources = prepare_sources(output_attrs, build, probe, build_size);
-
-    batch_allocate_for_results(results, total_matches);
-
-    worker_pool.execute([&](size_t t, size_t pool_size) {
-        for (size_t task_idx = t; task_idx < tasks.size(); task_idx += pool_size) {
-            const auto& task = tasks[task_idx];
-            const auto& src = sources[task.col_idx];
-            auto& dest = results[task.col_idx];
-            for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
-                const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
-                dest.write_at(i, (*src.column)[row_id]);
-            }
-        }
-    });
-}
-
-/**
- *
- *  constructs intermediate results directly from ColumnarTable columnar inputs
- *  both build and probe are reading from original page format
- *  parallel implementation using multiple threads
- *
- **/
-inline void construct_intermediate_from_columnar(
+inline void construct_intermediate(
     const MatchCollector &collector, const JoinInput &build_input,
     const JoinInput &probe_input,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
@@ -346,87 +301,93 @@ inline void construct_intermediate_from_columnar(
     ColumnarReader &columnar_reader, ExecuteResult &results) {
 
     const size_t total_matches = collector.size();
-    if (total_matches == 0)
-        return;
+    if (total_matches == 0) return;
+
+    /* 
+     * Pre-allocate memory using the batch allocator.
+     * This replaces the individual resize() calls which would do individual allocs.
+     * Note: This function now correctly handles 8KB chunks vs 4KB system pages.
+     */
+    auto allocator = batch_allocate_for_results(results, total_matches);
 
     const uint64_t *matches_ptr = collector.matches.data();
-    const size_t chunk_size = compute_chunk_size(remapped_attrs.size(), total_matches);
-    const auto tasks = compute_tasks(remapped_attrs.size(), total_matches, chunk_size);
-    const auto sources = prepare_columnar_sources(remapped_attrs, build_input, probe_input,
-                                                   build_node, probe_node, build_size);
+    constexpr int num_threads = SPC__CORE_COUNT;
 
-    batch_allocate_for_results(results, total_matches);
+    worker_pool.execute([&](size_t t, size_t num_threads) {
+        size_t start = t * total_matches / num_threads;
+        size_t end = (t + 1) * total_matches / num_threads;
+        if (start >= end) return;
 
-    worker_pool.execute([&](size_t t, size_t pool_size) {
-        for (size_t task_idx = t; task_idx < tasks.size(); task_idx += pool_size) {
-            const auto& task = tasks[task_idx];
-            const auto& src = sources[task.col_idx];
-            auto& dest = results[task.col_idx];
-            for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
-                const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
-                mema::value_t value = src.from_build
-                                          ? columnar_reader.read_value_build(
-                                                *src.column, src.remapped_col_idx, row_id,
-                                                src.column->type)
-                                          : columnar_reader.read_value_probe(
-                                                *src.column, src.remapped_col_idx, row_id,
-                                                src.column->type);
-                dest.write_at(i, value);
-            }
-        }
-    });
-}
+        /* iterate over each requested output column */
+        for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
+            auto [col_idx, data_type] = remapped_attrs[out_idx];
+            bool from_build = col_idx < build_size;
+            size_t remapped_col_idx = from_build ? col_idx : col_idx - build_size;
 
-/**
- *
- *  constructs intermediate results from mixed input types
- *  one side is ColumnarTable columnar other is column_t intermediate
- *  parallel implementation using multiple threads
- *
- **/
-inline void construct_intermediate_mixed(
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input,
-    const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
-    const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
-    ColumnarReader &columnar_reader, ExecuteResult &results) {
+            /* reference to destination column (paged vector) */
+            auto& dest_col = results[out_idx];
 
-    const size_t total_matches = collector.size();
-    if (total_matches == 0)
-        return;
+            /* resolve data source */
+            const Column *columnar_src_col = nullptr;
+            const mema::column_t *intermediate_src_col = nullptr;
 
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t chunk_size = compute_chunk_size(remapped_attrs.size(), total_matches);
-    const auto tasks = compute_tasks(remapped_attrs.size(), total_matches, chunk_size);
-    const auto sources = prepare_mixed_sources(remapped_attrs, build_input, probe_input,
-                                                build_node, probe_node, build_size);
-
-    batch_allocate_for_results(results, total_matches);
-
-    worker_pool.execute([&](size_t t, size_t pool_size) {
-        for (size_t task_idx = t; task_idx < tasks.size(); task_idx += pool_size) {
-            const auto& task = tasks[task_idx];
-            const auto& src = sources[task.col_idx];
-            auto& dest = results[task.col_idx];
-            for (size_t i = task.chunk_start; i < task.chunk_end; ++i) {
-                const uint32_t row_id = static_cast<uint32_t>(matches_ptr[i] >> src.shift);
-
-                mema::value_t value;
-                if (src.is_columnar) {
-                    value = src.from_build
-                                ? columnar_reader.read_value_build(
-                                      *src.columnar_col, src.remapped_col_idx,
-                                      row_id, src.columnar_col->type)
-                                : columnar_reader.read_value_probe(
-                                      *src.columnar_col, src.remapped_col_idx,
-                                      row_id, src.columnar_col->type);
+            if (from_build) {
+                if (build_input.is_columnar()) {
+                    auto *table = std::get<const ColumnarTable *>(build_input.data);
+                    auto [actual_idx, _] = build_node.output_attrs[remapped_col_idx];
+                    columnar_src_col = &table->columns[actual_idx];
                 } else {
-                    value = (*src.intermediate_col)[row_id];
+                    const auto &res = std::get<ExecuteResult>(build_input.data);
+                    intermediate_src_col = &res[remapped_col_idx];
                 }
-                dest.write_at(i, value);
+            } else {
+                if (probe_input.is_columnar()) {
+                    auto *table = std::get<const ColumnarTable *>(probe_input.data);
+                    auto [actual_idx, _] = probe_node.output_attrs[remapped_col_idx];
+                    columnar_src_col = &table->columns[actual_idx];
+                } else {
+                    const auto &res = std::get<ExecuteResult>(probe_input.data);
+                    intermediate_src_col = &res[remapped_col_idx];
+                }
+            }
+
+            /* inner tight loop for filling this column chunk */
+            if (columnar_src_col) {
+                const auto& col = *columnar_src_col;
+                /* 
+                 * FIX: Use col.type (source physical type) instead of data_type (destination logical type).
+                 * ColumnarReader needs the physical type to interpret the page bits correctly (e.g. VARCHAR vs INT32).
+                 * If they mismatch, the Reader produces garbage which is then written to the result.
+                 */
+                if (from_build) {
+                    for (size_t i = start; i < end; ++i) {
+                        uint32_t rid = static_cast<uint32_t>(matches_ptr[i]);
+                        dest_col.write_at(i, columnar_reader.read_value_build(
+                            col, remapped_col_idx, rid, col.type));
+                    }
+                } else {
+                    for (size_t i = start; i < end; ++i) {
+                        uint32_t rid = static_cast<uint32_t>(matches_ptr[i] >> 32);
+                        dest_col.write_at(i, columnar_reader.read_value_probe(
+                            col, remapped_col_idx, rid, col.type));
+                    }
+                }
+            } else {
+                /* fast copy from intermediate vector */
+                const auto& src_vec = *intermediate_src_col;
+                if (from_build) {
+                    for (size_t i = start; i < end; ++i) {
+                        uint32_t rid = static_cast<uint32_t>(matches_ptr[i]);
+                        dest_col.write_at(i, src_vec[rid]);
+                    }
+                } else {
+                    for (size_t i = start; i < end; ++i) {
+                        uint32_t rid = static_cast<uint32_t>(matches_ptr[i] >> 32);
+                        dest_col.write_at(i, src_vec[rid]);
+                    }
+                }
             }
         }
     });
 }
-
 } // namespace Contest
