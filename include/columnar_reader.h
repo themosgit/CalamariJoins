@@ -5,7 +5,7 @@
 #include <intermediate.h>
 #include <plan.h>
 #include <vector>
-#include <cstring> // Added for memcpy
+#include <cstring>
 
 /* likely/unlikely macros for branch prediction optimization */
 #define SPC_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -19,8 +19,8 @@ inline std::atomic<uint64_t> global_probe_version{0};
 
 /**
  *
- * page index for efficient row lookup in ColumnarTable pages
- * pre-computed metadata to accelerate random access during materialization
+ *  page index for efficient row lookup in ColumnarTable pages
+ *  pre-computed metadata to accelerate random access during materialization
  *
  **/
 struct PageIndex {
@@ -29,8 +29,8 @@ struct PageIndex {
 
     /**
      *
-     * builds page index for entire column
-     * processes all pages to construct cumulative_rows and page_prefix_sums
+     *  builds page index for entire column
+     *  processes all pages to construct cumulative_rows and page_prefix_sums
      *
      **/
     inline void build(const Column &column) {
@@ -59,7 +59,6 @@ struct PageIndex {
             if (num_rows != 0xfffe && num_rows != 0xffff &&
                 num_rows != num_values) {
                 
-                /* FIX: Use uint8_t* to calculate offset safely */
                 size_t bitmap_size = (num_rows + 7) / 8;
                 auto *bitmap_bytes = reinterpret_cast<const uint8_t *>(
                     page + PAGE_SIZE - bitmap_size);
@@ -70,8 +69,6 @@ struct PageIndex {
                 uint32_t sum = 0;
                 for (size_t i = 0; i < num_chunks; ++i) {
                     prefix_sums.push_back(sum);
-                    
-                    /* FIX: Safe read to avoid reading past PAGE_SIZE/bitmap end */
                     uint64_t word = 0;
                     size_t offset = i * 8;
                     size_t remaining = bitmap_size > offset ? bitmap_size - offset : 0;
@@ -90,8 +87,8 @@ struct PageIndex {
 
     /**
      *
-     * binary search to find which page contains row_id
-     * uses cumulative_rows for O(log P) lookup
+     *  binary search to find which page contains row_id
+     *  uses cumulative_rows for O(log P) lookup
      *
      **/
     inline size_t find_page(uint32_t row_id) const {
@@ -100,11 +97,7 @@ struct PageIndex {
         return static_cast<size_t>(it - cumulative_rows.begin());
     }
 
-    /**
-     *
-     * returns starting row number for given page
-     *
-     **/
+    /* returns starting row number for given page */
     inline uint32_t page_start_row(size_t page_num) const {
         return page_num == 0 ? 0 : cumulative_rows[page_num - 1];
     }
@@ -112,9 +105,9 @@ struct PageIndex {
 
 /**
  *
- * efficient reader for ColumnarTable inputs
- * provides two-level optimization for random row access
- * lazily populated caches exploit spatial locality
+ *  efficient reader for ColumnarTable inputs
+ *  provides two-level optimization for random row access
+ *  lazily populated caches exploit spatial locality
  *
  **/
 class ColumnarReader {
@@ -238,12 +231,10 @@ class ColumnarReader {
         } 
         
         /* sparse page handling */
-        /* FIX: Use uint8_t* for correct pointer arithmetic and sizing */
         size_t bitmap_size = (num_rows + 7) / 8;
         auto *bitmap = reinterpret_cast<const uint8_t *>(
             page + PAGE_SIZE - bitmap_size);
         
-        /* optimized bit check: replace div/mod with shifts */
         bool is_valid = bitmap[local_row >> 3] & (1u << (local_row & 7));
 
         if (!is_valid) {
@@ -256,7 +247,6 @@ class ColumnarReader {
 
         uint16_t data_idx = prefix_sums[chunk_idx];
 
-        /* FIX: Safe read to avoid reading past PAGE_SIZE/bitmap end */
         uint64_t word = 0;
         size_t offset = chunk_idx * 8;
         size_t remaining = bitmap_size > offset ? bitmap_size - offset : 0;
