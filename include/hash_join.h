@@ -1,14 +1,10 @@
 #pragma once
 
 #include <construct_intermediate.h>
-// #if defined(__aarch64__)
-//     #include <hardware_darwin.h>
-// #else
-//     #include <hardware.h>
-// #endif
 #include <hashtable.h>
 #include <intermediate.h>
 #include <join_setup.h>
+#include <worker_pool.h>
 
 /**
  *
@@ -128,49 +124,47 @@ inline void merge_local_collectors(
 
 inline void probe_intermediate(const UnchainedHashtable& hash_table,
                                const mema::column_t &probe_column,
-                                MatchCollector& collector,
-                                int num_threads = NUM_CORES)
+                               MatchCollector& collector,
+                               int /*num_threads*/ = NUM_CORES)
 {
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
 
+    // Use the thread pool's actual size for local collectors
+    size_t pool_size = worker_pool.thread_count();
+    std::vector<MatchCollector> local_collectors(pool_size);
     
-    std::vector<MatchCollector> local_collectors(num_threads);
     const size_t num_pages = probe_column.pages.size();
     const size_t probe_count = probe_column.row_count();
     std::atomic<size_t> page_counter(0);
 
-    std::vector<std::thread> workers;
-    for(int t = 0; t < num_threads; ++t){
-        workers.emplace_back([&,t](){
-            while(true){
-                size_t page_idx = page_counter.fetch_add(1);
-                if(page_idx >= num_pages) break;
+    // Execute using the global worker pool
+    worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+        while(true){
+            size_t page_idx = page_counter.fetch_add(1);
+            if(page_idx >= num_pages) break;
 
-                size_t base_row = page_idx * mema::CAP_PER_PAGE;
-                size_t page_end = std::min(base_row + mema::CAP_PER_PAGE,probe_count);
+            size_t base_row = page_idx * mema::CAP_PER_PAGE;
+            size_t page_end = std::min(base_row + mema::CAP_PER_PAGE, probe_count);
 
-                for(size_t idx = base_row; idx < page_end; ++idx){
-                    const mema::value_t& key = probe_column[idx];
+            for(size_t idx = base_row; idx < page_end; ++idx){
+                const mema::value_t& key = probe_column[idx];
 
-                    if(!key.is_null()){
-                        int32_t key_val = key.value;
-                        auto[start_idx,end_idx] = hash_table.find_indices(key_val);
+                if(!key.is_null()){
+                    int32_t key_val = key.value;
+                    auto[start_idx,end_idx] = hash_table.find_indices(key_val);
 
-                        for(uint64_t i = start_idx; i < end_idx; ++i){
-                            if(keys[i] == key_val){
-                                local_collectors[t].add_match(row_ids[i],idx);
-                            }
+                    for(uint64_t i = start_idx; i < end_idx; ++i){
+                        if(keys[i] == key_val){
+                            local_collectors[thread_id].add_match(row_ids[i], idx);
                         }
                     }
                 }
             }
-        });
-    }
-    for(auto& w : workers) w.join();
-    merge_local_collectors(local_collectors,collector);
-   
+        }
+    });
 
+    merge_local_collectors(local_collectors, collector);
 }
 /**
  *
@@ -181,14 +175,13 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
  *  
  **/
 inline void probe_columnar(const UnchainedHashtable& hash_table,
-                                    const JoinInput& probe_input,
-                                    size_t probe_attr,
-                                    MatchCollector& collector,int num_threads = NUM_CORES){
+                           const JoinInput& probe_input,
+                           size_t probe_attr,
+                           MatchCollector& collector,
+                           int /*num_threads*/ = NUM_CORES) {
 
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
-
-
                                 
     auto* table = std::get<const ColumnarTable*>(probe_input.data);
     auto [actual_idx_col,_] = probe_input.node->output_attrs[probe_attr];
@@ -205,58 +198,54 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
         running_offset += num_rows;
     }
 
-    std::vector<MatchCollector> local_collectors(num_threads);
+    size_t pool_size = worker_pool.thread_count();
+    std::vector<MatchCollector> local_collectors(pool_size);
 
     std::atomic<size_t> page_counter(0);
+    worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+        while(true){
+            size_t page_idx = page_counter.fetch_add(1);
+            if(page_idx >= num_pages) break;
+            auto* page = probe_col.pages[page_idx]->data;
+            auto num_rows = *reinterpret_cast<const uint16_t*>(page);
+            auto num_values = *reinterpret_cast<const uint16_t*>(page + 2);
+            auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
+            uint32_t probe_row_id = page_offsets[page_idx];
+            if(num_rows == num_values) { 
+                for(uint16_t  i = 0; i < num_rows; ++i){
+                    int32_t key_val = data_begin[i];
+                    auto [start_idx, end_idx] = hash_table.find_indices(key_val);
 
-    std::vector<std::thread> workers;
-    for(int t = 0; t < num_threads; ++t){
-        workers.emplace_back([&,t](){
-            while(true){
-                size_t page_idx = page_counter.fetch_add(1);
-                if(page_idx >= num_pages) break;
-                auto* page = probe_col.pages[page_idx]->data; //gets only one page
-                auto num_rows = *reinterpret_cast<const uint16_t*>(page);
-                auto num_values = *reinterpret_cast<const uint16_t*>(page + 2);
-                auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
-                uint32_t probe_row_id = page_offsets[page_idx];
-                if(num_rows == num_values) { 
-                    for(uint16_t  i = 0; i < num_rows; ++i){
-                        int32_t key_val = data_begin[i];
-                        auto [start_idx, end_idx] = hash_table.find_indices(key_val);
+                    for(uint64_t j = start_idx; j < end_idx; ++j){
+                        if(keys[j] == key_val){
+                            local_collectors[thread_id].add_match(row_ids[j], probe_row_id);
+                        }
+                    }
+                    probe_row_id++;
+                }
+            } else {
+                auto *bitmap = reinterpret_cast<const uint8_t *>(
+                    page + PAGE_SIZE - (num_rows + 7) / 8 );
+                uint16_t data_idx = 0;
+                for(uint16_t i = 0; i < num_rows; ++i){
+                    bool is_valid = bitmap[i/8] & (1u << (i % 8));
+                    if(is_valid){
+                        int32_t key_val = data_begin[data_idx++];
+                        auto[start_idx, end_idx] = 
+                            hash_table.find_indices(key_val);
 
                         for(uint64_t j = start_idx; j < end_idx; ++j){
                             if(keys[j] == key_val){
-                                local_collectors[t].add_match(row_ids[j],probe_row_id);
+                                local_collectors[thread_id].add_match(row_ids[j], probe_row_id);
                             }
                         }
-                        probe_row_id++;
                     }
-                } else {
-                    auto *bitmap = reinterpret_cast<const uint8_t *>(
-                        page + PAGE_SIZE - (num_rows + 7) / 8 );
-                    uint16_t data_idx = 0;
-                    for(uint16_t i = 0; i < num_rows; ++i){
-                        bool is_valid = bitmap[i/8] & (1u << (i % 8));
-                        if(is_valid){
-                            int32_t key_val = data_begin[data_idx++];
-                            auto[start_idx, end_idx] = 
-                                hash_table.find_indices(key_val);
-
-                            for(uint64_t j = start_idx; j < end_idx; ++j){
-                                if(keys[j] == key_val){
-                                    local_collectors[t].add_match(row_ids[j],probe_row_id);
-                                }
-                            }
-                        }
-                        probe_row_id++;
-                    }
+                    probe_row_id++;
                 }
             }
-        });
-    }
-    for(auto& w: workers) w.join();
-    merge_local_collectors(local_collectors,collector);
+        }
+    });
 
+    merge_local_collectors(local_collectors, collector);
 }
 } // namespace Contest
