@@ -36,6 +36,7 @@ struct alignas(4) value_t {
      **/
     static inline void decode_string(int32_t encoded, int32_t &page_idx,
                                      int32_t &offset_idx) {
+
         page_idx = encoded & 0x7FFFF;
         offset_idx = (static_cast<uint32_t>(encoded) >> 19) & 0x1FFF;
     }
@@ -98,7 +99,7 @@ struct column_t {
         num_values++;
     }
 
-    /* pre-allocate all pages for parallel writing - call before spawning threads */
+    /* pre-allocate all pages for parallel writing called before spawning threads */
     inline void pre_allocate(size_t count) {
         size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
         pages.reserve(pages_needed);

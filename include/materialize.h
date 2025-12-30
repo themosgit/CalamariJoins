@@ -7,9 +7,49 @@
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
-#include <thread>
+#include <worker_pool.h>
+#include <sys/mman.h>
 
 namespace Contest {
+
+/**
+ *
+ *  helper for building sparse page bitmaps
+ *  handles buffering and flushing partial bytes
+ *
+ **/
+struct BitmapBuilder {
+    std::vector<uint8_t>& bitmap;
+    uint8_t pending_bits = 0;
+    int bit_count = 0;
+
+    explicit BitmapBuilder(std::vector<uint8_t>& bm) : bitmap(bm) {}
+
+    inline void add_bit(bool is_valid) {
+        if (is_valid) {
+            pending_bits |= (1u << bit_count);
+        }
+        bit_count++;
+        if (bit_count == 8) {
+            bitmap.push_back(pending_bits);
+            pending_bits = 0;
+            bit_count = 0;
+        }
+    }
+
+    inline void flush() {
+        if (bit_count > 0) {
+            bitmap.push_back(pending_bits);
+            pending_bits = 0;
+            bit_count = 0;
+        }
+    }
+
+    inline void reset() {
+        pending_bits = 0;
+        bit_count = 0;
+    }
+};
 
 /**
  *
@@ -58,87 +98,6 @@ inline size_t compute_materialization_chunk_size(size_t total_matches) {
 
 /**
  *
- *  serial int32 materialization (for small joins)
- *
- **/
-template <typename ReaderFunc>
-inline void materialize_int32_column_serial(Column &dest_col,
-                                            const MatchCollector &collector,
-                                            ReaderFunc &&read_value, bool from_build) {
-
-    uint16_t num_rows = 0;
-    std::vector<int32_t> data;
-    std::vector<uint8_t> bitmap;
-
-    data.reserve(std::min(collector.size(), size_t(2048)));
-    bitmap.reserve(std::min(collector.size() / 8 + 1, size_t(256)));
-
-    uint8_t pending_bits = 0;
-    int bit_count = 0;
-
-    auto flush_bitmap = [&]() {
-        if (bit_count > 0) {
-            bitmap.push_back(pending_bits);
-            pending_bits = 0;
-            bit_count = 0;
-        }
-    };
-
-    auto save_page = [&]() {
-        flush_bitmap();
-
-        auto *page = dest_col.new_page()->data;
-        *reinterpret_cast<uint16_t *>(page) = num_rows;
-        *reinterpret_cast<uint16_t *>(page + 2) =
-            static_cast<uint16_t>(data.size());
-        std::memcpy(page + 4, data.data(), data.size() * 4);
-        std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                    bitmap.size());
-
-        num_rows = 0;
-        data.clear();
-        bitmap.clear();
-        pending_bits = 0;
-        bit_count = 0;
-    };
-
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t total_matches = collector.size();
-
-    auto run_loop = [&](auto get_row_id) {
-        for (size_t i = 0; i < total_matches; ++i) {
-            uint32_t row_id = get_row_id(matches_ptr[i]);
-            mema::value_t val = read_value(row_id);
-            if (4 + (data.size() + 1) * 4 + (bitmap.size() + 2) > PAGE_SIZE) {
-                save_page();
-            }
-            if (!val.is_null()) {
-                pending_bits |= (1u << bit_count);
-                data.emplace_back(val.value);
-            }
-            bit_count++;
-            if (bit_count == 8) {
-                bitmap.push_back(pending_bits);
-                pending_bits = 0;
-                bit_count = 0;
-            }
-            ++num_rows;
-        }
-    };
-
-    if (from_build) {
-        run_loop(
-            [](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
-    } else {
-        run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
-    }
-
-    if (num_rows != 0)
-        save_page();
-}
-
-/**
- *
  *  parallel int32 materialization
  *  each thread builds local pages then merges at end
  *
@@ -150,276 +109,119 @@ inline void materialize_int32_column(Column &dest_col,
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
 
-    constexpr size_t PARALLEL_THRESHOLD = 5000;
-    if (total_matches < PARALLEL_THRESHOLD) {
-        materialize_int32_column_serial(dest_col, collector, read_value, from_build);
-        return;
-    }
-
     const uint64_t *matches_ptr = collector.matches.data();
     const size_t chunk_size = compute_materialization_chunk_size(total_matches);
     constexpr int num_threads = SPC__CORE_COUNT;
+
+    /* estimate pages per thread conservatively */
+    size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
+    size_t max_rows_per_page = (PAGE_SIZE - 4 - 256) / 4;  // header + bitmap + data
+    size_t pages_per_thread = (matches_per_thread + max_rows_per_page - 1) / max_rows_per_page + 1;
+    size_t total_pages = pages_per_thread * num_threads;
+
+    /* batch allocate all pages upfront */
+    void* page_memory = mmap(nullptr, total_pages * PAGE_SIZE,
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page_memory == MAP_FAILED) {
+        throw std::bad_alloc();
+    }
 
     std::vector<Column> thread_columns;
     thread_columns.reserve(num_threads);
     for (int i = 0; i < num_threads; ++i) {
         thread_columns.emplace_back(DataType::INT32);
+        /* pre-assign pages to each thread's column */
+        for (size_t p = 0; p < pages_per_thread; ++p) {
+            size_t page_idx = i * pages_per_thread + p;
+            Page* page = reinterpret_cast<Page*>(
+                static_cast<char*>(page_memory) + page_idx * PAGE_SIZE);
+            thread_columns[i].pages.push_back(page);
+        }
     }
 
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
+    worker_pool.execute([&](size_t t, size_t num_threads) {
+        size_t start = t * total_matches / num_threads;
+        size_t end = (t + 1) * total_matches / num_threads;
+        if (start >= total_matches)
+            return;
 
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t] {
-            size_t start = t * total_matches / num_threads;
-            size_t end = (t + 1) * total_matches / num_threads;
-            if (start >= total_matches) return;
+        Column &local_col = thread_columns[t];
+        size_t chunk_matches = end - start;
 
-            Column &local_col = thread_columns[t];
+        /* pre-size vectors to exact capacity */
+        uint16_t num_rows = 0;
+        std::vector<int32_t> data;
+        std::vector<uint8_t> bitmap;
+        data.reserve(chunk_matches);  // worst case: all non-null
+        bitmap.reserve((chunk_matches + 7) / 8);  // exact bitmap size
 
-            uint16_t num_rows = 0;
-            std::vector<int32_t> data;
-            std::vector<uint8_t> bitmap;
-            data.reserve(2048);
-            bitmap.reserve(256);
+        /* calculate conservative min rows per page to reduce overflow checks */
+        constexpr size_t MIN_ROWS_PER_PAGE = (PAGE_SIZE - 4 - 256) / (4 + 1);  // data + bitmap
 
-            uint8_t pending_bits = 0;
-            int bit_count = 0;
+        BitmapBuilder bm_builder(bitmap);
 
-            auto flush_bitmap = [&]() {
-                if (bit_count > 0) {
-                    bitmap.push_back(pending_bits);
-                    pending_bits = 0;
-                    bit_count = 0;
-                }
-            };
+        auto save_page = [&]() {
+            bm_builder.flush();
+            auto *page = local_col.new_page()->data;
+            *reinterpret_cast<uint16_t *>(page) = num_rows;
+            *reinterpret_cast<uint16_t *>(page + 2) =
+                static_cast<uint16_t>(data.size());
+            std::memcpy(page + 4, data.data(), data.size() * 4);
+            std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
+                        bitmap.size());
+            num_rows = 0;
+            data.clear();
+            bitmap.clear();
+            bm_builder.reset();
+        };
 
-            auto save_page = [&]() {
-                flush_bitmap();
-                auto *page = local_col.new_page()->data;
-                *reinterpret_cast<uint16_t *>(page) = num_rows;
-                *reinterpret_cast<uint16_t *>(page + 2) = static_cast<uint16_t>(data.size());
-                std::memcpy(page + 4, data.data(), data.size() * 4);
-                std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(), bitmap.size());
-                num_rows = 0;
-                data.clear();
-                bitmap.clear();
-                pending_bits = 0;
-                bit_count = 0;
-            };
+        auto run_loop = [&](auto get_row_id) {
+            size_t rows_since_check = 0;
+            for (size_t i = start; i < end; ++i) {
+                uint32_t row_id = get_row_id(matches_ptr[i]);
+                mema::value_t val = read_value(row_id);
 
-            auto run_loop = [&](auto get_row_id) {
-                for (size_t i = start; i < end; ++i) {
-                    uint32_t row_id = get_row_id(matches_ptr[i]);
-                    mema::value_t val = read_value(row_id);
+                /* check overflow only every MIN_ROWS_PER_PAGE rows */
+                if (rows_since_check >= MIN_ROWS_PER_PAGE) {
                     if (4 + (data.size() + 1) * 4 + (bitmap.size() + 2) > PAGE_SIZE) {
                         save_page();
                     }
-                    if (!val.is_null()) {
-                        pending_bits |= (1u << bit_count);
-                        data.emplace_back(val.value);
-                    }
-                    bit_count++;
-                    if (bit_count == 8) {
-                        bitmap.push_back(pending_bits);
-                        pending_bits = 0;
-                        bit_count = 0;
-                    }
-                    ++num_rows;
+                    rows_since_check = 0;
                 }
-            };
 
-            if (from_build) {
-                run_loop([](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
-            } else {
-                run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+                bool is_valid = !val.is_null();
+                if (is_valid) {
+                    data.push_back(val.value);
+                }
+                bm_builder.add_bit(is_valid);
+                ++num_rows;
+                ++rows_since_check;
             }
+        };
 
-            if (num_rows != 0)
-                save_page();
-        });
-    }
+        if (from_build) {
+            run_loop(
+                [](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
+        } else {
+            run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+        }
 
-    for (auto &w : workers) {
-        w.join();
-    }
+        if (num_rows != 0)
+            save_page();
+    });
 
-    // merge phase: move pages from thread-local columns to dest_col
+    /* merge phase: move pages from thread-local columns to dest_col */
     for (auto &thread_col : thread_columns) {
         for (auto *page : thread_col.pages) {
             dest_col.pages.push_back(page);
         }
-        thread_col.pages.clear();  // don't delete in destructor
-    }
-}
-
-/**
- *
- *  serial version of varchar materialization
- *  kept as fallback for small result sets
- *
- **/
-template <typename ReaderFunc>
-inline void materialize_varchar_column_serial(Column &dest_col,
-                                               const MatchCollector &collector,
-                                               ReaderFunc &&read_value,
-                                               const Column &src_col,
-                                               bool from_build) {
-
-    uint16_t num_rows = 0;
-    std::vector<char> char_data;
-    std::vector<uint16_t> offsets;
-    std::vector<uint8_t> bitmap;
-    size_t current_char_size = 0;
-
-    size_t estimated_char_size =
-        std::min(collector.size() * 16, size_t(PAGE_SIZE));
-    char_data.reserve(estimated_char_size);
-    offsets.reserve(std::min(collector.size(), size_t(2048)));
-    bitmap.reserve(std::min(collector.size() / 8 + 1, size_t(512)));
-
-    uint8_t pending_bits = 0;
-    int bit_count = 0;
-
-    auto flush_bitmap = [&]() {
-        if (bit_count > 0) {
-            bitmap.push_back(pending_bits);
-            pending_bits = 0;
-            bit_count = 0;
-        }
-    };
-
-    auto save_long_string_buffer = [&](const std::string &str) {
-        size_t offset = 0;
-        bool first_page = true;
-        while (offset < str.size()) {
-            auto *page = dest_col.new_page()->data;
-            *reinterpret_cast<uint16_t *>(page) = first_page ? 0xffff : 0xfffe;
-            first_page = false;
-            size_t len = std::min(str.size() - offset, PAGE_SIZE - 4);
-            *reinterpret_cast<uint16_t *>(page + 2) =
-                static_cast<uint16_t>(len);
-            std::memcpy(page + 4, str.data() + offset, len);
-            offset += len;
-        }
-    };
-
-    auto copy_long_string_pages = [&](int32_t start_page_idx) {
-        int32_t curr_idx = start_page_idx;
-        while (true) {
-            auto *src_page_data = src_col.pages[curr_idx]->data;
-            auto *dest_page_data = dest_col.new_page()->data;
-            std::memcpy(dest_page_data, src_page_data, PAGE_SIZE);
-
-            curr_idx++;
-            if (curr_idx >= static_cast<int32_t>(src_col.pages.size()))
-                break;
-            auto *next_p = src_col.pages[curr_idx]->data;
-            if (*reinterpret_cast<uint16_t *>(next_p) != 0xfffe)
-                break;
-        }
-    };
-
-    auto save_page = [&]() {
-        flush_bitmap();
-        auto *page = dest_col.new_page()->data;
-        *reinterpret_cast<uint16_t *>(page) = num_rows;
-        *reinterpret_cast<uint16_t *>(page + 2) =
-            static_cast<uint16_t>(offsets.size());
-        std::memcpy(page + 4, offsets.data(), offsets.size() * 2);
-        std::memcpy(page + 4 + offsets.size() * 2, char_data.data(),
-                    current_char_size);
-        std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                    bitmap.size());
-        num_rows = 0;
-        current_char_size = 0;
-        offsets.clear();
-        bitmap.clear();
-        pending_bits = 0;
-        bit_count = 0;
-    };
-
-    auto add_normal_string = [&](int32_t page_idx, int32_t offset_idx) -> bool {
-        auto [str_ptr, str_len] =
-            get_string_view(src_col, page_idx, offset_idx);
-
-        if (str_len > PAGE_SIZE - 7) {
-            if (num_rows > 0)
-                save_page();
-            save_long_string_buffer(std::string(str_ptr, str_len));
-            return false;
-        }
-
-        size_t needed = 4 + (offsets.size() + 1) * 2 +
-                        (current_char_size + str_len) + (bitmap.size() + 2);
-        if (needed > PAGE_SIZE)
-            save_page();
-
-        if (current_char_size + str_len > char_data.size()) {
-            char_data.resize(std::max(char_data.size() * 2,
-                                      current_char_size + str_len + 4096));
-        }
-
-        std::memcpy(char_data.data() + current_char_size, str_ptr, str_len);
-        current_char_size += str_len;
-        offsets.emplace_back(current_char_size);
-        return true;
-    };
-
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t total_matches = collector.size();
-
-    auto run_loop = [&](auto get_row_id) {
-        for (size_t i = 0; i < total_matches; ++i) {
-            uint32_t row_id = get_row_id(matches_ptr[i]);
-            mema::value_t val = read_value(row_id);
-
-            if (val.is_null()) {
-                if (4 + offsets.size() * 2 + current_char_size +
-                        (bitmap.size() + 2) >
-                    PAGE_SIZE) {
-                    save_page();
-                }
-                bit_count++;
-                if (bit_count == 8) {
-                    bitmap.push_back(pending_bits);
-                    pending_bits = 0;
-                    bit_count = 0;
-                }
-                num_rows++;
-            } else {
-                int32_t page_idx, offset_idx;
-                mema::value_t::decode_string(val.value, page_idx, offset_idx);
-
-                if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
-                    if (num_rows > 0)
-                        save_page();
-                    copy_long_string_pages(page_idx);
-                } else {
-                    if (add_normal_string(page_idx, offset_idx)) {
-                        pending_bits |= (1u << bit_count);
-                        bit_count++;
-                        if (bit_count == 8) {
-                            bitmap.push_back(pending_bits);
-                            pending_bits = 0;
-                            bit_count = 0;
-                        }
-                        num_rows++;
-                    }
-                }
-            }
-        }
-    };
-
-    if (from_build) {
-        run_loop(
-            [](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
-    } else {
-        run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+        thread_col.pages.clear();
     }
 
-    if (num_rows != 0)
-        save_page();
+    /* assign mapped memory so dest_col will munmap on destruction */
+    auto* mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
+    dest_col.assign_mapped_memory(mapped_mem);
 }
 
 /**
@@ -438,201 +240,197 @@ inline void materialize_varchar_column(Column &dest_col,
     if (total_matches == 0)
         return;
 
-    constexpr size_t PARALLEL_THRESHOLD = 5000;
-    if (total_matches < PARALLEL_THRESHOLD) {
-        materialize_varchar_column_serial(dest_col, collector, read_value,
-                                          src_col, from_build);
-        return;
-    }
-
     const uint64_t *matches_ptr = collector.matches.data();
     const size_t chunk_size = compute_materialization_chunk_size(total_matches);
     constexpr int num_threads = SPC__CORE_COUNT;
+
+    /* estimate pages per thread conservatively for VARCHAR */
+    size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
+    constexpr size_t AVG_STRING_LEN = 32;
+    size_t bytes_per_row = AVG_STRING_LEN + 2 + 1;
+    size_t usable_per_page = PAGE_SIZE - 256;
+    size_t rows_per_page = usable_per_page / bytes_per_row;
+    size_t pages_per_thread = (matches_per_thread + rows_per_page - 1) / rows_per_page + 2;
+    size_t total_pages = pages_per_thread * num_threads;
+
+    /* batch allocate all pages upfront */
+    void* page_memory = mmap(nullptr, total_pages * PAGE_SIZE,
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page_memory == MAP_FAILED) {
+        throw std::bad_alloc();
+    }
 
     std::vector<Column> thread_columns;
     thread_columns.reserve(num_threads);
     for (int i = 0; i < num_threads; ++i) {
         thread_columns.emplace_back(DataType::VARCHAR);
+        /* pre-assign pages to each thread's column */
+        for (size_t p = 0; p < pages_per_thread; ++p) {
+            size_t page_idx = i * pages_per_thread + p;
+            Page* page = reinterpret_cast<Page*>(
+                static_cast<char*>(page_memory) + page_idx * PAGE_SIZE);
+            thread_columns[i].pages.push_back(page);
+        }
     }
 
-    std::vector<std::thread> workers;
-    workers.reserve(num_threads);
+    worker_pool.execute([&](size_t t, size_t num_threads) {
+        size_t start = t * total_matches / num_threads;
+        size_t end = (t + 1) * total_matches / num_threads;
+        if (start >= total_matches)
+            return;
 
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&, t] {
-            size_t start = t * total_matches / num_threads;
-            size_t end = (t + 1) * total_matches / num_threads;
-            if (start >= total_matches)
-                return;
+        Column &local_col = thread_columns[t];
+        size_t chunk_matches = end - start;
 
-            Column &local_col = thread_columns[t];
+        uint16_t num_rows = 0;
+        std::vector<char> char_data;
+        std::vector<uint16_t> offsets;
+        std::vector<uint8_t> bitmap;
+        size_t current_char_size = 0;
 
-            uint16_t num_rows = 0;
-            std::vector<char> char_data;
-            std::vector<uint16_t> offsets;
-            std::vector<uint8_t> bitmap;
-            size_t current_char_size = 0;
+        /* pre-size vectors with better estimates */
+        constexpr size_t AVG_STRING_SIZE = 32;
+        char_data.reserve(chunk_matches * AVG_STRING_SIZE);
+        offsets.reserve(chunk_matches);
+        bitmap.reserve((chunk_matches + 7) / 8);
 
-            size_t chunk_matches = end - start;
-            size_t estimated_char_size =
-                std::min(chunk_matches * 16, size_t(PAGE_SIZE));
-            char_data.reserve(estimated_char_size);
-            offsets.reserve(std::min(chunk_matches, size_t(2048)));
-            bitmap.reserve(std::min(chunk_matches / 8 + 1, size_t(512)));
+        /* calculate conservative min rows per page for VARCHAR */
+        constexpr size_t MIN_ROWS_PER_PAGE = 100;  // conservative for variable-length
 
-            uint8_t pending_bits = 0;
-            int bit_count = 0;
+        BitmapBuilder bm_builder(bitmap);
 
-            auto flush_bitmap = [&]() {
-                if (bit_count > 0) {
-                    bitmap.push_back(pending_bits);
-                    pending_bits = 0;
-                    bit_count = 0;
-                }
-            };
-
-            auto save_long_string_buffer = [&](const std::string &str) {
-                size_t offset = 0;
-                bool first_page = true;
-                while (offset < str.size()) {
-                    auto *page = local_col.new_page()->data;
-                    *reinterpret_cast<uint16_t *>(page) =
-                        first_page ? 0xffff : 0xfffe;
-                    first_page = false;
-                    size_t len = std::min(str.size() - offset, PAGE_SIZE - 4);
-                    *reinterpret_cast<uint16_t *>(page + 2) =
-                        static_cast<uint16_t>(len);
-                    std::memcpy(page + 4, str.data() + offset, len);
-                    offset += len;
-                }
-            };
-
-            auto copy_long_string_pages = [&](int32_t start_page_idx) {
-                int32_t curr_idx = start_page_idx;
-                while (true) {
-                    auto *src_page_data = src_col.pages[curr_idx]->data;
-                    auto *dest_page_data = local_col.new_page()->data;
-                    std::memcpy(dest_page_data, src_page_data, PAGE_SIZE);
-
-                    curr_idx++;
-                    if (curr_idx >= static_cast<int32_t>(src_col.pages.size()))
-                        break;
-                    auto *next_p = src_col.pages[curr_idx]->data;
-                    if (*reinterpret_cast<uint16_t *>(next_p) != 0xfffe)
-                        break;
-                }
-            };
-
-            auto save_page = [&]() {
-                flush_bitmap();
+        auto save_long_string_buffer = [&](const std::string &str) {
+            size_t offset = 0;
+            bool first_page = true;
+            while (offset < str.size()) {
                 auto *page = local_col.new_page()->data;
-                *reinterpret_cast<uint16_t *>(page) = num_rows;
+                *reinterpret_cast<uint16_t *>(page) =
+                    first_page ? 0xffff : 0xfffe;
+                first_page = false;
+                size_t len = std::min(str.size() - offset, PAGE_SIZE - 4);
                 *reinterpret_cast<uint16_t *>(page + 2) =
-                    static_cast<uint16_t>(offsets.size());
-                std::memcpy(page + 4, offsets.data(), offsets.size() * 2);
-                std::memcpy(page + 4 + offsets.size() * 2, char_data.data(),
-                            current_char_size);
-                std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                            bitmap.size());
-                num_rows = 0;
-                current_char_size = 0;
-                offsets.clear();
-                bitmap.clear();
-                pending_bits = 0;
-                bit_count = 0;
-            };
+                    static_cast<uint16_t>(len);
+                std::memcpy(page + 4, str.data() + offset, len);
+                offset += len;
+            }
+        };
 
-            auto add_normal_string =
-                [&](int32_t page_idx, int32_t offset_idx) -> bool {
-                auto [str_ptr, str_len] =
-                    get_string_view(src_col, page_idx, offset_idx);
+        auto copy_long_string_pages = [&](int32_t start_page_idx) {
+            int32_t curr_idx = start_page_idx;
+            while (true) {
+                auto *src_page_data = src_col.pages[curr_idx]->data;
+                auto *dest_page_data = local_col.new_page()->data;
+                std::memcpy(dest_page_data, src_page_data, PAGE_SIZE);
 
-                if (str_len > PAGE_SIZE - 7) {
-                    if (num_rows > 0)
-                        save_page();
-                    save_long_string_buffer(std::string(str_ptr, str_len));
-                    return false;
-                }
+                curr_idx++;
+                if (curr_idx >= static_cast<int32_t>(src_col.pages.size()))
+                    break;
+                auto *next_p = src_col.pages[curr_idx]->data;
+                if (*reinterpret_cast<uint16_t *>(next_p) != 0xfffe)
+                    break;
+            }
+        };
 
-                size_t needed = 4 + (offsets.size() + 1) * 2 +
-                                (current_char_size + str_len) +
-                                (bitmap.size() + 2);
-                if (needed > PAGE_SIZE)
+        size_t rows_since_check = 0;
+
+        auto save_page = [&]() {
+            bm_builder.flush();
+            auto *page = local_col.new_page()->data;
+            *reinterpret_cast<uint16_t *>(page) = num_rows;
+            *reinterpret_cast<uint16_t *>(page + 2) =
+                static_cast<uint16_t>(offsets.size());
+            std::memcpy(page + 4, offsets.data(), offsets.size() * 2);
+            std::memcpy(page + 4 + offsets.size() * 2, char_data.data(),
+                        current_char_size);
+            std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
+                        bitmap.size());
+            num_rows = 0;
+            current_char_size = 0;
+            offsets.clear();
+            bitmap.clear();
+            bm_builder.reset();
+            rows_since_check = 0;
+        };
+
+        auto add_normal_string =
+            [&](int32_t page_idx, int32_t offset_idx) -> bool {
+            auto [str_ptr, str_len] =
+                get_string_view(src_col, page_idx, offset_idx);
+
+            if (str_len > PAGE_SIZE - 7) {
+                if (num_rows > 0)
                     save_page();
+                save_long_string_buffer(std::string(str_ptr, str_len));
+                return false;
+            }
 
-                if (current_char_size + str_len > char_data.size()) {
-                    char_data.resize(std::max(char_data.size() * 2,
-                                              current_char_size + str_len +
-                                                  4096));
-                }
+            size_t needed = 4 + (offsets.size() + 1) * 2 +
+                            (current_char_size + str_len) +
+                            (bitmap.size() + 2);
+            if (needed > PAGE_SIZE)
+                save_page();
 
-                std::memcpy(char_data.data() + current_char_size, str_ptr,
-                            str_len);
-                current_char_size += str_len;
-                offsets.emplace_back(current_char_size);
-                return true;
-            };
+            if (current_char_size + str_len > char_data.size()) {
+                char_data.resize(std::max(char_data.size() * 2,
+                                          current_char_size + str_len + 4096));
+            }
 
-            auto run_loop = [&](auto get_row_id) {
-                for (size_t i = start; i < end; ++i) {
-                    uint32_t row_id = get_row_id(matches_ptr[i]);
-                    mema::value_t val = read_value(row_id);
+            std::memcpy(char_data.data() + current_char_size, str_ptr, str_len);
+            current_char_size += str_len;
+            offsets.push_back(current_char_size);  // no emplace
+            return true;
+        };
 
-                    if (val.is_null()) {
+        auto run_loop = [&](auto get_row_id) {
+            for (size_t i = start; i < end; ++i) {
+                uint32_t row_id = get_row_id(matches_ptr[i]);
+                mema::value_t val = read_value(row_id);
+
+                if (val.is_null()) {
+                    /* reduce overflow checks for nulls */
+                    if (rows_since_check >= MIN_ROWS_PER_PAGE) {
                         if (4 + offsets.size() * 2 + current_char_size +
-                                (bitmap.size() + 2) >
-                            PAGE_SIZE) {
+                                (bitmap.size() + 2) > PAGE_SIZE) {
                             save_page();
                         }
-                        bit_count++;
-                        if (bit_count == 8) {
-                            bitmap.push_back(pending_bits);
-                            pending_bits = 0;
-                            bit_count = 0;
-                        }
-                        num_rows++;
-                    } else {
-                        int32_t page_idx, offset_idx;
-                        mema::value_t::decode_string(val.value, page_idx,
-                                                      offset_idx);
+                        rows_since_check = 0;
+                    }
+                    bm_builder.add_bit(false);
+                    num_rows++;
+                    rows_since_check++;
+                } else {
+                    int32_t page_idx, offset_idx;
+                    mema::value_t::decode_string(val.value, page_idx,
+                                                  offset_idx);
 
-                        if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
-                            if (num_rows > 0)
-                                save_page();
-                            copy_long_string_pages(page_idx);
-                        } else {
-                            if (add_normal_string(page_idx, offset_idx)) {
-                                pending_bits |= (1u << bit_count);
-                                bit_count++;
-                                if (bit_count == 8) {
-                                    bitmap.push_back(pending_bits);
-                                    pending_bits = 0;
-                                    bit_count = 0;
-                                }
-                                num_rows++;
-                            }
+                    if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
+                        if (num_rows > 0)
+                            save_page();
+                        copy_long_string_pages(page_idx);
+                        rows_since_check = 0;
+                    } else {
+                        if (add_normal_string(page_idx, offset_idx)) {
+                            bm_builder.add_bit(true);
+                            num_rows++;
+                            rows_since_check++;
                         }
                     }
                 }
-            };
-
-            if (from_build) {
-                run_loop([](uint64_t m) {
-                    return static_cast<uint32_t>(m & 0xFFFFFFFF);
-                });
-            } else {
-                run_loop(
-                    [](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
             }
+        };
 
-            if (num_rows != 0)
-                save_page();
-        });
-    }
+        if (from_build) {
+            run_loop(
+                [](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
+        } else {
+            run_loop(
+                [](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+        }
 
-    for (auto &w : workers) {
-        w.join();
-    }
+        if (num_rows != 0)
+            save_page();
+    });
 
     /* merge phase: move pages from thread-local columns to dest_col */
     for (auto &thread_col : thread_columns) {
@@ -641,6 +439,10 @@ inline void materialize_varchar_column(Column &dest_col,
         }
         thread_col.pages.clear();
     }
+
+    /* assign mapped memory so dest_col will munmap on destruction */
+    auto* mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
+    dest_col.assign_mapped_memory(mapped_mem);
 }
 
 /**
@@ -840,17 +642,6 @@ inline ColumnarTable materialize_mixed(
     return result;
 }
 
-inline void ensure_bitmap_size(std::vector<uint8_t> &bitmap, size_t byte_idx) {
-    if (bitmap.size() <= byte_idx) {
-        bitmap.resize(byte_idx + 1, 0);
-    }
-}
-inline void set_bitmap_bit(std::vector<uint8_t> &bitmap, size_t byte_idx,
-                           uint8_t bit_idx) {
-    ensure_bitmap_size(bitmap, byte_idx);
-    bitmap[byte_idx] |= (1u << bit_idx);
-}
-
 /**
  *
  *  materializes final ColumnarTable from column_t intermediate inputs
@@ -889,45 +680,108 @@ inline ColumnarTable materialize_from_intermediate(
         Column &dest_col = result.columns.back();
 
         if (data_type == DataType::INT32) {
-            uint16_t num_rows = 0;
-            std::vector<int32_t> data;
-            std::vector<uint8_t> bitmap;
-            data.reserve(2048);
-            bitmap.reserve(256);
+            constexpr int num_threads = SPC__CORE_COUNT;
 
-            auto save_page = [&]() {
-                auto *page = dest_col.new_page()->data;
-                *reinterpret_cast<uint16_t *>(page) = num_rows;
-                *reinterpret_cast<uint16_t *>(page + 2) =
-                    static_cast<uint16_t>(data.size());
-                std::memcpy(page + 4, data.data(), data.size() * 4);
-                std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                            bitmap.size());
-                num_rows = 0;
-                data.clear();
-                bitmap.clear();
-            };
+            /* estimate pages per thread conservatively */
+            size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
+            size_t max_rows_per_page = (PAGE_SIZE - 4 - 256) / 4;
+            size_t pages_per_thread = (matches_per_thread + max_rows_per_page - 1) / max_rows_per_page + 1;
+            size_t total_pages_int32 = pages_per_thread * num_threads;
 
-            for (size_t match_idx = 0; match_idx < total_matches;
-                 ++match_idx) {
-                uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                const mema::value_t &val = (*column)[row_id];
-                if (4 + (!val.is_null() ? data.size() + 1 : data.size()) * 4 +
-                        (num_rows / 8 + 1) >
-                    PAGE_SIZE)
-                    save_page();
-                size_t byte_idx = num_rows / 8;
-                uint8_t bit_idx = num_rows % 8;
-                if (!val.is_null()) {
-                    set_bitmap_bit(bitmap, byte_idx, bit_idx);
-                    data.emplace_back(val.value);
-                } else {
-                    ensure_bitmap_size(bitmap, byte_idx);
-                }
-                ++num_rows;
+            /* batch allocate all pages upfront */
+            void* page_memory_int32 = mmap(nullptr, total_pages_int32 * PAGE_SIZE,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (page_memory_int32 == MAP_FAILED) {
+                throw std::bad_alloc();
             }
-            if (num_rows != 0)
-                save_page();
+
+            std::vector<Column> thread_columns;
+            thread_columns.reserve(num_threads);
+            for (int i = 0; i < num_threads; ++i) {
+                thread_columns.emplace_back(DataType::INT32);
+                /* pre-assign pages to each thread's column */
+                for (size_t p = 0; p < pages_per_thread; ++p) {
+                    size_t page_idx = i * pages_per_thread + p;
+                    Page* page = reinterpret_cast<Page*>(
+                        static_cast<char*>(page_memory_int32) + page_idx * PAGE_SIZE);
+                    thread_columns[i].pages.push_back(page);
+                }
+            }
+
+            worker_pool.execute([&](size_t t, size_t pool_threads) {
+                size_t start = t * total_matches / pool_threads;
+                size_t end = (t + 1) * total_matches / pool_threads;
+                if (start >= total_matches)
+                    return;
+
+                Column &local_col = thread_columns[t];
+                size_t chunk_matches = end - start;
+
+                /* pre-size vectors to exact capacity */
+                uint16_t num_rows = 0;
+                std::vector<int32_t> data;
+                std::vector<uint8_t> bitmap;
+                data.reserve(chunk_matches);  // worst case: all non-null
+                bitmap.reserve((chunk_matches + 7) / 8);  // exact bitmap size
+
+                /* calculate conservative min rows per page to reduce overflow checks */
+                constexpr size_t MIN_ROWS_PER_PAGE = (PAGE_SIZE - 4 - 256) / (4 + 1);
+
+                BitmapBuilder bm_builder(bitmap);
+
+                auto save_page = [&]() {
+                    bm_builder.flush();
+                    auto *page = local_col.new_page()->data;
+                    *reinterpret_cast<uint16_t *>(page) = num_rows;
+                    *reinterpret_cast<uint16_t *>(page + 2) =
+                        static_cast<uint16_t>(data.size());
+                    std::memcpy(page + 4, data.data(), data.size() * 4);
+                    std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
+                                bitmap.size());
+                    num_rows = 0;
+                    data.clear();
+                    bitmap.clear();
+                    bm_builder.reset();
+                };
+
+                size_t rows_since_check = 0;
+                for (size_t match_idx = start; match_idx < end; ++match_idx) {
+                    uint32_t row_id = (matches_ptr[match_idx] >> shift);
+                    const mema::value_t &val = (*column)[row_id];
+
+                    /* check overflow only every MIN_ROWS_PER_PAGE rows */
+                    if (rows_since_check >= MIN_ROWS_PER_PAGE) {
+                        if (4 + (data.size() + 1) * 4 + (bitmap.size() + 2) > PAGE_SIZE) {
+                            save_page();
+                        }
+                        rows_since_check = 0;
+                    }
+
+                    bool is_valid = !val.is_null();
+                    if (is_valid) {
+                        data.push_back(val.value);
+                    }
+                    bm_builder.add_bit(is_valid);
+                    ++num_rows;
+                    ++rows_since_check;
+                }
+
+                if (num_rows != 0)
+                    save_page();
+            });
+
+            /* merge phase: move pages from thread-local columns to dest_col */
+            for (auto &thread_col : thread_columns) {
+                for (auto *page : thread_col.pages) {
+                    dest_col.pages.push_back(page);
+                }
+                thread_col.pages.clear();
+            }
+
+            /* assign mapped memory so dest_col will munmap on destruction */
+            auto* mapped_mem_int32 = new MappedMemory(page_memory_int32, total_pages_int32 * PAGE_SIZE);
+            dest_col.assign_mapped_memory(mapped_mem_int32);
         } else {
             const auto &src_table = plan.inputs[column->source_table];
             const auto &src_col = src_table.columns[column->source_column];

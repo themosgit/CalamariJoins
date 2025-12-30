@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 #include <deque>
-#include <thread>
+#include <worker_pool.h>
 #include <algorithm>
 #include <bloom_tags.h>
 #include <intermediate.h>
@@ -35,6 +35,7 @@ static constexpr size_t L2_CACHE = SPC__LEVEL2_CACHE_SIZE;
 static constexpr size_t CACHE_LINE = SPC__LEVEL1_DCACHE_LINESIZE;
 static constexpr int NUM_CORES = SPC__CORE_COUNT;
 
+using Contest::worker_pool;
 
 class UnchainedHashtable {
 public:
@@ -243,23 +244,18 @@ public:
 
         /* partitions data to every thread based on hash */
         size_t batch = (row_count + num_threads - 1) / num_threads;
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        for (int t = 0; t < num_threads; ++t) {
+        worker_pool.execute([&, partition_bits](size_t t, size_t pool_threads) {
             size_t start = t * batch;
             size_t end = std::min(start + batch, row_count);
-            if (start >= end) continue;
-            workers.emplace_back([&, t, start, end, partition_bits] {
-                const int shift = 64 - partition_bits;
-                for (size_t i = start; i < end; ++i) {
-                    int32_t val = column[i].value;
-                    uint64_t h = hash_key(val);
-                    size_t p = (partition_bits == 0) ? 0 : (h >> shift);
-                    thread_parts[t][p].append(allocators[t], {val, static_cast<uint32_t>(i)});
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+            if (start >= end) return;
+            const int shift = 64 - partition_bits;
+            for (size_t i = start; i < end; ++i) {
+                int32_t val = column[i].value;
+                uint64_t h = hash_key(val);
+                size_t p = (partition_bits == 0) ? 0 : (h >> shift);
+                thread_parts[t][p].append(allocators[t], {val, static_cast<uint32_t>(i)});
+            }
+        });
 
         /* compute offsets partition data from every thread */
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
@@ -276,17 +272,15 @@ public:
         row_ids_.resize(total);
 
         /* accumulates and builds partitions from all threads */
-        workers.clear();
-        workers.reserve(num_threads);
-        for (int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t] {
-                for (size_t p = t; p < num_partitions; p += num_threads) {
-                    build_partition(thread_parts, p, slots_per_partition, global_offsets[p],
-                                    global_offsets[p + 1] - global_offsets[p], num_threads);
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+        const int nt = num_threads;  // Capture for use in build_partition
+        worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
+            for (size_t p = t; p < num_partitions; p += pool_threads) {
+                build_partition(thread_parts, p, slots_per_partition,
+                                global_offsets[p],
+                                global_offsets[p + 1] - global_offsets[p],
+                                nt);
+            }
+        });
     }
 
     /* same for ColumnarTable */
@@ -316,46 +310,40 @@ public:
         for (auto& tp : thread_parts) tp.resize(num_partitions);
 
         size_t batch = (num_pages + num_threads - 1) / num_threads;
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-
-        for (int t = 0; t < num_threads; ++t) {
+        worker_pool.execute([&, partition_bits](size_t t, size_t pool_threads) {
             size_t pg_start = t * batch;
             size_t pg_end = std::min(pg_start + batch, num_pages);
-            if (pg_start >= pg_end) continue;
+            if (pg_start >= pg_end) return;
 
-            workers.emplace_back([&, t, pg_start, pg_end, partition_bits] {
-                const int shift = 64 - partition_bits;
-                for (size_t pg = pg_start; pg < pg_end; ++pg) {
-                    const auto* page = reinterpret_cast<const uint8_t*>(column.pages[pg]->data);
-                    uint16_t n_rows = *reinterpret_cast<const uint16_t*>(page);
-                    uint16_t n_vals = *reinterpret_cast<const uint16_t*>(page + 2);
-                    const int32_t* vals = reinterpret_cast<const int32_t*>(page + 4);
-                    uint32_t base = page_offsets[pg];
+            const int shift = 64 - partition_bits;
+            for (size_t pg = pg_start; pg < pg_end; ++pg) {
+                const auto* page = reinterpret_cast<const uint8_t*>(column.pages[pg]->data);
+                uint16_t n_rows = *reinterpret_cast<const uint16_t*>(page);
+                uint16_t n_vals = *reinterpret_cast<const uint16_t*>(page + 2);
+                const int32_t* vals = reinterpret_cast<const int32_t*>(page + 4);
+                uint32_t base = page_offsets[pg];
 
-                    if (n_rows == n_vals) {
-                        for (uint16_t r = 0; r < n_rows; ++r) {
-                            int32_t val = vals[r];
+                if (n_rows == n_vals) {
+                    for (uint16_t r = 0; r < n_rows; ++r) {
+                        int32_t val = vals[r];
+                        uint64_t h = hash_key(val);
+                        size_t p = (partition_bits == 0) ? 0 : (h >> shift);
+                        thread_parts[t][p].append(allocators[t], {val, base + r});
+                    }
+                } else {
+                    const uint8_t* bitmap = page + PAGE_SIZE - ((n_rows + 7) / 8);
+                    uint16_t vi = 0;
+                    for (uint16_t r = 0; r < n_rows; ++r) {
+                        if (bitmap[r / 8] & (1u << (r % 8))) {
+                            int32_t val = vals[vi++];
                             uint64_t h = hash_key(val);
                             size_t p = (partition_bits == 0) ? 0 : (h >> shift);
                             thread_parts[t][p].append(allocators[t], {val, base + r});
                         }
-                    } else {
-                        const uint8_t* bitmap = page + PAGE_SIZE - ((n_rows + 7) / 8);
-                        uint16_t vi = 0;
-                        for (uint16_t r = 0; r < n_rows; ++r) {
-                            if (bitmap[r / 8] & (1u << (r % 8))) {
-                                int32_t val = vals[vi++];
-                                uint64_t h = hash_key(val);
-                                size_t p = (partition_bits == 0) ? 0 : (h >> shift);
-                                thread_parts[t][p].append(allocators[t], {val, base + r});
-                            }
-                        }
                     }
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
+            }
+        });
 
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
         for (size_t p = 0; p < num_partitions; ++p) {
@@ -370,16 +358,14 @@ public:
         keys_.resize(total);
         row_ids_.resize(total);
 
-        workers.clear();
-        workers.reserve(num_threads);
-        for (int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t] {
-                for (size_t p = t; p < num_partitions; p += num_threads) {
-                    build_partition(thread_parts, p, slots_per_partition, global_offsets[p],
-                                    global_offsets[p + 1] - global_offsets[p], num_threads);
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+        const int nt = num_threads;  // Capture for use in build_partition
+        worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
+            for (size_t p = t; p < num_partitions; p += pool_threads) {
+                build_partition(thread_parts, p, slots_per_partition,
+                                global_offsets[p],
+                                global_offsets[p + 1] - global_offsets[p],
+                                nt);
+            }
+        });
     }
 };
