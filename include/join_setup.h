@@ -158,7 +158,6 @@ inline ExecuteResult initialize_output_columns(
         auto [col_idx, _] = output_attrs[i];
 
         mema::column_t col;
-        col.reserve(estimated_rows);
 
         if (col_idx < left_size) {
             set_column_metadata(col, left_input, left_node, col_idx);
