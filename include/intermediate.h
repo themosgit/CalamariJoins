@@ -35,19 +35,11 @@ struct alignas(4) value_t {
     inline bool is_null() const { return value == NULL_VALUE; }
 };
 
-/* 2048 values * 4 bytes = 8192 bytes = 2 * PAGE_SIZE (typically) */
 /* Ensuring this aligns with system page size is good for mmap */
 constexpr size_t CAP_PER_PAGE = 2048; 
 
-/**
- *
- * column_t: Paged vector storage
- * optimized for parallel construction and random access
- *
- **/
 struct column_t {
   private:
-    /* Align to page size to prevent false sharing and help prefetchers */
     struct alignas(4096) Page {
         value_t data[CAP_PER_PAGE];
     };
@@ -64,7 +56,6 @@ struct column_t {
   public:
     column_t() = default;
 
-    /* Proper move semantics to avoid double-freeing pages */
     column_t(column_t&& other) noexcept 
         : num_values(other.num_values), owns_pages(other.owns_pages), 
           external_memory(std::move(other.external_memory)), 
@@ -93,7 +84,6 @@ struct column_t {
         return *this;
     }
 
-    /* Deleted copy to prevent accidental deep copies of massive columns */
     column_t(const column_t&) = delete;
     column_t& operator=(const column_t&) = delete;
 
@@ -103,10 +93,13 @@ struct column_t {
         }
     }
 
-    /* * Resizes the column to hold `count` elements.
-     * Allocates new pages if necessary. 
-     * Crucial for parallel write_at access.
-     */
+    /**
+     *  
+     *  Resizes the column to hold `count` elements.
+     *  Allocates new pages if necessary. 
+     *  Crucial for parallel write_at access.
+     *
+     **/
     inline void resize(size_t count) {
         size_t current_capacity = pages.size() * CAP_PER_PAGE;
         if (count > current_capacity) {
@@ -120,14 +113,7 @@ struct column_t {
         num_values = count;
     }
 
-    /* * Optimizes division/modulo into bitwise operations 
-     * because CAP_PER_PAGE (2048) is a power of 2.
-     * 2048 = 2^11.
-     * idx / 2048  => idx >> 11
-     * idx % 2048  => idx & 2047
-     */
     inline void append(const value_t &val) {
-        // "Unlikely" check for new page needed
         if ((num_values & (CAP_PER_PAGE - 1)) == 0) {
              pages.push_back(new Page());
         }
@@ -145,11 +131,6 @@ struct column_t {
         return pages[idx >> 11]->data[idx & 0x7FF];
     }
     
-    /* non-const read operator */
-    value_t &operator[](size_t idx) {
-        return pages[idx >> 11]->data[idx & 0x7FF];
-    }
-
     size_t row_count() const { return num_values; }
 
     /* pre-allocate from a contiguous memory block (batch allocation) */
