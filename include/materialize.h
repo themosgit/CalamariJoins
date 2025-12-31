@@ -310,7 +310,6 @@ inline void materialize_column(Column &dest_col,
     auto* mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
     dest_col.assign_mapped_memory(mapped_mem);
 }
-
 /**
  *
  *  materializes final ColumnarTable from mixed inputs

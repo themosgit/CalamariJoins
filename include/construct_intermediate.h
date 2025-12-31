@@ -176,5 +176,4 @@ inline void construct_intermediate(
         }
     });
 }
-
 } // namespace Contest
