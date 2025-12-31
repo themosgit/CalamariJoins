@@ -1386,6 +1386,7 @@ run(const std::unordered_map<std::string, std::vector<std::string>>
         cumulative_stats->hash_join_probe_ms += query_stats.hash_join_probe_ms;
         cumulative_stats->nested_loop_join_ms += query_stats.nested_loop_join_ms;
         cumulative_stats->materialize_ms += query_stats.materialize_ms;
+        cumulative_stats->intermediate_ms += query_stats.intermediate_ms;
         cumulative_stats->setup_ms += query_stats.setup_ms;
         cumulative_stats->total_execution_ms += query_stats.total_execution_ms;
     }
@@ -1532,7 +1533,7 @@ int main(int argc, char *argv[]) {
 
         int64_t accounted = cumulative_stats.hashtable_build_ms + cumulative_stats.hash_join_probe_ms +
                            cumulative_stats.nested_loop_join_ms + cumulative_stats.materialize_ms +
-                           cumulative_stats.setup_ms;
+                           cumulative_stats.setup_ms + cumulative_stats.intermediate_ms;
         int64_t other_overhead = cumulative_stats.total_execution_ms - accounted;
 
         fmt::println("\nCumulative Timings Across All Queries:");
@@ -1541,6 +1542,7 @@ int main(int argc, char *argv[]) {
         fmt::println("  Hash Join Probe Time: {} ms", cumulative_stats.hash_join_probe_ms);
         fmt::println("  Nested Loop Join Time: {} ms", cumulative_stats.nested_loop_join_ms);
         fmt::println("  Materialization Time: {} ms", cumulative_stats.materialize_ms);
+        fmt::println("  Intermediate Time: {} ms", cumulative_stats.intermediate_ms);
         fmt::println("  Setup Time: {} ms", cumulative_stats.setup_ms);
         fmt::println("  Other Overhead: {} ms", other_overhead);
 

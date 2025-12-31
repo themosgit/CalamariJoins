@@ -25,6 +25,7 @@ struct alignas(4) value_t {
 
     static inline void decode_string(int32_t encoded, int32_t &page_idx,
                                      int32_t &offset_idx) {
+
         page_idx = encoded & 0x7FFFF;
         offset_idx = (static_cast<uint32_t>(encoded) >> 19) & 0x1FFF;
     }
@@ -40,7 +41,7 @@ constexpr size_t CAP_PER_PAGE = 2048;
 
 struct column_t {
   private:
-    struct alignas(4096) Page {
+    struct alignas(PAGE_SIZE) Page {
         value_t data[CAP_PER_PAGE];
     };
 
@@ -121,9 +122,14 @@ struct column_t {
         num_values++;
     }
 
-    /* thread-safe random write used by parallel construct_intermediate */
-    inline void write_at(size_t idx, const value_t &val) {
-        pages[idx >> 11]->data[idx & 0x7FF] = val;
+    /* pre-allocate all pages for parallel writing called before spawning threads */
+    inline void pre_allocate(size_t count) {
+        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            pages.push_back(new Page());
+        }
+        num_values = count;
     }
 
     /* read operator */
@@ -147,6 +153,19 @@ struct column_t {
         owns_pages = false;
         external_memory = memory_keeper;
     }
+
+
+
+    /* thread-safe random write to pre-allocated pages */
+    inline void write_at(size_t idx, const value_t &val) {
+        pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE] = val;
+    }
+
+    const value_t &operator[](size_t idx) const {
+        return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
+    }
+
+    size_t row_count() const { return num_values; }
 };
 
 using Columnar = std::vector<column_t>;

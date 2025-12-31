@@ -1,4 +1,6 @@
 #pragma once
+#ifndef HARDWARE_H_INCLUDED
+#define HARDWARE_H_INCLUDED
 
 #include <cstddef>
 #include <cstdint>
@@ -15,10 +17,11 @@
     #include <hardware.h>
 #endif
 
-#if defined(__x86_64__)
-    #include <immintrin.h>
-#elif defined(__aarch64__)
-    #include <arm_acle.h>
+    #if defined(__x86_64__)
+        #include <immintrin.h>
+    #elif defined(__aarch64__)
+        #include <arm_acle.h>
+    #endif
 #endif
 
 /* some systems do not have L3 cache ao L2 is set as LLC */
@@ -206,6 +209,13 @@ public:
     bool empty() const noexcept { return keys_.empty(); }
     const int32_t* keys() const noexcept { return keys_.data(); }
     const uint32_t* row_ids() const noexcept { return row_ids_.data(); }
+    inline void prefetch_bucket(int32_t key) const noexcept {
+        uint64_t h = hash_key(key);
+        size_t slot = slot_for(h);
+        // __builtin_prefetch is supported by GCC/Clang/ICC
+        // 0 = Read, 1 = Low temporal locality (streaming)
+        __builtin_prefetch(static_cast<const void*>(&directory[slot]), 0, 1);
+    }
 
     std::pair<uint64_t, uint64_t> find_indices(int32_t key) const noexcept {
         if (keys_.empty()) return {0, 0};
@@ -269,7 +279,7 @@ public:
         row_ids_.resize(total);
 
         /* accumulates and builds partitions from all threads */
-        const int nt = num_threads;  // Capture for use in build_partition
+        const int nt = num_threads;
         worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
             for (size_t p = t; p < num_partitions; p += pool_threads) {
                 build_partition(thread_parts, p, slots_per_partition,
@@ -355,7 +365,7 @@ public:
         keys_.resize(total);
         row_ids_.resize(total);
 
-        const int nt = num_threads;  // Capture for use in build_partition
+        const int nt = num_threads;
         worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
             for (size_t p = t; p < num_partitions; p += pool_threads) {
                 build_partition(thread_parts, p, slots_per_partition,

@@ -29,9 +29,8 @@
 #define SPC__LEVEL4_CACHE_ASSOC 0
 #define SPC__LEVEL4_CACHE_LINESIZE 0
 
-// Memory and performance characteristics
-#define SPC__PAGE_SIZE 16384 // 16 KB (queried via getconf PAGE_SIZE)
-#define SPC__PREFETCH_DISTANCE 6 // Prefetch 6 cache lines ahead (768 bytes)
-#define SPC__MEMORY_LATENCY_NS 100 // ~100ns main memory latency (typical for M1)
-#define SPC__SIMD_WIDTH 16 // 16 bytes (128-bit NEON registers)
-#define SPC__HAS_LSE // ARM Large System Extensions (hw.optional.armv8_1_atomics: 1)
+#define SPC__PAGE_SIZE 16384
+#define SPC__PREFETCH_DISTANCE 6
+#define SPC__MEMORY_LATENCY_NS 100
+#define SPC__SIMD_WIDTH 16
+#define SPC__HAS_LSE
