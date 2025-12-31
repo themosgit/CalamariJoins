@@ -73,11 +73,11 @@ def save_results(executable, results, timestamp, arch, results_dir):
     print(f"  Results saved to {filepath}")
 
 def main():
-    executables = ['faster']
+    executables = ['parallel-probe']
     project_dir = '.'
     iterations = 10
 
-    RESULTS_DIR = '../project-site/benchmark_results/part2'
+    RESULTS_DIR = '../project-site/benchmark_results/part3'
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     num_cores = str(multiprocessing.cpu_count())

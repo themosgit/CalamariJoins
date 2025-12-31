@@ -61,8 +61,6 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     set(SKIP_EXTENSIONS jemalloc)
 endif()
 
-# Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
-# Try re-running cmake in case changes are not recognized.
 file(GLOB ALL_SRC
     CONFIGURE_DEPENDS
     "src/*.cpp"
@@ -89,18 +87,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_include_directories(faster PRIVATE include)
 endif()
 
-# OPTIONAL
-# For unit_tests, use more portable CPU flags to avoid "Illegal instruction" errors
-# Use native architecture to match the build machine's CPU capabilities
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
-    # Keep ARM settings as is for unit_tests
-    target_compile_options(unit_tests PRIVATE -O3 -mcpu=native -flto)
+    target_compile_options(unit_tests PRIVATE -O3 -mcpu=apple-m1 -flto)
 else()
-    # Override the global znver4 flag for unit_tests with native CPU detection
-    # This ensures unit_tests work on the machine they're compiled on
     target_compile_options(unit_tests PRIVATE -O3 -march=native -m64 -fpermissive -flto)
 endif()
-# END OPTIONAL
 
 target_compile_definitions(unit_tests PRIVATE)
 target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain)
