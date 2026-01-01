@@ -159,7 +159,7 @@ struct VarcharPageBuilder {
 
         auto [str_ptr, str_len] = get_string_view(src_col, page_idx, offset_idx);
 
-        if (str_len > PAGE_SIZE - 16) {
+        if (str_len > PAGE_SIZE - 512) {
             if (num_rows > 0) flush_current_page();
             save_long_string_buffer(str_ptr, str_len);
             return true;

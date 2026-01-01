@@ -133,7 +133,7 @@ struct column_t {
     }
 
     /* read operator */
-    const value_t &operator[](size_t idx) const {
+    inline const value_t &operator[](size_t idx) const {
         return pages[idx >> 11]->data[idx & 0x7FF];
     }
     
@@ -154,18 +154,10 @@ struct column_t {
         external_memory = memory_keeper;
     }
 
-
-
     /* thread-safe random write to pre-allocated pages */
     inline void write_at(size_t idx, const value_t &val) {
-        pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE] = val;
+        pages[idx >> 11]->data[idx % CAP_PER_PAGE] = val;
     }
-
-    const value_t &operator[](size_t idx) const {
-        return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
-    }
-
-    size_t row_count() const { return num_values; }
 };
 
 using Columnar = std::vector<column_t>;
