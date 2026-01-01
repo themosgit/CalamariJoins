@@ -21,7 +21,7 @@ private:
 public:
     BatchAllocator() = default;
     void allocate(size_t total_pages) {
-        total_size = total_pages * PAGE_SIZE;
+        total_size = total_pages * mema::IR_PAGE_SIZE;
         memory_block = mmap(nullptr, total_size,
                            PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -73,7 +73,7 @@ inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
     }
     
     size_t total_bytes = total_chunks * mema::CAP_PER_PAGE * sizeof(mema::value_t);
-    size_t system_pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    size_t system_pages = (total_bytes + mema::IR_PAGE_SIZE - 1) / mema::IR_PAGE_SIZE;
     auto allocator = std::make_shared<BatchAllocator>();
     allocator->allocate(system_pages);
     void* block = allocator->get_block();

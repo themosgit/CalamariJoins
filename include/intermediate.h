@@ -36,12 +36,16 @@ struct alignas(4) value_t {
     inline bool is_null() const { return value == NULL_VALUE; }
 };
 
+constexpr size_t IR_PAGE_SIZE = 1 << 15;
+
 /* Ensuring this aligns with system page size is good for mmap */
-constexpr size_t CAP_PER_PAGE = 2048; 
+constexpr size_t CAP_PER_PAGE = IR_PAGE_SIZE / sizeof(value_t); 
+
+
 
 struct column_t {
   private:
-    struct alignas(PAGE_SIZE) Page {
+    struct alignas(IR_PAGE_SIZE) Page {
         value_t data[CAP_PER_PAGE];
     };
 
@@ -134,7 +138,7 @@ struct column_t {
 
     /* read operator */
     inline const value_t &operator[](size_t idx) const {
-        return pages[idx >> 11]->data[idx & 0x7FF];
+        return pages[idx >> 13]->data[idx & 0x1FFF];
     }
     
     size_t row_count() const { return num_values; }
@@ -156,7 +160,7 @@ struct column_t {
 
     /* thread-safe random write to pre-allocated pages */
     inline void write_at(size_t idx, const value_t &val) {
-        pages[idx >> 11]->data[idx % CAP_PER_PAGE] = val;
+        pages[idx >> 13]->data[idx % CAP_PER_PAGE] = val;
     }
 };
 
