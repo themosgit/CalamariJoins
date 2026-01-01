@@ -116,6 +116,13 @@ class ColumnarReader {
         uint32_t cached_start = 0;
         uint32_t cached_end = 0;
         uint64_t version = 0;
+
+        const int32_t* data_ptr = nullptr;
+        const uint8_t* bitmap_ptr = nullptr;
+        const uint32_t* prefix_sum_ptr = nullptr;
+        int32_t page_idx_val = 0;
+        bool is_dense = false;
+        bool is_special = false;
     };
 
     inline void prepare_build(const std::vector<const Column *> &columns) {
@@ -155,29 +162,56 @@ class ColumnarReader {
                        col_idx == cursor.cached_col && 
                        row_id >= cursor.cached_start &&
                        row_id < cursor.cached_end)) {
-            
-            const auto& indices = IsBuild ? build_page_indices : probe_page_indices;
-            return read_from_page(column, indices[col_idx],
-                                  cursor.cached_page,
-                                  row_id - cursor.cached_start, data_type);
+            uint32_t local_row = row_id - cursor.cached_start;
+            if (SPC_LIKELY(cursor.is_dense)) {
+                if (data_type == DataType::INT32) {
+                    return mema::value_t{cursor.data_ptr[local_row]};
+                } else {
+                    return mema::value_t::encode_string(cursor.page_idx_val,static_cast<int32_t>(local_row));
+                }
+            }
+            if (SPC_UNLIKELY(cursor.is_special)) {
+                return mema::value_t::encode_string(cursor.page_idx_val, mema::value_t::LONG_STRING_OFFSET);
+            }
+
+            return  read_sparse(local_row, data_type, cursor);
         }
+        return read_value_slow<IsBuild>(column, col_idx, row_id, data_type, cursor, current_version);
+
+    }
+
+    template <bool IsBuild>
+    inline mema::value_t read_value_slow(const Column &column, size_t col_idx,
+            uint32_t row_id, DataType data_type,
+            Cursor &cursor, uint64_t current_version) const {
 
         /* slow path: cache miss / version mismatch */
         const PageIndex &page_index = IsBuild ? build_page_indices[col_idx] 
                                               : probe_page_indices[col_idx];
         
         size_t page_num = page_index.find_page(row_id);
-        uint32_t page_start = page_index.page_start_row(page_num);
-        uint32_t page_end = page_index.cumulative_rows[page_num];
 
         cursor.version = current_version;
         cursor.cached_col = col_idx;
         cursor.cached_page = page_num;
-        cursor.cached_start = page_start;
-        cursor.cached_end = page_end;
+        cursor.cached_start = page_index.page_start_row(page_num);
+        cursor.cached_end = page_index.cumulative_rows[page_num];
+        cursor.page_idx_val = static_cast<int32_t>(page_num);
 
-        return read_from_page(column, page_index, page_num, row_id - page_start,
-                              data_type);
+        auto *page_data = column.pages[page_num]->data;
+        auto num_rows = *reinterpret_cast<const uint16_t*>(page_data);
+        auto num_values = *reinterpret_cast<const uint16_t*>(page_data + 2);
+
+        cursor.is_special = (num_rows == 0xffff);
+        cursor.is_dense = (num_rows == num_values);
+        cursor.data_ptr = reinterpret_cast<const int32_t*>(page_data + 4);
+
+        if (!cursor.is_dense && !cursor.is_special) {
+            size_t bitmap_size = (num_rows + 7) / 8;
+            cursor.bitmap_ptr = reinterpret_cast<const uint8_t*>(page_data + PAGE_SIZE - bitmap_size);
+            cursor.prefix_sum_ptr = page_index.page_prefix_sums[page_num].data();
+        }
+        return read_value_internal<IsBuild>(column, col_idx, row_id, data_type, cursor);
     }
 
     inline mema::value_t read_value_build(const Column &column, size_t col_idx,
@@ -199,70 +233,26 @@ class ColumnarReader {
     }
 
   private:
-    inline mema::value_t read_from_page(const Column &column,
-                                        const PageIndex &page_index,
-                                        size_t page_num, uint32_t local_row,
-                                        DataType data_type) const {
-        auto *page = column.pages[page_num]->data;
-        auto num_rows = *reinterpret_cast<const uint16_t *>(page);
-        auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
 
-        /* check for long string continuation */
-        if (SPC_UNLIKELY(num_rows == 0xffff)) {
-            return mema::value_t::encode_string(
-                static_cast<int32_t>(page_num), mema::value_t::LONG_STRING_OFFSET);
-        }
+    inline mema::value_t read_sparse(uint32_t local_row, DataType data_type, const Cursor& cursor) const {
+        bool is_valid = cursor.bitmap_ptr[local_row >> 3] & (1u << (local_row & 7));
 
-        auto *data_begin = reinterpret_cast<const int32_t *>(page + 4);
+        if (!is_valid) return mema::value_t{mema::value_t::NULL_VALUE};
 
-        /* dense page optimization (no nulls) */
-        if (SPC_LIKELY(num_rows == num_values)) {
-            if (data_type == DataType::INT32) {
-                return mema::value_t{data_begin[local_row]};
-            } else {
-                return mema::value_t::encode_string(static_cast<int32_t>(page_num), 
-                                                    static_cast<int32_t>(local_row));
-            }
-        } 
-        
-        /* sparse page handling */
-        size_t bitmap_size = (num_rows + 7) / 8;
-        auto *bitmap = reinterpret_cast<const uint8_t *>(
-            page + PAGE_SIZE - bitmap_size);
-        
-        bool is_valid = bitmap[local_row >> 3] & (1u << (local_row & 7));
-
-        if (!is_valid) {
-            return mema::value_t{mema::value_t::NULL_VALUE};
-        }
-
-        const auto &prefix_sums = page_index.page_prefix_sums[page_num];
         size_t chunk_idx = local_row >> 6;
         size_t bit_offset = local_row & 0x3F;
+        uint16_t data_idx = cursor.prefix_sum_ptr[chunk_idx];
 
-        uint16_t data_idx = prefix_sums[chunk_idx];
-
-        uint64_t word = 0;
-        size_t offset = chunk_idx * 8;
-        size_t remaining = bitmap_size > offset ? bitmap_size - offset : 0;
-        size_t bytes_to_read = std::min(remaining, size_t(8));
-
-        if (bytes_to_read > 0) {
-            std::memcpy(&word, bitmap + offset, bytes_to_read);
-        }
-        
-        /* create mask for bits preceding current position */
-        uint64_t mask = (1ULL << bit_offset) - 1;
-        data_idx += __builtin_popcountll(word & mask);
+        uint64_t word;
+        std::memcpy(&word, cursor.bitmap_ptr + (chunk_idx * 8), 8);
+        data_idx += __builtin_popcountll(word & ((1ULL << bit_offset) - 1));
 
         if (data_type == DataType::INT32) {
-            return mema::value_t{data_begin[data_idx]};
+            return mema::value_t{cursor.data_ptr[data_idx]};
         } else {
-            return mema::value_t::encode_string(static_cast<int32_t>(page_num), 
-                                                static_cast<int32_t>(data_idx));
+            return mema::value_t::encode_string(cursor.page_idx_val, static_cast<int32_t>(data_idx));
         }
     }
-
     std::vector<PageIndex> build_page_indices;
     std::vector<PageIndex> probe_page_indices;
 };
