@@ -133,8 +133,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
         auto nested_loop_start = std::chrono::high_resolution_clock::now();
 
         nested_loop_join(build_input, probe_input, config.build_attr,
-                              config.probe_attr, setup.columnar_reader,
-                              collector);
+                              config.probe_attr, collector);
         auto nested_loop_end = std::chrono::high_resolution_clock::now();
         auto nested_loop_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(nested_loop_end - nested_loop_start);
         stats.nested_loop_join_ms += nested_loop_elapsed.count();
