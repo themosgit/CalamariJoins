@@ -325,6 +325,8 @@ inline void materialize_column(Column &dest_col,
         size_t thread_page_limit = pages_per_thread;
         size_t used_pages = 0;
 
+        ColumnarReader::Cursor cursor;
+
         auto page_allocator = [&]() -> Page* {
             Page* p;
             if (used_pages < thread_page_limit) {
@@ -352,7 +354,7 @@ inline void materialize_column(Column &dest_col,
         for (size_t i = start; i < end; ++i) {
             uint32_t row_id = get_row_id(matches_ptr[i]);
             
-            bool flushed = builder.add(read_value(row_id));
+            bool flushed = builder.add(read_value(row_id, cursor));
             
             if (flushed) {
                 rows_since_check = 0;
@@ -427,11 +429,11 @@ inline ColumnarTable materialize(
         }
 
         if (data_type == DataType::INT32) {
-            auto reader = [&](uint32_t rid) {
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 if (col_source) {
                      return from_build 
-                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::INT32)
-                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::INT32);
+                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::INT32, cursor)
+                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::INT32, cursor);
                 }
                 return (*inter_source)[rid];
             };
@@ -448,11 +450,11 @@ inline ColumnarTable materialize(
                                    .columns[inter_source->source_column];
             }
 
-            auto reader = [&](uint32_t rid) {
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor & cursor) {
                 if (col_source) {
                     return from_build
-                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::VARCHAR)
-                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::VARCHAR);
+                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::VARCHAR, cursor)
+                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::VARCHAR, cursor);
                 }
                 return (*inter_source)[rid];
             };

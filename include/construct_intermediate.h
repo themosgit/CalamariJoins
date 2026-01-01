@@ -144,6 +144,8 @@ inline void construct_intermediate(
     auto allocator = batch_allocate_for_results(results, total_matches);
 
     worker_pool.execute([&](size_t t, size_t num_threads) {
+
+        Contest::ColumnarReader::Cursor cursor;
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
@@ -156,13 +158,13 @@ inline void construct_intermediate(
                     for (size_t k = start; k < end; ++k) {
                         uint32_t rid = static_cast<uint32_t>(matches_ptr[k]);
                         dest_col.write_at(k, columnar_reader.read_value_build(
-                            col, src.remapped_col_idx, rid, col.type));
+                            col, src.remapped_col_idx, rid, col.type, cursor));
                     }
                 } else {
                     for (size_t k = start; k < end; ++k) {
                         uint32_t rid = static_cast<uint32_t>(matches_ptr[k] >> 32);
                         dest_col.write_at(k, columnar_reader.read_value_probe(
-                            col, src.remapped_col_idx, rid, col.type));
+                            col, src.remapped_col_idx, rid, col.type, cursor));
                     }
                 }
             } else {

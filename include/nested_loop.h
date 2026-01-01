@@ -8,9 +8,8 @@
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
-#include <atomic>
-#include "worker_pool.h"
-#include "match_collector.h"
+#include <worker_pool.h>
+#include <match_collector.h>
 
 namespace Contest {
 

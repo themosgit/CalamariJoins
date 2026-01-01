@@ -1,7 +1,9 @@
 #pragma once
 
+#include "attribute.h"
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <intermediate.h>
 #include <plan.h>
 #include <vector>
@@ -108,6 +110,14 @@ class ColumnarReader {
   public:
     ColumnarReader() = default;
 
+    struct Cursor {
+        size_t cached_col = ~0u;
+        size_t cached_page = ~0u;
+        uint32_t cached_start = 0;
+        uint32_t cached_end = 0;
+        uint64_t version = 0;
+    };
+
     inline void prepare_build(const std::vector<const Column *> &columns) {
         build_page_indices.clear();
         build_page_indices.reserve(columns.size());
@@ -132,13 +142,7 @@ class ColumnarReader {
 
     template <bool IsBuild>
     inline mema::value_t read_value_internal(const Column &column, size_t col_idx,
-                                             uint32_t row_id, DataType data_type) const {
-        /* thread-local cache */
-        thread_local size_t tl_cached_col = ~0u;
-        thread_local size_t tl_cached_page = ~0u;
-        thread_local uint32_t tl_cached_start = 0;
-        thread_local uint32_t tl_cached_end = 0;
-        thread_local uint64_t tl_version = 0;
+            uint32_t row_id, DataType data_type, Cursor &cursor) const {
 
         uint64_t current_version;
         if constexpr (IsBuild) {
@@ -147,15 +151,15 @@ class ColumnarReader {
             current_version = global_probe_version.load(std::memory_order_relaxed);
         }
 
-        if (SPC_LIKELY(tl_version == current_version &&
-                       col_idx == tl_cached_col && 
-                       row_id >= tl_cached_start &&
-                       row_id < tl_cached_end)) {
+        if (SPC_LIKELY(cursor.version == current_version &&
+                       col_idx == cursor.cached_col && 
+                       row_id >= cursor.cached_start &&
+                       row_id < cursor.cached_end)) {
             
             const auto& indices = IsBuild ? build_page_indices : probe_page_indices;
             return read_from_page(column, indices[col_idx],
-                                  tl_cached_page,
-                                  row_id - tl_cached_start, data_type);
+                                  cursor.cached_page,
+                                  row_id - cursor.cached_start, data_type);
         }
 
         /* slow path: cache miss / version mismatch */
@@ -166,24 +170,24 @@ class ColumnarReader {
         uint32_t page_start = page_index.page_start_row(page_num);
         uint32_t page_end = page_index.cumulative_rows[page_num];
 
-        tl_version = current_version;
-        tl_cached_col = col_idx;
-        tl_cached_page = page_num;
-        tl_cached_start = page_start;
-        tl_cached_end = page_end;
+        cursor.version = current_version;
+        cursor.cached_col = col_idx;
+        cursor.cached_page = page_num;
+        cursor.cached_start = page_start;
+        cursor.cached_end = page_end;
 
         return read_from_page(column, page_index, page_num, row_id - page_start,
                               data_type);
     }
 
     inline mema::value_t read_value_build(const Column &column, size_t col_idx,
-                                          uint32_t row_id, DataType data_type) const {
-        return read_value_internal<true>(column, col_idx, row_id, data_type);
+                                          uint32_t row_id, DataType data_type, Cursor &cursor) const {
+        return read_value_internal<true>(column, col_idx, row_id, data_type, cursor);
     }
 
     inline mema::value_t read_value_probe(const Column &column, size_t col_idx,
-                                          uint32_t row_id, DataType data_type) const {
-        return read_value_internal<false>(column, col_idx, row_id, data_type);
+                                          uint32_t row_id, DataType data_type, Cursor &cursor) const {
+        return read_value_internal<false>(column, col_idx, row_id, data_type, cursor);
     }
 
     inline const PageIndex &get_build_page_index(size_t col_idx) const {
