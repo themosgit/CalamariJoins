@@ -87,22 +87,6 @@ inline UnchainedHashtable build_from_intermediate_parallel(const JoinInput &inpu
 
 /**
  *
- *  merges thread-local match collectors into global collector
- *  single-threaded aggregation after parallel probing phase
- *  appends all local matches sequentially
- *
- **/
-
-inline void merge_local_collectors(
-    std::vector<ThreadLocalMatchBuffer>& local_buffers,
-    MatchCollector& global_collector) {
-    for(auto& buf : local_buffers){
-        global_collector.merge_thread_buffer(buf);
-    }
-}
-
-/**
- *
  *  parallel probing of hash table with intermediate column_t input using work stealing
  *  each thread processes pages via atomic counter for dynamic load balancing
  *  leverages fixed-size pages for simple row offset calculation

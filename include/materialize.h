@@ -283,6 +283,7 @@ private:
  *  handles mmap allocation, threading, and merging logic
  *
  **/
+
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
 inline void materialize_column(Column &dest_col,
                                         const MatchCollector &collector,
@@ -292,9 +293,8 @@ inline void materialize_column(Column &dest_col,
                                         size_t est_bytes_per_row) {
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
-    const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
-    const uint64_t *matches_ptr = matches_vec.data();
-
+    
+    const_cast<MatchCollector&>(collector).ensure_finalized();
     constexpr int num_threads = SPC__CORE_COUNT;
 
     size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
@@ -318,6 +318,8 @@ inline void materialize_column(Column &dest_col,
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
+
+        auto stream = collector.get_stream(start);
 
         Column &local_col = thread_columns[t];
         
@@ -352,7 +354,8 @@ inline void materialize_column(Column &dest_col,
         };
 
         for (size_t i = start; i < end; ++i) {
-            uint32_t row_id = get_row_id(matches_ptr[i]);
+            uint64_t match = stream.next();
+            uint32_t row_id = get_row_id(match);
             
             bool flushed = builder.add(read_value(row_id, cursor));
             
@@ -385,6 +388,7 @@ inline void materialize_column(Column &dest_col,
     auto* mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
     dest_col.assign_mapped_memory(mapped_mem);
 }
+
 /**
  *
  *  materializes final ColumnarTable from mixed inputs

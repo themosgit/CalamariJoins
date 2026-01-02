@@ -136,8 +136,7 @@ inline void construct_intermediate(
     ColumnarReader &columnar_reader, ExecuteResult &results) {
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
-    const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
-    const uint64_t *matches_ptr = matches_vec.data();
+    const_cast<MatchCollector&>(collector).ensure_finalized();
 
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
@@ -149,20 +148,23 @@ inline void construct_intermediate(
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
+        
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto& src = sources[i];
             auto& dest_col = results[i];
+            
+            auto stream = collector.get_stream(start);
             if (src.is_columnar) {
                 const auto& col = *src.columnar_col;
                 if (src.from_build) {
                     for (size_t k = start; k < end; ++k) {
-                        uint32_t rid = static_cast<uint32_t>(matches_ptr[k]);
+                        uint32_t rid = static_cast<uint32_t>(stream.next());
                         dest_col.write_at(k, columnar_reader.read_value_build(
                             col, src.remapped_col_idx, rid, col.type, cursor));
                     }
                 } else {
                     for (size_t k = start; k < end; ++k) {
-                        uint32_t rid = static_cast<uint32_t>(matches_ptr[k] >> 32);
+                        uint32_t rid = static_cast<uint32_t>(stream.next() >> 32);
                         dest_col.write_at(k, columnar_reader.read_value_probe(
                             col, src.remapped_col_idx, rid, col.type, cursor));
                     }
@@ -171,7 +173,7 @@ inline void construct_intermediate(
                 const auto& vec = *src.intermediate_col;
                 uint32_t shift = src.shift;
                 for (size_t k = start; k < end; ++k) {
-                    uint32_t rid = static_cast<uint32_t>(matches_ptr[k] >> shift);
+                    uint32_t rid = static_cast<uint32_t>(stream.next() >> shift);
                     dest_col.write_at(k, vec[rid]);
                 }
             }
