@@ -295,7 +295,7 @@ inline void materialize_column(Column &dest_col,
     if (total_matches == 0) return;
     
     const_cast<MatchCollector&>(collector).ensure_finalized();
-    constexpr int num_threads = SPC__CORE_COUNT;
+    constexpr int num_threads = worker_pool.thread_count();
 
     size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
     size_t usable_per_page = PAGE_SIZE - 256; 
