@@ -101,14 +101,13 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
     const auto* row_ids = hash_table.row_ids();
 
     size_t pool_size = worker_pool.thread_count();
-    // Use the new ThreadLocalMatchBuffer
     std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
     
     const size_t num_pages = probe_column.pages.size();
     const size_t probe_count = probe_column.row_count();
     std::atomic<size_t> page_counter(0);
 
-    worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+    worker_pool.execute([&](size_t thread_id) {
         auto& local_buf = local_buffers[thread_id];
         
         while(true){
@@ -166,7 +165,7 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
     std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
 
     std::atomic<size_t> page_counter(0);
-    worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+    worker_pool.execute([&](size_t thread_id) {
         auto& local_buf = local_buffers[thread_id];
 
         while(true){

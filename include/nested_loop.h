@@ -88,7 +88,7 @@ inline void nested_loop_join(const JoinInput &build_input,
     }
     std::atomic<size_t> probe_page_counter{0};
 
-    worker_pool.execute([&](size_t t_id, size_t total_threads) {
+    worker_pool.execute([&](size_t t_id) {
         auto &local_buffer = buffers[t_id];
 
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
@@ -130,8 +130,8 @@ inline void nested_loop_join(const JoinInput &build_input,
             const auto &res = std::get<ExecuteResult>(probe_input.data);
             const mema::column_t &col = res[probe_attr];
             size_t count = col.row_count();
-            size_t start = (t_id * count) / total_threads;
-            size_t end = ((t_id + 1) * count) / total_threads;
+            size_t start = (t_id * count) / worker_pool.thread_count();
+            size_t end = ((t_id + 1) * count) / worker_pool.thread_count();
 
             for (size_t i = start; i < end; i++) {
                 const mema::value_t &val = col[i];

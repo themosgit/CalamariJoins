@@ -42,12 +42,6 @@ public:
 
 using ExecuteResult = std::vector<mema::column_t>;
 
-/**
- *
- *  pre-resolved source information for a result column
- *  eliminates repetitive lookup logic inside parallel loops
- *
- **/
 struct SourceInfo {
     const mema::column_t* intermediate_col = nullptr;
     const Column* columnar_col = nullptr;
@@ -142,9 +136,9 @@ inline void construct_intermediate(
                                    build_node, probe_node, build_size);
     auto allocator = batch_allocate_for_results(results, total_matches);
 
-    worker_pool.execute([&](size_t t, size_t num_threads) {
-
+    worker_pool.execute([&](size_t t) {
         Contest::ColumnarReader::Cursor cursor;
+        size_t num_threads = worker_pool.thread_count();
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;

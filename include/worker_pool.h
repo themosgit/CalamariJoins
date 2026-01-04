@@ -9,7 +9,6 @@
 #include <common.h>
 #include <condition_variable>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -25,7 +24,7 @@ namespace Contest {
  **/
 class WorkerThreadPool {
   private:
-    static constexpr int NUM_THREADS = SPC__CORE_COUNT;
+    static constexpr int NUM_THREADS = SPC__THREAD_COUNT;
 
     std::vector<std::thread> threads;
     std::mutex pool_mutex;
@@ -35,7 +34,7 @@ class WorkerThreadPool {
     int task_generation = 0;
     bool should_exit = false;
 
-    std::function<void(size_t, size_t)> current_task;
+    std::function<void(size_t)> current_task;
 
     void worker_loop(size_t thread_id) {
         int last_generation = 0;
@@ -52,7 +51,7 @@ class WorkerThreadPool {
             int current_gen = task_generation;
             lock.unlock();
 
-            local_task(thread_id, NUM_THREADS);
+            local_task(thread_id);
             last_generation = current_gen;
             if (tasks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
                 main_cv.notify_one();
@@ -79,7 +78,7 @@ class WorkerThreadPool {
         }
     }
 
-    void execute(std::function<void(size_t, size_t)> task) {
+    void execute(std::function<void(size_t)> task) {
         {
             std::lock_guard<std::mutex> lock(pool_mutex);
             current_task = task;

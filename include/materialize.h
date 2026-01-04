@@ -314,7 +314,8 @@ inline void materialize_column(Column &dest_col,
         thread_columns.emplace_back(dest_col.type);
     }
 
-    worker_pool.execute([&](size_t t, size_t num_threads) {
+    worker_pool.execute([&](size_t t) {
+        size_t num_threads = worker_pool.thread_count();
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
