@@ -53,8 +53,10 @@ class WorkerThreadPool {
 
             local_task(thread_id);
             last_generation = current_gen;
-            if (tasks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            if (tasks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> notify_lock(pool_mutex);
                 main_cv.notify_one();
+            }
         }
     }
 
