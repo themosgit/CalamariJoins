@@ -42,7 +42,7 @@ public:
 
 using ExecuteResult = std::vector<mema::column_t>;
 
-struct SourceInfo {
+struct alignas(8) SourceInfo {
     const mema::column_t* intermediate_col = nullptr;
     const Column* columnar_col = nullptr;
     size_t remapped_col_idx = 0;
@@ -149,18 +149,10 @@ inline void construct_intermediate(
 
             if (src.is_columnar) {
                 const auto& col = *src.columnar_col;
-                if (src.from_build) {
-                    size_t k = start;
-                    for (uint32_t rid : range) {
-                        dest_col.write_at(k++, columnar_reader.read_value_build(
-                            col, src.remapped_col_idx, rid, col.type, cursor));
-                    }
-                } else {
-                    size_t k = start;
-                    for (uint32_t rid : range) {
-                        dest_col.write_at(k++, columnar_reader.read_value_probe(
-                            col, src.remapped_col_idx, rid, col.type, cursor));
-                    }
+                size_t k = start;
+                for (uint32_t rid : range) {
+                    dest_col.write_at(k++, columnar_reader.read_value(
+                        col, src.remapped_col_idx, rid, col.type, cursor, src.from_build));
                 }
             } else {
                 const auto& vec = *src.intermediate_col;

@@ -33,7 +33,7 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     return {char_begin + start_off, static_cast<uint16_t>(end_off - start_off)};
 }
 
-struct BitmapAccumulator {
+struct alignas(8) BitmapAccumulator {
     std::vector<uint8_t> buffer;
     uint8_t pending_bits = 0;
     int bit_count = 0;
@@ -429,9 +429,8 @@ inline ColumnarTable materialize(
         if (data_type == DataType::INT32) {
             auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 if (col_source) {
-                     return from_build 
-                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::INT32, cursor)
-                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::INT32, cursor);
+                    return columnar_reader.read_value(*col_source, remapped_col_idx, rid,
+                                                      DataType::INT32, cursor, from_build);
                 }
                 return (*inter_source)[rid];
             };
@@ -448,11 +447,10 @@ inline ColumnarTable materialize(
                                    .columns[inter_source->source_column];
             }
 
-            auto reader = [&](uint32_t rid, ColumnarReader::Cursor & cursor) {
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 if (col_source) {
-                    return from_build
-                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::VARCHAR, cursor)
-                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::VARCHAR, cursor);
+                    return columnar_reader.read_value(*col_source, remapped_col_idx, rid,
+                                                      DataType::VARCHAR, cursor, from_build);
                 }
                 return (*inter_source)[rid];
             };

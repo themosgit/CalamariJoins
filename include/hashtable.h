@@ -34,7 +34,7 @@ using Contest::worker_pool;
 
 class UnchainedHashtable {
 public:
-    struct Tuple {
+    struct alignas(4) Tuple {
         int32_t key;
         uint32_t row_id;
     };
@@ -49,7 +49,7 @@ public:
     static constexpr size_t CHUNK_SIZE = 4096;
     static constexpr size_t CHUNK_HEADER = 16;
     static constexpr size_t TUPLES_PER_CHUNK = (CHUNK_SIZE - CHUNK_HEADER) / sizeof(Tuple);
-    struct alignas(CACHE_LINE) Chunk {
+    struct alignas(8) Chunk {
         Chunk* next;
         size_t count;
         Tuple data[TUPLES_PER_CHUNK];
@@ -77,7 +77,7 @@ public:
      *  Designed to fit in LLC.
      *
      **/
-    struct Partition {
+    struct alignas(8) Partition {
         Chunk* head = nullptr;
         Chunk* tail = nullptr;
         size_t total_count = 0;

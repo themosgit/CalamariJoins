@@ -163,12 +163,17 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
         auto probe_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(probe_end - probe_start);
         stats.hash_join_probe_ms += probe_elapsed.count();
     }
-    JoinResult final_result; 
+    JoinResult final_result;
     if (is_root) {
         auto mat_start = std::chrono::high_resolution_clock::now();
         if (collector.size() == 0) {
             final_result = create_empty_result(config.remapped_attrs);
         } else {
+            /* prepare PageIndex now - after probing, before materialization */
+            prepare_output_columns(setup.columnar_reader, build_input, probe_input,
+                                   build_node, probe_node, config.remapped_attrs,
+                                   build_input.output_size());
+
             final_result = materialize(collector, build_input, probe_input,
                                        config.remapped_attrs, build_node, probe_node,
                                        build_input.output_size(), setup.columnar_reader, plan);
@@ -179,6 +184,11 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root, TimingS
     } else {
         auto inter_start = std::chrono::high_resolution_clock::now();
         if (collector.size() > 0) {
+            /* prepare PageIndex now - after probing, before intermediate construction */
+            prepare_output_columns(setup.columnar_reader, build_input, probe_input,
+                                   build_node, probe_node, config.remapped_attrs,
+                                   build_input.output_size());
+
             construct_intermediate(collector, build_input, probe_input,
                                    config.remapped_attrs, build_node, probe_node,
                                    build_input.output_size(), setup.columnar_reader,
