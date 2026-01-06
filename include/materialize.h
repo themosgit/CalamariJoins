@@ -320,10 +320,8 @@ inline void materialize_column(Column &dest_col,
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
 
-        auto stream = collector.get_stream(start);
-
         Column &local_col = thread_columns[t];
-        
+
         size_t thread_page_start = t * pages_per_thread;
         size_t thread_page_limit = pages_per_thread;
         size_t used_pages = 0;
@@ -348,18 +346,13 @@ inline void materialize_column(Column &dest_col,
 
         const size_t check_interval = BuilderType::MIN_ROWS_PER_PAGE_CHECK;
         size_t rows_since_check = 0;
-        
-        auto get_row_id = [from_build](uint64_t m) -> uint32_t {
-            return from_build ? static_cast<uint32_t>(m) 
-                              : static_cast<uint32_t>(m >> 32);
-        };
 
-        for (size_t i = start; i < end; ++i) {
-            uint64_t match = stream.next();
-            uint32_t row_id = get_row_id(match);
-            
+        auto range = from_build ? collector.get_left_range(start, end - start)
+                                : collector.get_right_range(start, end - start);
+
+        for (uint32_t row_id : range) {
             bool flushed = builder.add(read_value(row_id, cursor));
-            
+
             if (flushed) {
                 rows_since_check = 0;
             } else {
@@ -369,7 +362,7 @@ inline void materialize_column(Column &dest_col,
                         builder.save_to_page(builder.current_page);
                         rows_since_check = 0;
                     }
-                    if (rows_since_check > check_interval * 2) rows_since_check = 0; 
+                    if (rows_since_check > check_interval * 2) rows_since_check = 0;
                 }
             }
         }

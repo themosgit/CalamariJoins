@@ -46,8 +46,6 @@ struct SourceInfo {
     const mema::column_t* intermediate_col = nullptr;
     const Column* columnar_col = nullptr;
     size_t remapped_col_idx = 0;
-    /* 0 for build , 32 for probe */
-    uint32_t shift = 0;
     bool is_columnar = false;
     bool from_build = false;
 };
@@ -96,7 +94,6 @@ inline std::vector<SourceInfo> prepare_sources(
     for (const auto& [col_idx, _] : remapped_attrs) {
         SourceInfo info;
         info.from_build = (col_idx < build_size);
-        info.shift = info.from_build ? 0 : 32;
         size_t local_idx = info.from_build ? col_idx : col_idx - build_size;
         info.remapped_col_idx = local_idx;
         const JoinInput& input = info.from_build ? build_input : probe_input;
@@ -142,33 +139,34 @@ inline void construct_intermediate(
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
-        
+
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto& src = sources[i];
             auto& dest_col = results[i];
-            
-            auto stream = collector.get_stream(start);
+
+            auto range = src.from_build ? collector.get_left_range(start, end - start)
+                                        : collector.get_right_range(start, end - start);
+
             if (src.is_columnar) {
                 const auto& col = *src.columnar_col;
                 if (src.from_build) {
-                    for (size_t k = start; k < end; ++k) {
-                        uint32_t rid = static_cast<uint32_t>(stream.next());
-                        dest_col.write_at(k, columnar_reader.read_value_build(
+                    size_t k = start;
+                    for (uint32_t rid : range) {
+                        dest_col.write_at(k++, columnar_reader.read_value_build(
                             col, src.remapped_col_idx, rid, col.type, cursor));
                     }
                 } else {
-                    for (size_t k = start; k < end; ++k) {
-                        uint32_t rid = static_cast<uint32_t>(stream.next() >> 32);
-                        dest_col.write_at(k, columnar_reader.read_value_probe(
+                    size_t k = start;
+                    for (uint32_t rid : range) {
+                        dest_col.write_at(k++, columnar_reader.read_value_probe(
                             col, src.remapped_col_idx, rid, col.type, cursor));
                     }
                 }
             } else {
                 const auto& vec = *src.intermediate_col;
-                uint32_t shift = src.shift;
-                for (size_t k = start; k < end; ++k) {
-                    uint32_t rid = static_cast<uint32_t>(stream.next() >> shift);
-                    dest_col.write_at(k, vec[rid]);
+                size_t k = start;
+                for (uint32_t rid : range) {
+                    dest_col.write_at(k++, vec[rid]);
                 }
             }
         }
