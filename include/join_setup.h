@@ -2,6 +2,7 @@
 
 #include <columnar_reader.h>
 #include <intermediate.h>
+#include <match_collector.h>
 #include <plan.h>
 #include <tuple>
 #include <variant>
@@ -122,6 +123,41 @@ inline BuildProbeConfig select_build_probe_side(
         }
     }
     return config;
+}
+
+/**
+ *
+ * Analyzes remapped output attributes to determine which row IDs are needed.
+ *
+ **/
+inline MatchCollectionMode determine_collection_mode(
+    const std::vector<std::tuple<size_t, DataType>>& remapped_attrs,
+    size_t build_size) {
+
+    bool needs_build = false;
+    bool needs_probe = false;
+
+    for (const auto& [col_idx, dtype] : remapped_attrs) {
+        if (col_idx < build_size) {
+            needs_build = true;
+        } else {
+            needs_probe = true;
+        }
+
+        // Early exit if we need both
+        if (needs_build && needs_probe) {
+            return MatchCollectionMode::BOTH;
+        }
+    }
+
+    if (needs_build && !needs_probe) {
+        return MatchCollectionMode::LEFT_ONLY;
+    } else if (needs_probe && !needs_build) {
+        return MatchCollectionMode::RIGHT_ONLY;
+    }
+
+    // Empty output (shouldn't happen, but safe default)
+    return MatchCollectionMode::BOTH;
 }
 
 /**

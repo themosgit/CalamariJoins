@@ -15,7 +15,8 @@ namespace Contest {
 
 inline void nested_loop_join(const JoinInput &build_input,
                              const JoinInput &probe_input, size_t build_attr,
-                             size_t probe_attr, MatchCollector &collector) {
+                             size_t probe_attr, MatchCollector &collector,
+                             MatchCollectionMode mode = MatchCollectionMode::BOTH) {
     size_t build_rows = build_input.row_count(build_attr);
     size_t probe_rows = probe_input.row_count(probe_attr);
 
@@ -69,7 +70,11 @@ inline void nested_loop_join(const JoinInput &build_input,
         }
     }
     int num_threads = worker_pool.thread_count();
-    std::vector<ThreadLocalMatchBuffer> buffers(num_threads);
+    std::vector<ThreadLocalMatchBuffer> buffers;
+    buffers.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        buffers.emplace_back(mode);
+    }
 
     const Column *probe_col = nullptr;
     std::vector<uint32_t> page_offsets;

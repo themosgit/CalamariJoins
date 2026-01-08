@@ -125,9 +125,9 @@ inline void construct_intermediate(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, ExecuteResult &results) {
+    const_cast<MatchCollector&>(collector).ensure_finalized();
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
-    const_cast<MatchCollector&>(collector).ensure_finalized();
 
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
