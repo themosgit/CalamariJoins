@@ -9,8 +9,8 @@
 #include <common.h>
 #include <condition_variable>
 #include <functional>
-#include <memory>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <vector>
 namespace Contest {
@@ -24,92 +24,76 @@ namespace Contest {
  **/
 class WorkerThreadPool {
   private:
-    static constexpr int NUM_THREADS = SPC__CORE_COUNT;
+    static constexpr int NUM_THREADS = SPC__THREAD_COUNT;
 
     std::vector<std::thread> threads;
-    std::vector<std::unique_ptr<std::mutex>> mtxes;
-    std::vector<std::unique_ptr<std::condition_variable>> cvs;
-    std::vector<uint8_t> has_task;
-    std::vector<uint8_t> finished;
-    std::vector<bool> should_exit;
+    std::mutex pool_mutex;
+    std::condition_variable worker_cv;
+    std::condition_variable main_cv;
+    std::atomic<int> tasks_remaining{0};
+    int task_generation = 0;
+    bool should_exit = false;
 
-    std::mutex task_mutex;
-    std::function<void(size_t, size_t)> current_task;
+    std::function<void(size_t)> current_task;
 
     void worker_loop(size_t thread_id) {
+        int last_generation = 0;
         while (true) {
-            std::unique_lock<std::mutex> lock(*mtxes[thread_id]);
-            cvs[thread_id]->wait(lock, [&] {
-                return has_task[thread_id] || should_exit[thread_id];
+            std::unique_lock<std::mutex> lock(pool_mutex);
+            worker_cv.wait(lock, [&] {
+                return task_generation > last_generation || should_exit;
             });
-
-            if (should_exit[thread_id])
+            if (should_exit)
                 break;
 
-            std::function<void(size_t, size_t)> local_task;
-            /* execute task under lock to ensure proper access */
-            {
-                std::lock_guard<std::mutex> task_lock(task_mutex);
-                local_task = current_task;
-            }
-            local_task(thread_id, NUM_THREADS);
+            /* copy task while holding lock, then unlock */
+            auto local_task = current_task;
+            int current_gen = task_generation;
+            lock.unlock();
 
-            has_task[thread_id] = 0;
-            finished[thread_id] = 1;
-            cvs[thread_id]->notify_one();
+            local_task(thread_id);
+            last_generation = current_gen;
+            if (tasks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> notify_lock(pool_mutex);
+                main_cv.notify_one();
+            }
         }
     }
 
   public:
     WorkerThreadPool() {
         threads.reserve(NUM_THREADS);
-        mtxes.reserve(NUM_THREADS);
-        cvs.reserve(NUM_THREADS);
-        has_task.resize(NUM_THREADS, 0);
-        finished.resize(NUM_THREADS, 1);
-        should_exit.resize(NUM_THREADS, false);
 
         for (int t = 0; t < NUM_THREADS; ++t) {
-            mtxes.push_back(std::make_unique<std::mutex>());
-            cvs.push_back(std::make_unique<std::condition_variable>());
             threads.emplace_back([this, t] { worker_loop(t); });
         }
     }
 
     ~WorkerThreadPool() {
-        for (int t = 0; t < NUM_THREADS; ++t) {
-            {
-                std::lock_guard<std::mutex> lock(*mtxes[t]);
-                should_exit[t] = true;
-                cvs[t]->notify_one();
-            }
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            should_exit = true;
         }
+        worker_cv.notify_all();
         for (auto &thread : threads) {
             thread.join();
         }
     }
 
-    void execute(std::function<void(size_t, size_t)> task) {
-        /* assign task under lock to prevent data race */
+    void execute(std::function<void(size_t)> task) {
         {
-            std::lock_guard<std::mutex> task_lock(task_mutex);
+            std::lock_guard<std::mutex> lock(pool_mutex);
             current_task = task;
+            tasks_remaining.store(NUM_THREADS, std::memory_order_release);
+            task_generation++;
         }
-
-        /* wake all threads */
-        for (int t = 0; t < NUM_THREADS; ++t) {
-            std::lock_guard<std::mutex> lock(*mtxes[t]);
-            has_task[t] = 1;
-            finished[t] = 0;
-            cvs[t]->notify_one();
-        }
-
-        /* wait for all threads to finish */
-        for (int t = 0; t < NUM_THREADS; ++t) {
-            std::unique_lock<std::mutex> lock(*mtxes[t]);
-            const int thread_idx = t;  // Capture by value
-            cvs[t]->wait(lock, [&, thread_idx] { return finished[thread_idx]; });
-        }
+        worker_cv.notify_all();
+        
+        /* wait for atomic counter to reach 0 */
+        std::unique_lock<std::mutex> lock(pool_mutex);
+        main_cv.wait(lock, [&] {
+                return tasks_remaining.load(std::memory_order_acquire) == 0;
+        });
 
     }
 

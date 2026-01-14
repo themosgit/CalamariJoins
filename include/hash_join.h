@@ -87,22 +87,6 @@ inline UnchainedHashtable build_from_intermediate_parallel(const JoinInput &inpu
 
 /**
  *
- *  merges thread-local match collectors into global collector
- *  single-threaded aggregation after parallel probing phase
- *  appends all local matches sequentially
- *
- **/
-
-inline void merge_local_collectors(
-    std::vector<ThreadLocalMatchBuffer>& local_buffers,
-    MatchCollector& global_collector) {
-    for(auto& buf : local_buffers){
-        global_collector.merge_thread_buffer(buf);
-    }
-}
-
-/**
- *
  *  parallel probing of hash table with intermediate column_t input using work stealing
  *  each thread processes pages via atomic counter for dynamic load balancing
  *  leverages fixed-size pages for simple row offset calculation
@@ -112,19 +96,23 @@ inline void merge_local_collectors(
  **/
 inline void probe_intermediate(const UnchainedHashtable& hash_table,
                                const mema::column_t &probe_column,
-                               MatchCollector& collector) {
+                               MatchCollector& collector,
+                               MatchCollectionMode mode = MatchCollectionMode::BOTH) {
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
 
     size_t pool_size = worker_pool.thread_count();
-    // Use the new ThreadLocalMatchBuffer
-    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
+    std::vector<ThreadLocalMatchBuffer> local_buffers;
+    local_buffers.reserve(pool_size);
+    for (size_t i = 0; i < pool_size; ++i) {
+        local_buffers.emplace_back(mode);
+    }
     
     const size_t num_pages = probe_column.pages.size();
     const size_t probe_count = probe_column.row_count();
     std::atomic<size_t> page_counter(0);
 
-    worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+    worker_pool.execute([&](size_t thread_id) {
         auto& local_buf = local_buffers[thread_id];
         
         while(true){
@@ -158,11 +146,12 @@ inline void probe_intermediate(const UnchainedHashtable& hash_table,
 inline void probe_columnar(const UnchainedHashtable& hash_table,
                            const JoinInput& probe_input,
                            size_t probe_attr,
-                           MatchCollector& collector) {
+                           MatchCollector& collector,
+                           MatchCollectionMode mode = MatchCollectionMode::BOTH) {
 
     const auto* keys = hash_table.keys();
     const auto* row_ids = hash_table.row_ids();
-                                
+
     auto* table = std::get<const ColumnarTable*>(probe_input.data);
     auto [actual_idx_col,_] = probe_input.node->output_attrs[probe_attr];
     const Column& probe_col = table->columns[actual_idx_col];
@@ -179,10 +168,14 @@ inline void probe_columnar(const UnchainedHashtable& hash_table,
     }
 
     size_t pool_size = worker_pool.thread_count();
-    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
+    std::vector<ThreadLocalMatchBuffer> local_buffers;
+    local_buffers.reserve(pool_size);
+    for (size_t i = 0; i < pool_size; ++i) {
+        local_buffers.emplace_back(mode);
+    }
 
     std::atomic<size_t> page_counter(0);
-    worker_pool.execute([&](size_t thread_id, size_t /* total_threads */) {
+    worker_pool.execute([&](size_t thread_id) {
         auto& local_buf = local_buffers[thread_id];
 
         while(true){

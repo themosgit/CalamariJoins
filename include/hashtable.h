@@ -1,7 +1,4 @@
 #pragma once
-#ifndef HARDWARE_H_INCLUDED
-#define HARDWARE_H_INCLUDED
-
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -17,11 +14,10 @@
     #include <hardware.h>
 #endif
 
-    #if defined(__x86_64__)
-        #include <immintrin.h>
-    #elif defined(__aarch64__)
-        #include <arm_acle.h>
-    #endif
+#if defined(__x86_64__)
+    #include <immintrin.h>
+#elif defined(__aarch64__)
+    #include <arm_acle.h>
 #endif
 
 /* some systems do not have L3 cache ao L2 is set as LLC */
@@ -33,13 +29,12 @@
 
 static constexpr size_t L2_CACHE = SPC__LEVEL2_CACHE_SIZE;
 static constexpr size_t CACHE_LINE = SPC__LEVEL1_DCACHE_LINESIZE;
-static constexpr int NUM_CORES = SPC__CORE_COUNT;
 
 using Contest::worker_pool;
 
 class UnchainedHashtable {
 public:
-    struct Tuple {
+    struct alignas(4) Tuple {
         int32_t key;
         uint32_t row_id;
     };
@@ -54,7 +49,7 @@ public:
     static constexpr size_t CHUNK_SIZE = 4096;
     static constexpr size_t CHUNK_HEADER = 16;
     static constexpr size_t TUPLES_PER_CHUNK = (CHUNK_SIZE - CHUNK_HEADER) / sizeof(Tuple);
-    struct alignas(CACHE_LINE) Chunk {
+    struct alignas(8) Chunk {
         Chunk* next;
         size_t count;
         Tuple data[TUPLES_PER_CHUNK];
@@ -82,7 +77,7 @@ public:
      *  Designed to fit in LLC.
      *
      **/
-    struct Partition {
+    struct alignas(8) Partition {
         Chunk* head = nullptr;
         Chunk* tail = nullptr;
         size_t total_count = 0;
@@ -127,7 +122,7 @@ private:
 
     /* compute number of partitions required */
     size_t compute_num_partitions(size_t tuple_count, int num_threads) const {
-        size_t per_core_cache = LAST_LEVEL_CACHE / NUM_CORES;
+        size_t per_core_cache = LAST_LEVEL_CACHE / worker_pool.thread_count();
         size_t target_bytes = per_core_cache / 2;
         size_t bytes_per_tuple = sizeof(Tuple);
         size_t tuples_per_partition = target_bytes / bytes_per_tuple;
@@ -209,13 +204,6 @@ public:
     bool empty() const noexcept { return keys_.empty(); }
     const int32_t* keys() const noexcept { return keys_.data(); }
     const uint32_t* row_ids() const noexcept { return row_ids_.data(); }
-    inline void prefetch_bucket(int32_t key) const noexcept {
-        uint64_t h = hash_key(key);
-        size_t slot = slot_for(h);
-        // __builtin_prefetch is supported by GCC/Clang/ICC
-        // 0 = Read, 1 = Low temporal locality (streaming)
-        __builtin_prefetch(static_cast<const void*>(&directory[slot]), 0, 1);
-    }
 
     std::pair<uint64_t, uint64_t> find_indices(int32_t key) const noexcept {
         if (keys_.empty()) return {0, 0};
@@ -236,7 +224,7 @@ public:
         const size_t row_count = column.row_count();
         if (row_count == 0) return;
 
-        num_threads = NUM_CORES;
+        num_threads = worker_pool.thread_count();
         if (row_count < 10000) num_threads = 1;
 
         const size_t num_slots = directory.size();
@@ -251,7 +239,7 @@ public:
 
         /* partitions data to every thread based on hash */
         size_t batch = (row_count + num_threads - 1) / num_threads;
-        worker_pool.execute([&, partition_bits](size_t t, size_t pool_threads) {
+        worker_pool.execute([&, partition_bits](size_t t) {
             size_t start = t * batch;
             size_t end = std::min(start + batch, row_count);
             if (start >= end) return;
@@ -267,7 +255,7 @@ public:
         /* compute offsets partition data from every thread */
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
         for (size_t p = 0; p < num_partitions; ++p) {
-            for (int t = 0; t < num_threads; ++t) {
+            for (size_t t = 0; t < num_threads; ++t) {
                 global_offsets[p + 1] += thread_parts[t][p].total_count;
             }
             global_offsets[p + 1] += global_offsets[p];
@@ -280,8 +268,8 @@ public:
 
         /* accumulates and builds partitions from all threads */
         const int nt = num_threads;
-        worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
-            for (size_t p = t; p < num_partitions; p += pool_threads) {
+        worker_pool.execute([&, nt](size_t t) {
+            for (size_t p = t; p < num_partitions; p += nt) {
                 build_partition(thread_parts, p, slots_per_partition,
                                 global_offsets[p],
                                 global_offsets[p + 1] - global_offsets[p],
@@ -303,7 +291,7 @@ public:
         }
         if (total_rows == 0) return;
 
-        num_threads = std::clamp(num_threads, 1, NUM_CORES);
+        num_threads = std::clamp(num_threads, 1, worker_pool.thread_count());
         if (column.pages.size() < 16) num_threads = 1;
 
         const size_t num_pages = column.pages.size();
@@ -317,7 +305,7 @@ public:
         for (auto& tp : thread_parts) tp.resize(num_partitions);
 
         size_t batch = (num_pages + num_threads - 1) / num_threads;
-        worker_pool.execute([&, partition_bits](size_t t, size_t pool_threads) {
+        worker_pool.execute([&, partition_bits](size_t t) {
             size_t pg_start = t * batch;
             size_t pg_end = std::min(pg_start + batch, num_pages);
             if (pg_start >= pg_end) return;
@@ -366,8 +354,8 @@ public:
         row_ids_.resize(total);
 
         const int nt = num_threads;
-        worker_pool.execute([&, nt](size_t t, size_t pool_threads) {
-            for (size_t p = t; p < num_partitions; p += pool_threads) {
+        worker_pool.execute([&, nt](size_t t) {
+            for (size_t p = t; p < num_partitions; p += nt) {
                 build_partition(thread_parts, p, slots_per_partition,
                                 global_offsets[p],
                                 global_offsets[p + 1] - global_offsets[p],

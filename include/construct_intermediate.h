@@ -21,7 +21,7 @@ private:
 public:
     BatchAllocator() = default;
     void allocate(size_t total_pages) {
-        total_size = total_pages * PAGE_SIZE;
+        total_size = total_pages * mema::IR_PAGE_SIZE;
         memory_block = mmap(nullptr, total_size,
                            PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -42,18 +42,10 @@ public:
 
 using ExecuteResult = std::vector<mema::column_t>;
 
-/**
- *
- *  pre-resolved source information for a result column
- *  eliminates repetitive lookup logic inside parallel loops
- *
- **/
-struct SourceInfo {
+struct alignas(8) SourceInfo {
     const mema::column_t* intermediate_col = nullptr;
     const Column* columnar_col = nullptr;
     size_t remapped_col_idx = 0;
-    /* 0 for build , 32 for probe */
-    uint32_t shift = 0;
     bool is_columnar = false;
     bool from_build = false;
 };
@@ -73,7 +65,7 @@ inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
     }
     
     size_t total_bytes = total_chunks * mema::CAP_PER_PAGE * sizeof(mema::value_t);
-    size_t system_pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    size_t system_pages = (total_bytes + mema::IR_PAGE_SIZE - 1) / mema::IR_PAGE_SIZE;
     auto allocator = std::make_shared<BatchAllocator>();
     allocator->allocate(system_pages);
     void* block = allocator->get_block();
@@ -102,7 +94,6 @@ inline std::vector<SourceInfo> prepare_sources(
     for (const auto& [col_idx, _] : remapped_attrs) {
         SourceInfo info;
         info.from_build = (col_idx < build_size);
-        info.shift = info.from_build ? 0 : 32;
         size_t local_idx = info.from_build ? col_idx : col_idx - build_size;
         info.remapped_col_idx = local_idx;
         const JoinInput& input = info.from_build ? build_input : probe_input;
@@ -134,43 +125,40 @@ inline void construct_intermediate(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, ExecuteResult &results) {
+    const_cast<MatchCollector&>(collector).ensure_finalized();
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
-    const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
-    const uint64_t *matches_ptr = matches_vec.data();
 
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
     auto allocator = batch_allocate_for_results(results, total_matches);
 
-    worker_pool.execute([&](size_t t, size_t num_threads) {
+    worker_pool.execute([&](size_t t) {
+        Contest::ColumnarReader::Cursor cursor;
+        size_t num_threads = worker_pool.thread_count();
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
+
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto& src = sources[i];
             auto& dest_col = results[i];
+
+            auto range = src.from_build ? collector.get_left_range(start, end - start)
+                                        : collector.get_right_range(start, end - start);
+
             if (src.is_columnar) {
                 const auto& col = *src.columnar_col;
-                if (src.from_build) {
-                    for (size_t k = start; k < end; ++k) {
-                        uint32_t rid = static_cast<uint32_t>(matches_ptr[k]);
-                        dest_col.write_at(k, columnar_reader.read_value_build(
-                            col, src.remapped_col_idx, rid, col.type));
-                    }
-                } else {
-                    for (size_t k = start; k < end; ++k) {
-                        uint32_t rid = static_cast<uint32_t>(matches_ptr[k] >> 32);
-                        dest_col.write_at(k, columnar_reader.read_value_probe(
-                            col, src.remapped_col_idx, rid, col.type));
-                    }
+                size_t k = start;
+                for (uint32_t rid : range) {
+                    dest_col.write_at(k++, columnar_reader.read_value(
+                        col, src.remapped_col_idx, rid, col.type, cursor, src.from_build));
                 }
             } else {
                 const auto& vec = *src.intermediate_col;
-                uint32_t shift = src.shift;
-                for (size_t k = start; k < end; ++k) {
-                    uint32_t rid = static_cast<uint32_t>(matches_ptr[k] >> shift);
-                    dest_col.write_at(k, vec[rid]);
+                size_t k = start;
+                for (uint32_t rid : range) {
+                    dest_col.write_at(k++, vec[rid]);
                 }
             }
         }

@@ -1,23 +1,22 @@
 /*nested_loop.h*/
 #pragma once
 
-#include <columnar_reader.h>
+#include <atomic>
 #include <construct_intermediate.h>
 #include <cstdint>
 #include <intermediate.h>
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
-#include <atomic>
-#include "worker_pool.h"
-#include "match_collector.h"
+#include <worker_pool.h>
+#include <match_collector.h>
 
 namespace Contest {
 
 inline void nested_loop_join(const JoinInput &build_input,
                              const JoinInput &probe_input, size_t build_attr,
-                             size_t probe_attr, ColumnarReader &columnar_reader,
-                             MatchCollector &collector) {
+                             size_t probe_attr, MatchCollector &collector,
+                             MatchCollectionMode mode = MatchCollectionMode::BOTH) {
     size_t build_rows = build_input.row_count(build_attr);
     size_t probe_rows = probe_input.row_count(probe_attr);
 
@@ -40,31 +39,26 @@ inline void nested_loop_join(const JoinInput &build_input,
         auto *table = std::get<const ColumnarTable *>(build_input.data);
         auto [col_idx, _] = build_input.node->output_attrs[build_attr];
         const Column &col = table->columns[col_idx];
-        const auto &prefix = columnar_reader.get_build_page_index(build_attr);
 
         uint32_t row_id = 0;
-        size_t page_idx = 0;
         for (auto *page_obj : col.pages) {
             auto *page = page_obj->data;
             auto num_rows = *reinterpret_cast<uint16_t *>(page);
             auto num_values = *reinterpret_cast<uint16_t *>(page + 2);
             auto *data = reinterpret_cast<const int32_t *>(page + 4);
-            const auto &page_prefix = prefix.page_prefix_sums[page_idx];
 
+            uint16_t val_idx = 0;
             for (uint16_t i = 0; i < num_rows; i++) {
                 if (num_rows == num_values) {
                     collect_build(row_id++, data[i]);
                 } else {
                     auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE - (num_rows + 7) / 8);
                     if (bitmap[i / 8] & (1u << (i % 8))) {
-                        size_t chunk = i >> 6;
-                        uint16_t idx = page_prefix[chunk] + __builtin_popcountll(((const uint64_t*)bitmap)[chunk] & ((1ULL << (i & 0x3F)) - 1));
-                        collect_build(row_id, data[idx]);
+                        collect_build(row_id, data[val_idx++]);
                     }
                     row_id++;
                 }
             }
-            page_idx++;
         }
     } else {
         const auto &res = std::get<ExecuteResult>(build_input.data);
@@ -76,7 +70,11 @@ inline void nested_loop_join(const JoinInput &build_input,
         }
     }
     int num_threads = worker_pool.thread_count();
-    std::vector<ThreadLocalMatchBuffer> buffers(num_threads);
+    std::vector<ThreadLocalMatchBuffer> buffers;
+    buffers.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        buffers.emplace_back(mode);
+    }
 
     const Column *probe_col = nullptr;
     std::vector<uint32_t> page_offsets;
@@ -93,8 +91,9 @@ inline void nested_loop_join(const JoinInput &build_input,
         }
         page_offsets.push_back(current);
     }
+    std::atomic<size_t> probe_page_counter{0};
 
-    worker_pool.execute([&](size_t t_id, size_t total_threads) {
+    worker_pool.execute([&](size_t t_id) {
         auto &local_buffer = buffers[t_id];
 
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
@@ -107,10 +106,10 @@ inline void nested_loop_join(const JoinInput &build_input,
 
         if (probe_input.is_columnar()) {
             size_t num_pages = probe_col->pages.size();
-            size_t start = (t_id * num_pages) / total_threads;
-            size_t end = ((t_id + 1) * num_pages) / total_threads;
 
-            for (size_t i = start; i < end; ++i) {
+            while (true) {
+            size_t i = probe_page_counter.fetch_add(1, std::memory_order_relaxed);
+                if (i >= num_pages) break;
                 auto *page = probe_col->pages[i]->data;
                 auto num_rows = *reinterpret_cast<const uint16_t *>(page);
                 auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
@@ -136,8 +135,8 @@ inline void nested_loop_join(const JoinInput &build_input,
             const auto &res = std::get<ExecuteResult>(probe_input.data);
             const mema::column_t &col = res[probe_attr];
             size_t count = col.row_count();
-            size_t start = (t_id * count) / total_threads;
-            size_t end = ((t_id + 1) * count) / total_threads;
+            size_t start = (t_id * count) / worker_pool.thread_count();
+            size_t end = ((t_id + 1) * count) / worker_pool.thread_count();
 
             for (size_t i = start; i < end; i++) {
                 const mema::value_t &val = col[i];

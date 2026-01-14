@@ -36,12 +36,16 @@ struct alignas(4) value_t {
     inline bool is_null() const { return value == NULL_VALUE; }
 };
 
+constexpr size_t IR_PAGE_SIZE = 1 << 14;
+
 /* Ensuring this aligns with system page size is good for mmap */
-constexpr size_t CAP_PER_PAGE = 2048; 
+constexpr size_t CAP_PER_PAGE = IR_PAGE_SIZE / sizeof(value_t); 
+
+
 
 struct column_t {
   private:
-    struct alignas(PAGE_SIZE) Page {
+    struct alignas(IR_PAGE_SIZE) Page {
         value_t data[CAP_PER_PAGE];
     };
 
@@ -133,8 +137,8 @@ struct column_t {
     }
 
     /* read operator */
-    const value_t &operator[](size_t idx) const {
-        return pages[idx >> 11]->data[idx & 0x7FF];
+    inline const value_t &operator[](size_t idx) const {
+        return pages[idx >> 12]->data[idx & 0xFFF];
     }
     
     size_t row_count() const { return num_values; }
@@ -154,18 +158,10 @@ struct column_t {
         external_memory = memory_keeper;
     }
 
-
-
     /* thread-safe random write to pre-allocated pages */
     inline void write_at(size_t idx, const value_t &val) {
-        pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE] = val;
+        pages[idx >> 12]->data[idx & 0xFFF] = val;
     }
-
-    const value_t &operator[](size_t idx) const {
-        return pages[idx / CAP_PER_PAGE]->data[idx % CAP_PER_PAGE];
-    }
-
-    size_t row_count() const { return num_values; }
 };
 
 using Columnar = std::vector<column_t>;

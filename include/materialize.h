@@ -33,7 +33,7 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     return {char_begin + start_off, static_cast<uint16_t>(end_off - start_off)};
 }
 
-struct BitmapAccumulator {
+struct alignas(8) BitmapAccumulator {
     std::vector<uint8_t> buffer;
     uint8_t pending_bits = 0;
     int bit_count = 0;
@@ -159,7 +159,7 @@ struct VarcharPageBuilder {
 
         auto [str_ptr, str_len] = get_string_view(src_col, page_idx, offset_idx);
 
-        if (str_len > PAGE_SIZE - 16) {
+        if (str_len > PAGE_SIZE - 512) {
             if (num_rows > 0) flush_current_page();
             save_long_string_buffer(str_ptr, str_len);
             return true;
@@ -283,6 +283,7 @@ private:
  *  handles mmap allocation, threading, and merging logic
  *
  **/
+
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
 inline void materialize_column(Column &dest_col,
                                         const MatchCollector &collector,
@@ -292,10 +293,9 @@ inline void materialize_column(Column &dest_col,
                                         size_t est_bytes_per_row) {
     const size_t total_matches = collector.size();
     if (total_matches == 0) return;
-    const auto& matches_vec = const_cast<MatchCollector&>(collector).get_flattened_matches();
-    const uint64_t *matches_ptr = matches_vec.data();
-
-    constexpr int num_threads = SPC__CORE_COUNT;
+    
+    const_cast<MatchCollector&>(collector).ensure_finalized();
+    constexpr int num_threads = worker_pool.thread_count();
 
     size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
     size_t usable_per_page = PAGE_SIZE - 256; 
@@ -314,16 +314,19 @@ inline void materialize_column(Column &dest_col,
         thread_columns.emplace_back(dest_col.type);
     }
 
-    worker_pool.execute([&](size_t t, size_t num_threads) {
+    worker_pool.execute([&](size_t t) {
+        size_t num_threads = worker_pool.thread_count();
         size_t start = t * total_matches / num_threads;
         size_t end = (t + 1) * total_matches / num_threads;
         if (start >= end) return;
 
         Column &local_col = thread_columns[t];
-        
+
         size_t thread_page_start = t * pages_per_thread;
         size_t thread_page_limit = pages_per_thread;
         size_t used_pages = 0;
+
+        ColumnarReader::Cursor cursor;
 
         auto page_allocator = [&]() -> Page* {
             Page* p;
@@ -343,17 +346,13 @@ inline void materialize_column(Column &dest_col,
 
         const size_t check_interval = BuilderType::MIN_ROWS_PER_PAGE_CHECK;
         size_t rows_since_check = 0;
-        
-        auto get_row_id = [from_build](uint64_t m) -> uint32_t {
-            return from_build ? static_cast<uint32_t>(m) 
-                              : static_cast<uint32_t>(m >> 32);
-        };
 
-        for (size_t i = start; i < end; ++i) {
-            uint32_t row_id = get_row_id(matches_ptr[i]);
-            
-            bool flushed = builder.add(read_value(row_id));
-            
+        auto range = from_build ? collector.get_left_range(start, end - start)
+                                : collector.get_right_range(start, end - start);
+
+        for (uint32_t row_id : range) {
+            bool flushed = builder.add(read_value(row_id, cursor));
+
             if (flushed) {
                 rows_since_check = 0;
             } else {
@@ -363,7 +362,7 @@ inline void materialize_column(Column &dest_col,
                         builder.save_to_page(builder.current_page);
                         rows_since_check = 0;
                     }
-                    if (rows_since_check > check_interval * 2) rows_since_check = 0; 
+                    if (rows_since_check > check_interval * 2) rows_since_check = 0;
                 }
             }
         }
@@ -383,6 +382,7 @@ inline void materialize_column(Column &dest_col,
     auto* mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
     dest_col.assign_mapped_memory(mapped_mem);
 }
+
 /**
  *
  *  materializes final ColumnarTable from mixed inputs
@@ -427,11 +427,10 @@ inline ColumnarTable materialize(
         }
 
         if (data_type == DataType::INT32) {
-            auto reader = [&](uint32_t rid) {
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 if (col_source) {
-                     return from_build 
-                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::INT32)
-                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::INT32);
+                    return columnar_reader.read_value(*col_source, remapped_col_idx, rid,
+                                                      DataType::INT32, cursor, from_build);
                 }
                 return (*inter_source)[rid];
             };
@@ -448,11 +447,10 @@ inline ColumnarTable materialize(
                                    .columns[inter_source->source_column];
             }
 
-            auto reader = [&](uint32_t rid) {
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 if (col_source) {
-                    return from_build
-                        ? columnar_reader.read_value_build(*col_source, remapped_col_idx, rid, DataType::VARCHAR)
-                        : columnar_reader.read_value_probe(*col_source, remapped_col_idx, rid, DataType::VARCHAR);
+                    return columnar_reader.read_value(*col_source, remapped_col_idx, rid,
+                                                      DataType::VARCHAR, cursor, from_build);
                 }
                 return (*inter_source)[rid];
             };

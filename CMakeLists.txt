@@ -73,7 +73,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
     add_compile_options(-O3 -mcpu=apple-m1 -flto)
 else()
-    add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive -flto)
+    add_compile_options(-O3 -march=skylake -m64 -mcrc32 -fpermissive -flto)
 endif()
 
 add_link_options(-flto)
