@@ -387,9 +387,19 @@ template <> struct ColumnInserter<std::string> {
 
 namespace Contest {
 
+struct TimingStats {
+    int64_t hashtable_build_ms = 0;
+    int64_t hash_join_probe_ms = 0;
+    int64_t nested_loop_join_ms = 0;
+    int64_t materialize_ms = 0;
+    int64_t setup_ms = 0;
+    int64_t total_execution_ms = 0;
+    int64_t intermediate_ms = 0;
+};
+
 void *build_context();
 void destroy_context(void *);
 
-ColumnarTable execute(const Plan &plan, void *context);
+ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out = nullptr, bool show_detailed_timing = false);
 
 } // namespace Contest

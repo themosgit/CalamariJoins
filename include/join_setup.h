@@ -2,6 +2,7 @@
 
 #include <columnar_reader.h>
 #include <intermediate.h>
+#include <match_collector.h>
 #include <plan.h>
 #include <tuple>
 #include <variant>
@@ -126,6 +127,41 @@ inline BuildProbeConfig select_build_probe_side(
 
 /**
  *
+ * Analyzes remapped output attributes to determine which row IDs are needed.
+ *
+ **/
+inline MatchCollectionMode determine_collection_mode(
+    const std::vector<std::tuple<size_t, DataType>>& remapped_attrs,
+    size_t build_size) {
+
+    bool needs_build = false;
+    bool needs_probe = false;
+
+    for (const auto& [col_idx, dtype] : remapped_attrs) {
+        if (col_idx < build_size) {
+            needs_build = true;
+        } else {
+            needs_probe = true;
+        }
+
+        // Early exit if we need both
+        if (needs_build && needs_probe) {
+            return MatchCollectionMode::BOTH;
+        }
+    }
+
+    if (needs_build && !needs_probe) {
+        return MatchCollectionMode::LEFT_ONLY;
+    } else if (needs_probe && !needs_build) {
+        return MatchCollectionMode::RIGHT_ONLY;
+    }
+
+    // Empty output (shouldn't happen, but safe default)
+    return MatchCollectionMode::BOTH;
+}
+
+/**
+ *
  *  initializes output column_t vector with proper metadata
  *  sets source_table and source_column for string materialization
  *  tracks original ColumnarTable location for varchar columns
@@ -158,7 +194,6 @@ inline ExecuteResult initialize_output_columns(
         auto [col_idx, _] = output_attrs[i];
 
         mema::column_t col;
-        col.reserve(estimated_rows);
 
         if (col_idx < left_size) {
             set_column_metadata(col, left_input, left_node, col_idx);
@@ -193,7 +228,7 @@ struct JoinSetup {
  *
  *  initializes all resources needed for join execution
  *  allocates output columns with proper metadata
- *  prepares columnar_reader if inputs are columnar
+ *  NOTE: PageIndex building is deferred to reduce cache pollution during probing
  *  returns setup ready for hash or nested loop join
  *
  **/
@@ -211,37 +246,74 @@ setup_join(const JoinInput &build_input, const JoinInput &probe_input,
         initialize_output_columns(output_attrs, left_node, right_node,
                                   left_input, right_input, estimated_rows);
 
+    /* PageIndex building is deferred - will be built on-demand during materialization */
+    setup.prepared = false;
+
+    return setup;
+}
+
+/**
+ *
+ *  prepares PageIndex ONLY for columnar output columns that will be accessed
+ *  filters out intermediate columns to avoid unnecessary PageIndex building
+ *  called after probing to avoid cache pollution during probe phase
+ *
+ **/
+inline void prepare_output_columns(
+    ColumnarReader &reader,
+    const JoinInput &build_input, const JoinInput &probe_input,
+    const PlanNode &build_node, const PlanNode &probe_node,
+    const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
+    size_t build_size) {
+
     bool build_is_columnar = build_input.is_columnar();
     bool probe_is_columnar = probe_input.is_columnar();
 
-    /* prepare columnar reader if any input is columnar */
-    if (build_is_columnar || probe_is_columnar) {
-        if (build_is_columnar) {
-            std::vector<const Column *> build_columns;
-            auto *build_table =
-                std::get<const ColumnarTable *>(build_input.data);
-            for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
-                auto [actual_col_idx, _] = build_node.output_attrs[i];
-                build_columns.push_back(&build_table->columns[actual_col_idx]);
-            }
-            setup.columnar_reader.prepare_build(build_columns);
-        }
+    if (!build_is_columnar && !probe_is_columnar) return;
 
-        if (probe_is_columnar) {
-            std::vector<const Column *> probe_columns;
-            auto *probe_table =
-                std::get<const ColumnarTable *>(probe_input.data);
-            for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
-                auto [actual_col_idx, _] = probe_node.output_attrs[i];
-                probe_columns.push_back(&probe_table->columns[actual_col_idx]);
-            }
-            setup.columnar_reader.prepare_probe(probe_columns);
-        }
+    /* track which columns are actually needed from each side */
+    std::vector<bool> build_needed(build_node.output_attrs.size(), false);
+    std::vector<bool> probe_needed(probe_node.output_attrs.size(), false);
 
-        setup.prepared = true;
+    for (const auto &[col_idx, dtype] : remapped_attrs) {
+        if (col_idx < build_size) {
+            /* from build side */
+            if (build_is_columnar) {
+                build_needed[col_idx] = true;
+            }
+        } else {
+            /* from probe side */
+            if (probe_is_columnar) {
+                probe_needed[col_idx - build_size] = true;
+            }
+        }
     }
 
-    return setup;
+    if (build_is_columnar) {
+        std::vector<const Column *> build_columns;
+        auto *build_table = std::get<const ColumnarTable *>(build_input.data);
+        build_columns.resize(build_node.output_attrs.size(), nullptr);
+
+        for (size_t i = 0; i < build_node.output_attrs.size(); ++i) {
+            auto [actual_col_idx, _] = build_node.output_attrs[i];
+            /* only add columns that are in output */
+            build_columns[i] = build_needed[i] ? &build_table->columns[actual_col_idx] : nullptr;
+        }
+        reader.prepare_build(build_columns);
+    }
+
+    if (probe_is_columnar) {
+        std::vector<const Column *> probe_columns;
+        auto *probe_table = std::get<const ColumnarTable *>(probe_input.data);
+        probe_columns.resize(probe_node.output_attrs.size(), nullptr);
+
+        for (size_t i = 0; i < probe_node.output_attrs.size(); ++i) {
+            auto [actual_col_idx, _] = probe_node.output_attrs[i];
+            /* only add columns that are in output */
+            probe_columns[i] = probe_needed[i] ? &probe_table->columns[actual_col_idx] : nullptr;
+        }
+        reader.prepare_probe(probe_columns);
+    }
 }
 
 } // namespace Contest

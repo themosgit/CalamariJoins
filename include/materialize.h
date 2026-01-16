@@ -7,17 +7,19 @@
 #include <join_setup.h>
 #include <plan.h>
 #include <vector>
+#include <worker_pool.h>
+#include <sys/mman.h>
+#include <variant>
+#include <match_collector.h>
+#include <algorithm>
+#include <functional>
+
+
+/* work here will be done after match collector is optimized and finalized
+ * we mainly want to look at the memcpy happening in string reconstruction */
 
 namespace Contest {
 
-/**
- *
- *  extracts string view from ColumnarTable page
- *  decodes offset array to find string boundaries
- *  returns pointer to string data and length
- *  works directly on page layout without copy
- *
- **/
 inline std::pair<const char *, uint16_t>
 get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     auto *page = reinterpret_cast<uint8_t *>(src_col.pages[page_idx]->data);
@@ -31,329 +33,363 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     return {char_begin + start_off, static_cast<uint16_t>(end_off - start_off)};
 }
 
-/**
- *
- *  materializes int32 column directly to ColumnarTable format
- *  builds pages incrementally with bitmap for nulls
- *  reader function abstracts source type either column_t [] or get_by_row
- *  or ColumnarTable via columnar_reader read_value_build/probe
- *  flushes page when space runs out
- *
- **/
-template <typename ReaderFunc>
-inline void materialize_int32_column(Column &dest_col,
-                                     const MatchCollector &collector,
-                                     ReaderFunc &&read_value, bool from_build) {
-
-    uint16_t num_rows = 0;
-    std::vector<int32_t> data;
-    std::vector<uint8_t> bitmap;
-
-    data.reserve(std::min(collector.size(), size_t(2048)));
-    bitmap.reserve(std::min(collector.size() / 8 + 1, size_t(256)));
-
+struct alignas(8) BitmapAccumulator {
+    std::vector<uint8_t> buffer;
     uint8_t pending_bits = 0;
     int bit_count = 0;
-
-    auto flush_bitmap = [&]() {
-        if (bit_count > 0) {
-            bitmap.push_back(pending_bits);
+    void reserve(size_t count) {
+        buffer.clear();
+        buffer.reserve((count + 7) / 8);
+    }
+    inline void add_bit(bool set) {
+        if (set) pending_bits |= (1u << bit_count);
+        if (++bit_count == 8) {
+            buffer.push_back(pending_bits);
             pending_bits = 0;
             bit_count = 0;
         }
-    };
-
-    auto save_page = [&]() {
-        flush_bitmap();
-
-        auto *page = dest_col.new_page()->data;
-        *reinterpret_cast<uint16_t *>(page) = num_rows;
-        *reinterpret_cast<uint16_t *>(page + 2) =
-            static_cast<uint16_t>(data.size());
-        std::memcpy(page + 4, data.data(), data.size() * 4);
-        std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                    bitmap.size());
-
-        num_rows = 0;
-        data.clear();
-        bitmap.clear();
-        pending_bits = 0;
-        bit_count = 0;
-    };
-
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t total_matches = collector.size();
-
-    auto run_loop = [&](auto get_row_id) {
-        for (size_t i = 0; i < total_matches; ++i) {
-            uint32_t row_id = get_row_id(matches_ptr[i]);
-            mema::value_t val = read_value(row_id);
-            if (4 + (data.size() + 1) * 4 + (bitmap.size() + 2) > PAGE_SIZE) {
-                save_page();
-            }
-            if (!val.is_null()) {
-                pending_bits |= (1u << bit_count);
-                data.emplace_back(val.value);
-            }
-            bit_count++;
-            if (bit_count == 8) {
-                bitmap.push_back(pending_bits);
-                pending_bits = 0;
-                bit_count = 0;
-            }
-            ++num_rows;
+    }
+    void flush_to_memory(uint8_t* dest_ptr) {
+        if (bit_count > 0) {
+            buffer.push_back(pending_bits);
+            pending_bits = 0;
+            bit_count = 0;
         }
-    };
+        if (!buffer.empty()) {
+            std::memcpy(dest_ptr, buffer.data(), buffer.size());
+        }
+        buffer.clear();
+    }
+    size_t current_byte_size() const {
+        return buffer.size() + (bit_count > 0 ? 1 : 0);
+    }
+};
 
-    if (from_build) {
-        run_loop(
-            [](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
-    } else {
-        run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+struct Int32PageBuilder {
+    static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = (PAGE_SIZE - 4 - 256) / 5;
+    
+    Page* current_page = nullptr;
+    int32_t* data_ptr = nullptr;
+    std::function<Page*()> alloc_page;
+    BitmapAccumulator bitmap;
+    uint16_t num_rows = 0;
+    uint16_t valid_count = 0;
+
+    explicit Int32PageBuilder(std::function<Page*()> alloc) : alloc_page(std::move(alloc)) {}
+
+    void prepare(size_t chunk_matches) {
+        bitmap.reserve(chunk_matches);
     }
 
-    if (num_rows != 0)
-        save_page();
-}
-
-/**
- *
- *  materializes varchar column directly to ColumnarTable format
- *  handles normal strings and long strings spanning multiple pages
- *  reader function same as int32 columns
- *  copies long string pages directly without repacking
- *
- **/
-template <typename ReaderFunc>
-inline void materialize_varchar_column(Column &dest_col,
-                                       const MatchCollector &collector,
-                                       ReaderFunc &&read_value,
-                                       const Column &src_col, bool from_build) {
-
-    uint16_t num_rows = 0;
-    std::vector<char> char_data;
-    std::vector<uint16_t> offsets;
-    std::vector<uint8_t> bitmap;
-    size_t current_char_size = 0;
-
-    size_t estimated_char_size =
-        std::min(collector.size() * 16, size_t(PAGE_SIZE));
-    char_data.reserve(estimated_char_size);
-    offsets.reserve(std::min(collector.size(), size_t(2048)));
-    bitmap.reserve(std::min(collector.size() / 8 + 1, size_t(512)));
-
-    uint8_t pending_bits = 0;
-    int bit_count = 0;
-
-    auto flush_bitmap = [&]() {
-        if (bit_count > 0) {
-            bitmap.push_back(pending_bits);
-            pending_bits = 0;
-            bit_count = 0;
+    inline bool add(mema::value_t val) {
+        if (!current_page) [[unlikely]] {
+            if (num_rows > 0) save_to_page(current_page);
+            current_page = alloc_page();
+            data_ptr = reinterpret_cast<int32_t*>(current_page->data + 4);
         }
-    };
 
-    auto save_long_string_buffer = [&](const std::string &str) {
-        size_t offset = 0;
-        bool first_page = true;
-        while (offset < str.size()) {
-            auto *page = dest_col.new_page()->data;
-            *reinterpret_cast<uint16_t *>(page) = first_page ? 0xffff : 0xfffe;
-            first_page = false;
-            size_t len = std::min(str.size() - offset, PAGE_SIZE - 4);
-            *reinterpret_cast<uint16_t *>(page + 2) =
-                static_cast<uint16_t>(len);
-            std::memcpy(page + 4, str.data() + offset, len);
-            offset += len;
+        if (!val.is_null()) {
+            bitmap.add_bit(true);
+            data_ptr[valid_count++] = val.value;
+        } else {
+            bitmap.add_bit(false);
         }
-    };
+        num_rows++;
+        return false;
+    }
 
-    auto copy_long_string_pages = [&](int32_t start_page_idx) {
-        int32_t curr_idx = start_page_idx;
-        while (true) {
-            auto *src_page_data = src_col.pages[curr_idx]->data;
-            auto *dest_page_data = dest_col.new_page()->data;
-            std::memcpy(dest_page_data, src_page_data, PAGE_SIZE);
+    bool should_check_overflow() const {
+        size_t est_bitmap = (num_rows + 8) / 8;
+        return (num_rows >= 65000) || (4 + (valid_count + 1) * 4 + est_bitmap + 32 > PAGE_SIZE);
+    }
 
-            curr_idx++;
-            if (curr_idx >= static_cast<int32_t>(src_col.pages.size()))
-                break;
-            auto *next_p = src_col.pages[curr_idx]->data;
-            if (*reinterpret_cast<uint16_t *>(next_p) != 0xfffe)
-                break;
-        }
-    };
-
-    auto save_page = [&]() {
-        flush_bitmap();
-        auto *page = dest_col.new_page()->data;
+    void save_to_page(Page* page_ptr) {
+        auto *page = reinterpret_cast<uint8_t*>(page_ptr->data);
         *reinterpret_cast<uint16_t *>(page) = num_rows;
-        *reinterpret_cast<uint16_t *>(page + 2) =
-            static_cast<uint16_t>(offsets.size());
-        std::memcpy(page + 4, offsets.data(), offsets.size() * 2);
-        std::memcpy(page + 4 + offsets.size() * 2, char_data.data(),
-                    current_char_size);
-        std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                    bitmap.size());
+        *reinterpret_cast<uint16_t *>(page + 2) = valid_count;
+        
+        size_t bmp_size = bitmap.current_byte_size();
+        bitmap.flush_to_memory(page + PAGE_SIZE - bmp_size);
+
+        current_page = nullptr; 
         num_rows = 0;
-        current_char_size = 0;
-        offsets.clear();
-        bitmap.clear();
-        pending_bits = 0;
-        bit_count = 0;
-    };
+        valid_count = 0;
+    }
+};
 
-    auto add_normal_string = [&](int32_t page_idx, int32_t offset_idx) -> bool {
-        auto [str_ptr, str_len] =
-            get_string_view(src_col, page_idx, offset_idx);
+struct VarcharPageBuilder {
+    static constexpr size_t OFFSET_GAP_SIZE = 2048; 
+    static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = 100;
 
-        if (str_len > PAGE_SIZE - 7) {
-            if (num_rows > 0)
-                save_page();
-            save_long_string_buffer(std::string(str_ptr, str_len));
+    Page* current_page = nullptr;
+    char* string_write_ptr = nullptr;
+    std::function<Page*()> alloc_page;
+    size_t current_gap_size = OFFSET_GAP_SIZE;
+    
+    std::vector<uint16_t> offsets;
+    BitmapAccumulator bitmap;
+    
+    uint16_t num_rows = 0;
+    size_t current_char_bytes = 0;
+    
+    const Column& src_col;
+
+    VarcharPageBuilder(const Column& s, std::function<Page*()> alloc) : alloc_page(std::move(alloc)), src_col(s) {}
+
+    void prepare(size_t chunk_matches) {
+        offsets.reserve(chunk_matches > 1024 ? 1024 : chunk_matches);
+        bitmap.reserve(chunk_matches);
+    }
+
+    bool add(mema::value_t val) {
+        if (val.is_null()) {
+            bitmap.add_bit(false);
+            num_rows++;
             return false;
         }
 
-        size_t needed = 4 + (offsets.size() + 1) * 2 +
-                        (current_char_size + str_len) + (bitmap.size() + 2);
-        if (needed > PAGE_SIZE)
-            save_page();
+        int32_t page_idx, offset_idx;
+        mema::value_t::decode_string(val.value, page_idx, offset_idx);
 
-        if (current_char_size + str_len > char_data.size()) {
-            char_data.resize(std::max(char_data.size() * 2,
-                                      current_char_size + str_len + 4096));
+        if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
+            if (num_rows > 0) flush_current_page();
+            copy_long_string_pages(page_idx);
+            return true; 
+        } 
+
+        auto [str_ptr, str_len] = get_string_view(src_col, page_idx, offset_idx);
+
+        if (str_len > PAGE_SIZE - 512) {
+            if (num_rows > 0) flush_current_page();
+            save_long_string_buffer(str_ptr, str_len);
+            return true;
         }
 
-        std::memcpy(char_data.data() + current_char_size, str_ptr, str_len);
-        current_char_size += str_len;
-        offsets.emplace_back(current_char_size);
-        return true;
-    };
+        if (!current_page) init_new_page();
 
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t total_matches = collector.size();
+        size_t ptr_offset = string_write_ptr - reinterpret_cast<char*>(current_page->data);
+        size_t physical_space = PAGE_SIZE - ptr_offset - 64; 
 
-    auto run_loop = [&](auto get_row_id) {
-        for (size_t i = 0; i < total_matches; ++i) {
-            uint32_t row_id = get_row_id(matches_ptr[i]);
-            mema::value_t val = read_value(row_id);
-
-            if (val.is_null()) {
-                if (4 + offsets.size() * 2 + current_char_size +
-                        (bitmap.size() + 2) >
-                    PAGE_SIZE) {
-                    save_page();
-                }
-                bit_count++;
-                if (bit_count == 8) {
-                    bitmap.push_back(pending_bits);
-                    pending_bits = 0;
-                    bit_count = 0;
-                }
-                num_rows++;
-            } else {
-                int32_t page_idx, offset_idx;
-                mema::value_t::decode_string(val.value, page_idx, offset_idx);
-
-                if (offset_idx == mema::value_t::LONG_STRING_OFFSET) {
-                    if (num_rows > 0)
-                        save_page();
-                    copy_long_string_pages(page_idx);
-                } else {
-                    if (add_normal_string(page_idx, offset_idx)) {
-                        pending_bits |= (1u << bit_count);
-                        bit_count++;
-                        if (bit_count == 8) {
-                            bitmap.push_back(pending_bits);
-                            pending_bits = 0;
-                            bit_count = 0;
-                        }
-                        num_rows++;
-                    }
-                }
+        size_t needed = 4 + (offsets.size() + 1) * 2 + current_char_bytes + str_len + bitmap.current_byte_size() + 10;
+        
+        bool flushed = false;
+        if (num_rows == 65535 || needed > PAGE_SIZE || (offsets.size() * 2 >= current_gap_size) || str_len > physical_space) {
+            flush_current_page();
+            init_new_page();
+            flushed = true;
+            if (str_len > PAGE_SIZE - OFFSET_GAP_SIZE - 100) {
+                 size_t reduced_gap = 256;
+                 string_write_ptr = reinterpret_cast<char*>(current_page->data + 4 + reduced_gap);
+                 current_gap_size = reduced_gap;
             }
         }
-    };
 
-    if (from_build) {
-        run_loop(
-            [](uint64_t m) { return static_cast<uint32_t>(m & 0xFFFFFFFF); });
-    } else {
-        run_loop([](uint64_t m) { return static_cast<uint32_t>(m >> 32); });
+        std::memcpy(string_write_ptr, str_ptr, str_len);
+        string_write_ptr += str_len;
+        current_char_bytes += str_len;
+        
+        offsets.push_back(static_cast<uint16_t>(current_char_bytes));
+        bitmap.add_bit(true);
+        num_rows++;
+        
+        return flushed;
     }
 
-    if (num_rows != 0)
-        save_page();
-}
+    bool should_check_overflow() const {
+        if (!current_page) return false;
+        size_t ptr_offset = reinterpret_cast<uint8_t*>(string_write_ptr) - reinterpret_cast<uint8_t*>(current_page->data);
+        return (num_rows >= 65000) || (ptr_offset + bitmap.current_byte_size() + 100 > PAGE_SIZE);
+    }
+
+    void save_to_page(Page* page_ptr) {
+        if (num_rows > 0 && current_page == page_ptr) {
+            flush_current_page();
+            if (current_page == nullptr) {
+                num_rows = 0; offsets.clear(); bitmap.buffer.clear(); current_char_bytes = 0;
+            }
+        }
+    }
+
+private:
+    void init_new_page() {
+        current_page = alloc_page();
+        current_gap_size = OFFSET_GAP_SIZE;
+        string_write_ptr = reinterpret_cast<char*>(current_page->data + 4 + OFFSET_GAP_SIZE);
+        current_char_bytes = 0;
+        num_rows = 0;
+        offsets.clear();
+    }
+
+    void flush_current_page() {
+        if (current_page && num_rows > 0) {
+            finalize_page();
+        }
+        current_page = nullptr;
+        offsets.clear();
+        bitmap.buffer.clear(); 
+        current_char_bytes = 0;
+    }
+
+    void finalize_page() {
+        uint8_t* page_base = reinterpret_cast<uint8_t*>(current_page->data);
+        size_t offsets_size = offsets.size() * 2;
+        char* chars_start_actual = reinterpret_cast<char*>(page_base + 4 + offsets_size);
+        char* chars_gap_end = string_write_ptr;
+        
+        *reinterpret_cast<uint16_t *>(page_base) = num_rows;
+        *reinterpret_cast<uint16_t *>(page_base + 2) = static_cast<uint16_t>(offsets.size());
+
+        std::memcpy(page_base + 4, offsets.data(), offsets_size);
+
+        if (current_char_bytes > 0) {
+            std::memmove(chars_start_actual, chars_gap_end - current_char_bytes, current_char_bytes);
+        }
+
+        size_t bmp_size = bitmap.current_byte_size();
+        bitmap.flush_to_memory(page_base + PAGE_SIZE - bmp_size);
+    }
+
+    void copy_long_string_pages(int32_t start_page_idx) {
+        int32_t curr_idx = start_page_idx;
+        while (true) {
+            auto *src = src_col.pages[curr_idx]->data;
+            auto *dest = alloc_page()->data;
+            std::memcpy(dest, src, PAGE_SIZE);
+            if (++curr_idx >= static_cast<int32_t>(src_col.pages.size())) break;
+            if (*reinterpret_cast<uint16_t *>(src_col.pages[curr_idx]->data) != 0xfffe) break;
+        }
+        num_rows = 0; offsets.clear(); bitmap.buffer.clear(); current_char_bytes = 0; current_page = nullptr;
+    }
+
+    void save_long_string_buffer(const char* data_ptr, size_t total_len) {
+        size_t offset = 0;
+        bool first_page = true;
+        while (offset < total_len) {
+            auto *page = alloc_page()->data;
+            *reinterpret_cast<uint16_t *>(page) = first_page ? 0xffff : 0xfffe;
+            first_page = false;
+            size_t len = std::min(total_len - offset, PAGE_SIZE - 4);
+            *reinterpret_cast<uint16_t *>(page + 2) = static_cast<uint16_t>(len);
+            std::memcpy(page + 4, data_ptr + offset, len);
+            offset += len;
+        }
+        num_rows = 0; offsets.clear(); bitmap.buffer.clear(); current_char_bytes = 0; current_page = nullptr;
+    }
+};
 
 /**
  *
- *  materializes final ColumnarTable output from columnar inputs
- *  both build and probe read directly from ColumnarTable pages
- *  uses columnar_reader for efficient page access
- *  produces final result with proper page format
+ *  generic parallel column materialization driver
+ *  handles mmap allocation, threading, and merging logic
  *
  **/
-inline ColumnarTable materialize_from_columnar(
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input,
-    const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
-    const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
-    ColumnarReader &columnar_reader, const Plan &plan) {
 
-    ColumnarTable result;
-    result.num_rows = collector.size();
-    if (collector.size() == 0) {
-        for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
-            auto [_, data_type] = remapped_attrs[out_idx];
-            result.columns.emplace_back(data_type);
-        }
-        return result;
+template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
+inline void materialize_column(Column &dest_col,
+                                        const MatchCollector &collector,
+                                        ReaderFunc &&read_value,
+                                        InitBuilderFunc &&init_builder,
+                                        bool from_build,
+                                        size_t est_bytes_per_row) {
+    const size_t total_matches = collector.size();
+    if (total_matches == 0) return;
+    
+    const_cast<MatchCollector&>(collector).ensure_finalized();
+    constexpr int num_threads = worker_pool.thread_count();
+
+    size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
+    size_t usable_per_page = PAGE_SIZE - 256; 
+    size_t rows_per_page = std::max(1ul, usable_per_page / est_bytes_per_row);
+    size_t pages_per_thread = (matches_per_thread + rows_per_page - 1) / rows_per_page + 10; 
+    size_t total_pages = pages_per_thread * num_threads;
+
+    void* page_memory = mmap(nullptr, total_pages * PAGE_SIZE,
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page_memory == MAP_FAILED) throw std::bad_alloc();
+
+    std::vector<Column> thread_columns;
+    thread_columns.reserve(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+        thread_columns.emplace_back(dest_col.type);
     }
 
-    auto *build_table = std::get<const ColumnarTable *>(build_input.data);
-    auto *probe_table = std::get<const ColumnarTable *>(probe_input.data);
+    worker_pool.execute([&](size_t t) {
+        size_t num_threads = worker_pool.thread_count();
+        size_t start = t * total_matches / num_threads;
+        size_t end = (t + 1) * total_matches / num_threads;
+        if (start >= end) return;
 
-    for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
-        auto [col_idx, data_type] = remapped_attrs[out_idx];
-        bool from_build = col_idx < build_size;
-        size_t remapped_col_idx = from_build ? col_idx : col_idx - build_size;
+        Column &local_col = thread_columns[t];
 
-        const ColumnarTable *src_table = from_build ? build_table : probe_table;
-        const PlanNode *src_node = from_build ? &build_node : &probe_node;
-        auto [actual_col_idx, _] = src_node->output_attrs[remapped_col_idx];
-        const Column &src_col = src_table->columns[actual_col_idx];
+        size_t thread_page_start = t * pages_per_thread;
+        size_t thread_page_limit = pages_per_thread;
+        size_t used_pages = 0;
 
-        result.columns.emplace_back(data_type);
-        Column &dest_col = result.columns.back();
+        ColumnarReader::Cursor cursor;
 
-        auto read_columnar_value = [&](uint32_t row_id) {
-            return from_build
-                       ? columnar_reader.read_value_build(
-                             src_col, remapped_col_idx, row_id, src_col.type)
-                       : columnar_reader.read_value_probe(
-                             src_col, remapped_col_idx, row_id, src_col.type);
+        auto page_allocator = [&]() -> Page* {
+            Page* p;
+            if (used_pages < thread_page_limit) {
+                p = reinterpret_cast<Page*>(
+                    static_cast<char*>(page_memory) + (thread_page_start + used_pages) * PAGE_SIZE);
+                used_pages++;
+            } else {
+                p = new Page();
+            }
+            local_col.pages.push_back(p);
+            return p;
         };
 
-        if (data_type == DataType::INT32) {
-            materialize_int32_column(dest_col, collector, read_columnar_value,
-                                     from_build);
-        } else {
-            materialize_varchar_column(dest_col, collector, read_columnar_value,
-                                       src_col, from_build);
+        BuilderType builder = init_builder(page_allocator);
+        builder.prepare(end - start);
+
+        const size_t check_interval = BuilderType::MIN_ROWS_PER_PAGE_CHECK;
+        size_t rows_since_check = 0;
+
+        auto range = from_build ? collector.get_left_range(start, end - start)
+                                : collector.get_right_range(start, end - start);
+
+        for (uint32_t row_id : range) {
+            bool flushed = builder.add(read_value(row_id, cursor));
+
+            if (flushed) {
+                rows_since_check = 0;
+            } else {
+                rows_since_check++;
+                if (rows_since_check >= check_interval) {
+                    if (builder.should_check_overflow()) {
+                        builder.save_to_page(builder.current_page);
+                        rows_since_check = 0;
+                    }
+                    if (rows_since_check > check_interval * 2) rows_since_check = 0;
+                }
+            }
         }
+
+        if (builder.num_rows != 0) {
+            builder.save_to_page(builder.current_page);
+        }
+    });
+
+    for (auto &thread_col : thread_columns) {
+        for (auto *page : thread_col.pages) {
+            dest_col.pages.push_back(page);
+        }
+        thread_col.pages.clear();
     }
 
-    return result;
+    auto* mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
+    dest_col.assign_mapped_memory(mapped_mem);
 }
 
 /**
  *
  *  materializes final ColumnarTable from mixed inputs
- *  produces result from columnar + column_t intermediate combinations
+ *  dispatches to specific parallel builders based on type
  *
  **/
-inline ColumnarTable materialize_mixed(
+inline ColumnarTable materialize(
     const MatchCollector &collector, const JoinInput &build_input,
     const JoinInput &probe_input,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
@@ -362,23 +398,11 @@ inline ColumnarTable materialize_mixed(
 
     ColumnarTable result;
     result.num_rows = collector.size();
+    
     if (collector.size() == 0) {
-        for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
-            auto [_, data_type] = remapped_attrs[out_idx];
-            result.columns.emplace_back(data_type);
-        }
+        for (auto [_, dtype] : remapped_attrs) result.columns.emplace_back(dtype);
         return result;
     }
-
-    auto read_from_intermediate = [](const mema::column_t &column,
-                                     uint32_t row_id) {
-        if (column.has_direct_access()) {
-            return column[row_id];
-        } else {
-            const mema::value_t *val = column.get_by_row(row_id);
-            return val ? *val : mema::value_t{mema::value_t::NULL_VALUE};
-        }
-    };
 
     for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
         auto [col_idx, data_type] = remapped_attrs[out_idx];
@@ -388,331 +412,67 @@ inline ColumnarTable materialize_mixed(
         result.columns.emplace_back(data_type);
         Column &dest_col = result.columns.back();
 
-        const Column *columnar_src_col = nullptr;
-        const mema::column_t *intermediate_src_col = nullptr;
+        const Column *col_source = nullptr;
+        const mema::column_t *inter_source = nullptr;
+        const JoinInput& input = from_build ? build_input : probe_input;
+        const PlanNode& node = from_build ? build_node : probe_node;
 
-        if (from_build) {
-            if (build_input.is_columnar()) {
-                auto *build_table =
-                    std::get<const ColumnarTable *>(build_input.data);
-                auto [actual_col_idx, _] =
-                    build_node.output_attrs[remapped_col_idx];
-                columnar_src_col = &build_table->columns[actual_col_idx];
-            } else {
-                const auto &build_result =
-                    std::get<ExecuteResult>(build_input.data);
-                intermediate_src_col = &build_result[remapped_col_idx];
-            }
+        if (input.is_columnar()) {
+            auto *table = std::get<const ColumnarTable *>(input.data);
+            auto [actual_idx, _] = node.output_attrs[remapped_col_idx];
+            col_source = &table->columns[actual_idx];
         } else {
-            if (probe_input.is_columnar()) {
-                auto *probe_table =
-                    std::get<const ColumnarTable *>(probe_input.data);
-                auto [actual_col_idx, _] =
-                    probe_node.output_attrs[remapped_col_idx];
-                columnar_src_col = &probe_table->columns[actual_col_idx];
-            } else {
-                const auto &probe_result =
-                    std::get<ExecuteResult>(probe_input.data);
-                intermediate_src_col = &probe_result[remapped_col_idx];
-            }
+            const auto &res = std::get<ExecuteResult>(input.data);
+            inter_source = &res[remapped_col_idx];
         }
 
         if (data_type == DataType::INT32) {
-            if (columnar_src_col) {
-                auto &col = *columnar_src_col;
-                if (from_build) {
-                    materialize_int32_column(
-                        dest_col, collector,
-                        [&](uint32_t rid) {
-                            return columnar_reader.read_value_build(
-                                col, remapped_col_idx, rid, DataType::INT32);
-                        },
-                        from_build);
-                } else {
-                    materialize_int32_column(
-                        dest_col, collector,
-                        [&](uint32_t rid) {
-                            return columnar_reader.read_value_probe(
-                                col, remapped_col_idx, rid, DataType::INT32);
-                        },
-                        from_build);
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
+                if (col_source) {
+                    return columnar_reader.read_value(*col_source, remapped_col_idx, rid,
+                                                      DataType::INT32, cursor, from_build);
                 }
-            } else {
-                auto &col = *intermediate_src_col;
-                materialize_int32_column(
-                    dest_col, collector,
-                    [&](uint32_t rid) {
-                        return read_from_intermediate(col, rid);
-                    },
-                    from_build);
-            }
+                return (*inter_source)[rid];
+            };
+
+            auto init = [](std::function<Page*()> alloc) { return Int32PageBuilder(std::move(alloc)); };
+
+            materialize_column<Int32PageBuilder>(
+                dest_col, collector, reader, init, from_build, 4);
+
         } else {
-            const Column *string_source_col = columnar_src_col;
-            if (!string_source_col && intermediate_src_col) {
-                const auto &src_table =
-                    plan.inputs[intermediate_src_col->source_table];
-                string_source_col =
-                    &src_table.columns[intermediate_src_col->source_column];
+            const Column *str_src_ptr = col_source;
+            if (!str_src_ptr && inter_source) {
+                str_src_ptr = &plan.inputs[inter_source->source_table]
+                                   .columns[inter_source->source_column];
             }
 
-            if (columnar_src_col) {
-                auto &col = *columnar_src_col;
-                if (from_build) {
-                    materialize_varchar_column(
-                        dest_col, collector,
-                        [&](uint32_t rid) {
-                            return columnar_reader.read_value_build(
-                                col, remapped_col_idx, rid, DataType::VARCHAR);
-                        },
-                        *string_source_col, from_build);
-                } else {
-                    materialize_varchar_column(
-                        dest_col, collector,
-                        [&](uint32_t rid) {
-                            return columnar_reader.read_value_probe(
-                                col, remapped_col_idx, rid, DataType::VARCHAR);
-                        },
-                        *string_source_col, from_build);
+            auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
+                if (col_source) {
+                    return columnar_reader.read_value(*col_source, remapped_col_idx, rid,
+                                                      DataType::VARCHAR, cursor, from_build);
                 }
-            } else {
-                auto &col = *intermediate_src_col;
-                materialize_varchar_column(
-                    dest_col, collector,
-                    [&](uint32_t rid) {
-                        return read_from_intermediate(col, rid);
-                    },
-                    *string_source_col, from_build);
-            }
+                return (*inter_source)[rid];
+            };
+
+            auto init = [str_src_ptr](std::function<Page*()> alloc) { 
+                return VarcharPageBuilder(*str_src_ptr, std::move(alloc)); 
+            };
+
+            materialize_column<VarcharPageBuilder>(
+                dest_col, collector, reader, init, from_build, 35);
         }
     }
     return result;
 }
-
-inline void ensure_bitmap_size(std::vector<uint8_t> &bitmap, size_t byte_idx) {
-    if (bitmap.size() <= byte_idx) {
-        bitmap.resize(byte_idx + 1, 0);
-    }
-}
-inline void set_bitmap_bit(std::vector<uint8_t> &bitmap, size_t byte_idx,
-                           uint8_t bit_idx) {
-    ensure_bitmap_size(bitmap, byte_idx);
-    bitmap[byte_idx] |= (1u << bit_idx);
-}
-
-/**
- *
- *  materializes final ColumnarTable from column_t intermediate inputs
- *  both build and probe are intermediate results
- *  produces result from column_t + column_t
- *
- **/
-inline ColumnarTable materialize_from_intermediate(
-    const MatchCollector &collector, const ExecuteResult &build,
-    const ExecuteResult &probe,
-    const std::vector<std::tuple<size_t, DataType>> &output_attrs,
-    const Plan &plan) {
-
-    ColumnarTable result;
-    result.num_rows = collector.size();
-    if (collector.size() == 0) {
-        for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
-            auto [_, data_type] = output_attrs[out_idx];
-            result.columns.emplace_back(data_type);
-        }
-        return result;
-    }
-
-    const uint64_t *matches_ptr = collector.matches.data();
-    const size_t total_matches = collector.size();
-    const size_t build_size = build.size();
-
-    for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
-        auto [col_idx, data_type] = output_attrs[out_idx];
-        const bool from_build = col_idx < build_size;
-        const mema::column_t *column =
-            from_build ? &build[col_idx] : &probe[col_idx - build_size];
-        const uint32_t shift = from_build ? 0 : 32;
-
-        result.columns.emplace_back(data_type);
-        Column &dest_col = result.columns.back();
-
-        if (data_type == DataType::INT32) {
-            uint16_t num_rows = 0;
-            std::vector<int32_t> data;
-            std::vector<uint8_t> bitmap;
-            data.reserve(2048);
-            bitmap.reserve(256);
-
-            auto save_page = [&]() {
-                auto *page = dest_col.new_page()->data;
-                *reinterpret_cast<uint16_t *>(page) = num_rows;
-                *reinterpret_cast<uint16_t *>(page + 2) =
-                    static_cast<uint16_t>(data.size());
-                std::memcpy(page + 4, data.data(), data.size() * 4);
-                std::memcpy(page + PAGE_SIZE - bitmap.size(), bitmap.data(),
-                            bitmap.size());
-                num_rows = 0;
-                data.clear();
-                bitmap.clear();
-            };
-
-            if (column->has_direct_access()) {
-                size_t match_idx = 0;
-                while (match_idx < total_matches) {
-                    uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                    size_t run_end = match_idx + 1;
-                    uint32_t expected_row = row_id + 1;
-                    while (run_end < total_matches &&
-                           (matches_ptr[run_end] >> shift) == expected_row) {
-                        ++expected_row;
-                        ++run_end;
-                    }
-                    size_t run_length = run_end - match_idx;
-                    for (size_t i = 0; i < run_length; ++i) {
-                        uint32_t r = row_id + i;
-                        const mema::value_t &val = (*column)[r];
-                        if (4 + (data.size() + 1) * 4 + (num_rows / 8 + 1) >
-                            PAGE_SIZE)
-                            save_page();
-                        size_t byte_idx = num_rows / 8;
-                        uint8_t bit_idx = num_rows % 8;
-                        set_bitmap_bit(bitmap, byte_idx, bit_idx);
-                        data.emplace_back(val.value);
-                        ++num_rows;
-                    }
-                    match_idx = run_end;
-                }
-            } else {
-                for (size_t match_idx = 0; match_idx < total_matches;
-                     ++match_idx) {
-                    uint32_t row_id = (matches_ptr[match_idx] >> shift);
-                    const mema::value_t *val = column->get_by_row(row_id);
-                    if (4 + (val ? data.size() + 1 : data.size()) * 4 +
-                            (num_rows / 8 + 1) >
-                        PAGE_SIZE)
-                        save_page();
-                    size_t byte_idx = num_rows / 8;
-                    uint8_t bit_idx = num_rows % 8;
-                    if (val) {
-                        set_bitmap_bit(bitmap, byte_idx, bit_idx);
-                        data.emplace_back(val->value);
-                    } else {
-                        ensure_bitmap_size(bitmap, byte_idx);
-                    }
-                    ++num_rows;
-                }
-            }
-            if (num_rows != 0)
-                save_page();
-        } else {
-            const auto &src_table = plan.inputs[column->source_table];
-            const auto &src_col = src_table.columns[column->source_column];
-
-            auto read_val = [&](uint32_t row_id) {
-                if (column->has_direct_access())
-                    return (*column)[row_id];
-                const mema::value_t *v = column->get_by_row(row_id);
-                return v ? *v : mema::value_t{mema::value_t::NULL_VALUE};
-            };
-
-            materialize_varchar_column(
-                dest_col, collector,
-                [&](uint32_t rid) { return read_val(rid); }, src_col,
-                from_build);
-        }
-    }
-    return result;
-}
-
-/**
- *
- *  creates empty ColumnarTable with correct column types
- *  used when join produces no matches at root node
- *  initializes columns without any pages
- *
- **/
 inline ColumnarTable create_empty_result(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs) {
     ColumnarTable empty_result;
     empty_result.num_rows = 0;
-    for (size_t out_idx = 0; out_idx < remapped_attrs.size(); ++out_idx) {
-        auto [_, data_type] = remapped_attrs[out_idx];
+    for (auto [_, data_type] : remapped_attrs) {
         empty_result.columns.emplace_back(data_type);
     }
     return empty_result;
-}
-
-/**
- *
- *  dispatches materialization based on is_root flag and input types
- *  root nodes produce ColumnarTable via materialize_* functions
- *  intermediate nodes produce column_t via construct_intermediate_* functions
- *  handles empty collector case for both root and intermediate
- *
- **/
-inline std::variant<ExecuteResult, ColumnarTable> materialize_join_results(
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input, const BuildProbeConfig &config,
-    const PlanNode &build_node, const PlanNode &probe_node, JoinSetup &setup,
-    const Plan &plan, bool is_root) {
-
-    bool build_is_columnar = build_input.is_columnar();
-    bool probe_is_columnar = probe_input.is_columnar();
-
-    if (is_root) {
-        if (collector.size() == 0) {
-            return create_empty_result(config.remapped_attrs);
-        }
-
-        if (build_is_columnar && probe_is_columnar) {
-            return materialize_from_columnar(
-                collector, build_input, probe_input, config.remapped_attrs,
-                build_node, probe_node, build_input.output_size(),
-                setup.columnar_reader, plan);
-        } else if (!build_is_columnar && !probe_is_columnar) {
-            const auto &build_result =
-                std::get<ExecuteResult>(build_input.data);
-            const auto &probe_result =
-                std::get<ExecuteResult>(probe_input.data);
-            return materialize_from_intermediate(
-                collector, build_result, probe_result, config.remapped_attrs,
-                plan);
-        } else {
-            return materialize_mixed(
-                collector, build_input, probe_input, config.remapped_attrs,
-                build_node, probe_node, build_input.output_size(),
-                setup.columnar_reader, plan);
-        }
-    } else {
-        if (collector.size() == 0) {
-            return std::move(setup.results);
-        }
-
-        if (build_is_columnar && probe_is_columnar) {
-            construct_intermediate_from_columnar(collector, build_input, probe_input,
-                                      config.remapped_attrs, build_node,
-                                      probe_node, build_input.output_size(),
-                                      setup.columnar_reader, setup.results);
-        } else if (!build_is_columnar && !probe_is_columnar) {
-            const auto &build_result =
-                std::get<ExecuteResult>(build_input.data);
-            const auto &probe_result =
-                std::get<ExecuteResult>(probe_input.data);
-            construct_intermediate_from_intermediate(collector, build_result, probe_result,
-                                          config.remapped_attrs, setup.results);
-        } else {
-            construct_intermediate_mixed(collector, build_input, probe_input,
-                              config.remapped_attrs, build_node, probe_node,
-                              build_input.output_size(), setup.columnar_reader,
-                              setup.results);
-        }
-
-        for (auto &col : setup.results) {
-            col.build_cache();
-        }
-
-        return std::move(setup.results);
-    }
 }
 
 } // namespace Contest

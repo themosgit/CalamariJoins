@@ -1,7 +1,7 @@
 {
   description = "An environment for the sigmod project";
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -21,9 +21,9 @@
       {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            llvmPackages_21.libcxxClang
-            llvmPackages_21.libllvm
-            gdb
+            llvmPackages.libcxxClang
+            llvmPackages.libllvm
+            gef
             curl
             git
             cmake

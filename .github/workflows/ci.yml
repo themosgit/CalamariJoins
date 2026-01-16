@@ -18,7 +18,7 @@ jobs:
     steps:
     - name: Checkout repository code
       uses: actions/checkout@v4
-
+      
     - name: Configure initial build with CMake
       run: |
         cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
