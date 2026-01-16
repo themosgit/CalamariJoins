@@ -8,8 +8,10 @@
 #include <bloom_tags.h>
 #include <intermediate.h>
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__aarch64__)
     #include <hardware_darwin.h>
+#elif defined(SPC__USE_BENCHMARKVM_HARDWARE)
+    #include <hardware_benchmarkvm.h>
 #else
     #include <hardware.h>
 #endif
