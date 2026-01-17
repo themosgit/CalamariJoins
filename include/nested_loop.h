@@ -6,38 +6,19 @@
 #include <cstdint>
 #include <intermediate.h>
 #include <join_setup.h>
+#include <match_collector.h>
 #include <plan.h>
 #include <vector>
 #include <worker_pool.h>
-#include <match_collector.h>
 
 namespace Contest {
 
-inline void nested_loop_join(const JoinInput &build_input,
-                             const JoinInput &probe_input, size_t build_attr,
-                             size_t probe_attr, MatchCollector &collector,
-                             MatchCollectionMode mode = MatchCollectionMode::BOTH) {
-    size_t build_rows = build_input.row_count(build_attr);
-    size_t probe_rows = probe_input.row_count(probe_attr);
-
-    if (build_rows == 0 || probe_rows == 0) return;
-
-    constexpr size_t MAX_BUILD_SIZE = 64; 
-    int32_t b_vals[MAX_BUILD_SIZE];
-    uint32_t b_ids[MAX_BUILD_SIZE];
-    size_t b_count = 0;
-
-    auto collect_build = [&](uint32_t id, int32_t val) {
-        if (b_count < MAX_BUILD_SIZE) {
-            b_ids[b_count] = id;
-            b_vals[b_count] = val;
-            b_count++;
-        }
-    };
-
-    if (build_input.is_columnar()) {
-        auto *table = std::get<const ColumnarTable *>(build_input.data);
-        auto [col_idx, _] = build_input.node->output_attrs[build_attr];
+template <typename Func>
+inline void visit_rows(const JoinInput &input, size_t attr_idx,
+                       Func &&visitor) {
+    if (input.is_columnar()) {
+        auto *table = std::get<const ColumnarTable *>(input.data);
+        auto [col_idx, _] = input.node->output_attrs[attr_idx];
         const Column &col = table->columns[col_idx];
 
         uint32_t row_id = 0;
@@ -50,25 +31,56 @@ inline void nested_loop_join(const JoinInput &build_input,
             uint16_t val_idx = 0;
             for (uint16_t i = 0; i < num_rows; i++) {
                 if (num_rows == num_values) {
-                    collect_build(row_id++, data[i]);
+                    visitor(row_id++, data[i]);
                 } else {
-                    auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                    auto *bitmap = reinterpret_cast<const uint8_t *>(
+                        page + PAGE_SIZE - (num_rows + 7) / 8);
                     if (bitmap[i / 8] & (1u << (i % 8))) {
-                        collect_build(row_id, data[val_idx++]);
+                        visitor(row_id, data[val_idx++]);
                     }
                     row_id++;
                 }
             }
         }
     } else {
-        const auto &res = std::get<ExecuteResult>(build_input.data);
-        const mema::column_t &col = res[build_attr];
+        const auto &res = std::get<ExecuteResult>(input.data);
+        const mema::column_t &col = res[attr_idx];
         size_t count = col.row_count();
         for (size_t i = 0; i < count; i++) {
             const mema::value_t &val = col[i];
-            if (!val.is_null()) collect_build((uint32_t)i, val.value);
+            if (!val.is_null()) {
+                visitor(static_cast<uint32_t>(i), val.value);
+            }
         }
     }
+}
+
+inline void
+nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
+                 size_t build_attr, size_t probe_attr,
+                 MatchCollector &collector,
+                 MatchCollectionMode mode = MatchCollectionMode::BOTH) {
+    size_t build_rows = build_input.row_count(build_attr);
+    size_t probe_rows = probe_input.row_count(probe_attr);
+
+    if (build_rows == 0 || probe_rows == 0)
+        return;
+
+    constexpr size_t MAX_BUILD_SIZE = 64;
+    int32_t b_vals[MAX_BUILD_SIZE];
+    uint32_t b_ids[MAX_BUILD_SIZE];
+    size_t b_count = 0;
+
+    auto collect_build = [&](uint32_t id, int32_t val) {
+        if (b_count < MAX_BUILD_SIZE) {
+            b_ids[b_count] = id;
+            b_vals[b_count] = val;
+            b_count++;
+        }
+    };
+
+    visit_rows(build_input, build_attr, collect_build);
+
     int num_threads = worker_pool.thread_count();
     std::vector<ThreadLocalMatchBuffer> buffers;
     buffers.reserve(num_threads);
@@ -82,7 +94,7 @@ inline void nested_loop_join(const JoinInput &build_input,
         auto *table = std::get<const ColumnarTable *>(probe_input.data);
         auto [col_idx, _] = probe_input.node->output_attrs[probe_attr];
         probe_col = &table->columns[col_idx];
-        
+
         page_offsets.reserve(probe_col->pages.size() + 1);
         uint32_t current = 0;
         for (auto *p : probe_col->pages) {
@@ -108,8 +120,11 @@ inline void nested_loop_join(const JoinInput &build_input,
             size_t num_pages = probe_col->pages.size();
 
             while (true) {
-            size_t i = probe_page_counter.fetch_add(1, std::memory_order_relaxed);
-                if (i >= num_pages) break;
+                size_t i =
+                    probe_page_counter.fetch_add(1, std::memory_order_relaxed);
+
+                if (i >= num_pages)
+                    break;
                 auto *page = probe_col->pages[i]->data;
                 auto num_rows = *reinterpret_cast<const uint16_t *>(page);
                 auto num_values = *reinterpret_cast<const uint16_t *>(page + 2);
@@ -121,7 +136,8 @@ inline void nested_loop_join(const JoinInput &build_input,
                         process_value(row_id++, data[j]);
                     }
                 } else {
-                    auto *bitmap = reinterpret_cast<const uint8_t *>(page + PAGE_SIZE - (num_rows + 7) / 8);
+                    auto *bitmap = reinterpret_cast<const uint8_t *>(
+                        page + PAGE_SIZE - (num_rows + 7) / 8);
                     uint16_t val_idx = 0;
                     for (uint16_t j = 0; j < num_rows; j++) {
                         if (bitmap[j / 8] & (1u << (j % 8))) {

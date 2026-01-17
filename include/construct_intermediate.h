@@ -50,12 +50,6 @@ struct alignas(8) SourceInfo {
     bool from_build = false;
 };
 
-/**
- *
- *  calculates total pages needed and allocates single memory block
- *  distributes pre-allocated pages to result columns
- *
- **/
 inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
     ExecuteResult& results, size_t total_matches) {
 
@@ -76,12 +70,6 @@ inline std::shared_ptr<BatchAllocator> batch_allocate_for_results(
     return allocator;
 }
 
-/**
- *
- *  resolves all data sources before execution
- *  handles logic for columnar/intermediate and build/probe mapping
- *
- **/
 inline std::vector<SourceInfo> prepare_sources(
     const std::vector<std::tuple<size_t, DataType>>& remapped_attrs,
     const JoinInput& build_input,
@@ -113,12 +101,6 @@ inline std::vector<SourceInfo> prepare_sources(
     return sources;
 }
 
-/**
- *
- *  constructs intermediate results from join matches
- *  parallelized with hoisted checks and batch memory allocation
- *
- **/
 inline void construct_intermediate(
     const MatchCollector &collector, const JoinInput &build_input,
     const JoinInput &probe_input,
