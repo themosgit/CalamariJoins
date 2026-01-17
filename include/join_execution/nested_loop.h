@@ -2,14 +2,14 @@
 #pragma once
 
 #include <atomic>
-#include <construct_intermediate.h>
 #include <cstdint>
-#include <intermediate.h>
-#include <join_setup.h>
-#include <match_collector.h>
-#include <plan.h>
+#include <data_model/intermediate.h>
+#include <data_model/plan.h>
+#include <join_execution/join_setup.h>
+#include <join_execution/match_collector.h>
+#include <materialization/construct_intermediate.h>
+#include <platform/worker_pool.h>
 #include <vector>
-#include <worker_pool.h>
 
 namespace Contest {
 

@@ -4,9 +4,9 @@
 #include <fmt/core.h>
 #include <range/v3/all.hpp>
 
-#include <attribute.h>
-#include <plan.h>
-#include <statement.h>
+#include <data_model/plan.h>
+#include <data_model/statement.h>
+#include <foundation/attribute.h>
 
 #ifdef TEAMOPT_USE_DUCKDB
 #include <duckdb.hpp>

@@ -1,19 +1,19 @@
 #pragma once
 #include <algorithm>
-#include <bloom_tags.h>
 #include <cstddef>
 #include <cstdint>
+#include <data_model/intermediate.h>
 #include <deque>
-#include <intermediate.h>
+#include <foundation/bloom_tags.h>
+#include <platform/worker_pool.h>
 #include <vector>
-#include <worker_pool.h>
 
 #if defined(__APPLE__) && defined(__aarch64__)
-#include <hardware_darwin.h>
+#include <platform/hardware_darwin.h>
 #elif defined(SPC__USE_BENCHMARKVM_HARDWARE)
-#include <hardware_benchmarkvm.h>
+#include <platform/hardware_benchmarkvm.h>
 #else
-#include <hardware.h>
+#include <platform/hardware.h>
 #endif
 
 #if defined(__x86_64__)

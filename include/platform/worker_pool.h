@@ -1,16 +1,16 @@
 #pragma once
 
 #if defined(__APPLE__) && defined(__aarch64__)
-#include <hardware_darwin.h>
+#include <platform/hardware_darwin.h>
 #elif defined(SPC__USE_BENCHMARKVM_HARDWARE)
-#include <hardware_benchmarkvm.h>
+#include <platform/hardware_benchmarkvm.h>
 #else
-#include <hardware.h>
+#include <platform/hardware.h>
 #endif
 
 #include <atomic>
-#include <common.h>
 #include <condition_variable>
+#include <foundation/common.h>
 #include <functional>
 #include <mutex>
 #include <thread>

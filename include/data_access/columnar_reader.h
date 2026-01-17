@@ -1,12 +1,12 @@
 #pragma once
 
-#include "attribute.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <intermediate.h>
-#include <plan.h>
+#include <data_model/intermediate.h>
+#include <data_model/plan.h>
+#include <foundation/attribute.h>
 #include <vector>
 
 /* branch predictions shaved over 250ms in IR construction */

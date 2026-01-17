@@ -7,8 +7,8 @@
 
 #include <cstdint>
 
-#include "attribute.h"
 #include "statement.h"
+#include <foundation/attribute.h>
 
 struct FilterThreadPool {
     std::vector<std::thread> threads;

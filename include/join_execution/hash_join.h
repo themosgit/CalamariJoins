@@ -1,10 +1,10 @@
 #pragma once
 
-#include <hashtable.h>
-#include <intermediate.h>
-#include <join_setup.h>
-#include <match_collector.h>
-#include <worker_pool.h>
+#include <data_model/intermediate.h>
+#include <join_execution/hashtable.h>
+#include <join_execution/join_setup.h>
+#include <join_execution/match_collector.h>
+#include <platform/worker_pool.h>
 
 /**
  *

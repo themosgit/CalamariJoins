@@ -1,9 +1,9 @@
 #pragma once
 
-#include <columnar_reader.h>
-#include <intermediate.h>
-#include <match_collector.h>
-#include <plan.h>
+#include <data_access/columnar_reader.h>
+#include <data_model/intermediate.h>
+#include <data_model/plan.h>
+#include <join_execution/match_collector.h>
 #include <tuple>
 #include <variant>
 #include <vector>

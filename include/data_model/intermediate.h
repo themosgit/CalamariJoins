@@ -1,10 +1,10 @@
 #pragma once
 
-#include <common.h>
 #include <cstdint>
+#include <data_access/table.h>
+#include <data_model/plan.h>
+#include <foundation/common.h>
 #include <memory>
-#include <plan.h>
-#include <table.h>
 #include <vector>
 
 namespace mema {

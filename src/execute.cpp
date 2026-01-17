@@ -1,22 +1,22 @@
-#include "attribute.h"
+#include <foundation/attribute.h>
 #if defined(__APPLE__) && defined(__aarch64__)
-#include <hardware_darwin.h>
+#include <platform/hardware_darwin.h>
 #elif defined(SPC__USE_BENCHMARKVM_HARDWARE)
-#include <hardware_benchmarkvm.h>
+#include <platform/hardware_benchmarkvm.h>
 #else
-#include <hardware.h>
+#include <platform/hardware.h>
 #endif
 
 #include <chrono>
-#include <columnar_reader.h>
-#include <construct_intermediate.h>
-#include <hash_join.h>
-#include <hashtable.h>
-#include <intermediate.h>
+#include <data_access/columnar_reader.h>
+#include <data_model/intermediate.h>
 #include <iostream>
-#include <join_setup.h>
-#include <materialize.h>
-#include <nested_loop.h>
+#include <join_execution/hash_join.h>
+#include <join_execution/hashtable.h>
+#include <join_execution/join_setup.h>
+#include <join_execution/nested_loop.h>
+#include <materialization/construct_intermediate.h>
+#include <materialization/materialize.h>
 #include <variant>
 
 namespace Contest {

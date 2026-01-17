@@ -4,9 +4,9 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <platform/worker_pool.h>
 #include <sys/mman.h>
 #include <vector>
-#include <worker_pool.h>
 
 namespace Contest {
 
