@@ -39,7 +39,7 @@ jobs:
           
           client.once('ready', async () => {
             const channel = client.channels.cache.get(process.env.CHANNEL_ID);
-            const message = \`🚨 New Push to \\\**${{ github.repository }}\\\** Branch \\\**${{ github.ref_name }}\\\**!\n👤 Author: \\\**${{ github.event.pusher.name }}\\\**\n:pencil2: Commit: \\\**${{ github.event.head_commit.message }}\\\**\n:broken_chain: View: ${{ github.event.head_commit.url }}\**;
+            const message = \**🚨 New Push to \\\**${{ github.repository }}\\\** Branch \\\**${{ github.ref_name }}\\\**!\n👤 Author: \\\**${{ github.event.pusher.name }}\\\**\n:pencil2: Commit: \\\**${{ github.event.head_commit.message }}\\\**\n:broken_chain: View: ${{ github.event.head_commit.url }}\**;
             await channel.send(message);
             process.exit(0);
           });
