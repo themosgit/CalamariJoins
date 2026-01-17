@@ -416,7 +416,7 @@ inline void materialize_single_column(
     const JoinInput &probe_input, const PlanNode &build_node,
     const PlanNode &probe_node, ColumnarReader &columnar_reader,
     const Plan &plan) {
-    
+
     auto [input, node, local_idx] = resolve_input_source(
         col_idx, build_size, build_input, build_node, probe_input, probe_node);
     bool from_build = col_idx < build_size;

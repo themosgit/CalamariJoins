@@ -400,6 +400,8 @@ struct TimingStats {
 void *build_context();
 void destroy_context(void *);
 
-ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out = nullptr, bool show_detailed_timing = false);
+ColumnarTable execute(const Plan &plan, void *context,
+                      TimingStats *stats_out = nullptr,
+                      bool show_detailed_timing = false);
 
 } // namespace Contest

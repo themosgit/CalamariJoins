@@ -10,8 +10,6 @@
 
 namespace Contest {
 
-using ExecuteResult = std::vector<mema::column_t>;
-
 struct JoinInput {
     std::variant<ExecuteResult, const ColumnarTable *> data;
     const PlanNode *node;

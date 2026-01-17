@@ -81,12 +81,8 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
 
     visit_rows(build_input, build_attr, collect_build);
 
-    int num_threads = worker_pool.thread_count();
-    std::vector<ThreadLocalMatchBuffer> buffers;
-    buffers.reserve(num_threads);
-    for (int i = 0; i < num_threads; ++i) {
-        buffers.emplace_back(mode);
-    }
+    size_t num_threads = worker_pool.thread_count();
+    auto buffers = create_thread_local_buffers(num_threads, mode);
 
     const Column *probe_col = nullptr;
     std::vector<uint32_t> page_offsets;

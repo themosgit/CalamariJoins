@@ -1,12 +1,12 @@
 #pragma once
 
-#include <vector>
-#include <cstdint>
-#include <atomic>
-#include <cstring>
 #include <algorithm>
-#include <worker_pool.h>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <sys/mman.h>
+#include <vector>
+#include <worker_pool.h>
 
 namespace Contest {
 
@@ -21,22 +21,23 @@ static constexpr size_t MATCH_CHUNK_CAP = 8192;
 struct IndexChunk {
     uint32_t ids[MATCH_CHUNK_CAP];
     uint32_t count = 0;
-    IndexChunk* next = nullptr;
+    IndexChunk *next = nullptr;
 };
 
 class MatchCollector;
 
 class ThreadLocalMatchBuffer {
-    friend void merge_local_collectors(std::vector<ThreadLocalMatchBuffer>&, MatchCollector&);
+    friend void merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &,
+                                       MatchCollector &);
     friend class MatchCollector;
 
-    IndexChunk* left_head = nullptr;
-    IndexChunk* left_tail = nullptr;
-    IndexChunk* right_head = nullptr;
-    IndexChunk* right_tail = nullptr;
+    IndexChunk *left_head = nullptr;
+    IndexChunk *left_tail = nullptr;
+    IndexChunk *right_head = nullptr;
+    IndexChunk *right_tail = nullptr;
     MatchCollectionMode mode = MatchCollectionMode::BOTH;
 
-public:
+  public:
     size_t total_count = 0;
 
     ThreadLocalMatchBuffer(MatchCollectionMode mode = MatchCollectionMode::BOTH)
@@ -49,10 +50,10 @@ public:
         }
     }
 
-    ThreadLocalMatchBuffer(ThreadLocalMatchBuffer&& other) noexcept
+    ThreadLocalMatchBuffer(ThreadLocalMatchBuffer &&other) noexcept
         : left_head(other.left_head), left_tail(other.left_tail),
           right_head(other.right_head), right_tail(other.right_tail),
-          total_count(other.total_count) {
+          mode(other.mode), total_count(other.total_count) {
         other.left_head = other.left_tail = nullptr;
         other.right_head = other.right_tail = nullptr;
         other.total_count = 0;
@@ -60,12 +61,12 @@ public:
 
     ~ThreadLocalMatchBuffer() {
         while (left_head) {
-            IndexChunk* temp = left_head;
+            IndexChunk *temp = left_head;
             left_head = left_head->next;
             delete temp;
         }
         while (right_head) {
-            IndexChunk* temp = right_head;
+            IndexChunk *temp = right_head;
             right_head = right_head->next;
             delete temp;
         }
@@ -74,8 +75,8 @@ public:
     inline void add_match(uint32_t left, uint32_t right) {
         if (mode == MatchCollectionMode::BOTH) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
-                IndexChunk* new_left = new IndexChunk();
-                IndexChunk* new_right = new IndexChunk();
+                IndexChunk *new_left = new IndexChunk();
+                IndexChunk *new_right = new IndexChunk();
                 left_tail->next = new_left;
                 right_tail->next = new_right;
                 left_tail = new_left;
@@ -87,7 +88,7 @@ public:
             right_tail->count++;
         } else if (mode == MatchCollectionMode::LEFT_ONLY) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
-                IndexChunk* new_left = new IndexChunk();
+                IndexChunk *new_left = new IndexChunk();
                 left_tail->next = new_left;
                 left_tail = new_left;
             }
@@ -95,7 +96,7 @@ public:
             left_tail->count++;
         } else { // RIGHT_ONLY
             if (right_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
-                IndexChunk* new_right = new IndexChunk();
+                IndexChunk *new_right = new IndexChunk();
                 right_tail->next = new_right;
                 right_tail = new_right;
             }
@@ -107,37 +108,36 @@ public:
 };
 
 class MatchCollector {
-    IndexChunk* left_chain_head = nullptr;
-    IndexChunk* left_chain_tail = nullptr;
-    IndexChunk* right_chain_head = nullptr;
-    IndexChunk* right_chain_tail = nullptr;
+    IndexChunk *left_chain_head = nullptr;
+    IndexChunk *left_chain_tail = nullptr;
+    IndexChunk *right_chain_head = nullptr;
+    IndexChunk *right_chain_tail = nullptr;
 
     std::atomic<size_t> total_matches_count{0};
     bool is_finalized = false;
     MatchCollectionMode collection_mode = MatchCollectionMode::BOTH;
 
-    std::vector<IndexChunk*> all_chunks;
+    std::vector<IndexChunk *> all_chunks;
 
-public:
+  public:
     class ChunkIterator {
-        IndexChunk* current_chunk;
+        IndexChunk *current_chunk;
         uint32_t offset;
         size_t remaining;
 
-    public:
-        ChunkIterator(IndexChunk* start, size_t count)
+      public:
+        ChunkIterator(IndexChunk *start, size_t count)
             : current_chunk(start), offset(0), remaining(count) {
             if (!current_chunk) {
                 remaining = 0;
             }
         }
 
-        inline uint32_t operator*() const {
-            return current_chunk->ids[offset];
-        }
+        inline uint32_t operator*() const { return current_chunk->ids[offset]; }
 
-        inline ChunkIterator& operator++() {
-            if (remaining == 0 || !current_chunk) return *this;
+        inline ChunkIterator &operator++() {
+            if (remaining == 0 || !current_chunk)
+                return *this;
 
             offset++;
             remaining--;
@@ -151,7 +151,7 @@ public:
             return *this;
         }
 
-        inline bool operator!=(const ChunkIterator& other) const {
+        inline bool operator!=(const ChunkIterator &other) const {
             return remaining != other.remaining;
         }
 
@@ -174,12 +174,12 @@ public:
     };
 
     class ChunkRange {
-        IndexChunk* head;
+        IndexChunk *head;
         size_t start_offset;
         size_t count;
 
-    public:
-        ChunkRange(IndexChunk* h, size_t start, size_t cnt)
+      public:
+        ChunkRange(IndexChunk *h, size_t start, size_t cnt)
             : head(h), start_offset(start), count(cnt) {}
 
         ChunkIterator begin() const {
@@ -188,27 +188,27 @@ public:
             return it;
         }
 
-        ChunkIterator end() const {
-            return ChunkIterator(nullptr, 0);
-        }
+        ChunkIterator end() const { return ChunkIterator(nullptr, 0); }
     };
 
-    explicit MatchCollector(MatchCollectionMode mode = MatchCollectionMode::BOTH)
+    explicit MatchCollector(
+        MatchCollectionMode mode = MatchCollectionMode::BOTH)
         : collection_mode(mode) {}
     ~MatchCollector() {
         if (!is_finalized) {
             while (left_chain_head) {
-                IndexChunk* temp = left_chain_head;
+                IndexChunk *temp = left_chain_head;
                 left_chain_head = left_chain_head->next;
                 delete temp;
             }
             while (right_chain_head) {
-                IndexChunk* temp = right_chain_head;
+                IndexChunk *temp = right_chain_head;
                 right_chain_head = right_chain_head->next;
                 delete temp;
             }
         } else {
-            for (auto* chunk : all_chunks) delete chunk;
+            for (auto *chunk : all_chunks)
+                delete chunk;
         }
     }
 
@@ -220,16 +220,19 @@ public:
      *  and does simple pointer ops
      *
      **/
-    void append_batch_chains(IndexChunk* left_head, IndexChunk* left_tail,
-                             IndexChunk* right_head, IndexChunk* right_tail,
+    void append_batch_chains(IndexChunk *left_head, IndexChunk *left_tail,
+                             IndexChunk *right_head, IndexChunk *right_tail,
                              size_t batch_count) {
 
         if (collection_mode == MatchCollectionMode::LEFT_ONLY) {
-            if (!left_head) return;
+            if (!left_head)
+                return;
         } else if (collection_mode == MatchCollectionMode::RIGHT_ONLY) {
-            if (!right_head) return;
+            if (!right_head)
+                return;
         } else {
-            if (!left_head || !right_head) return;
+            if (!left_head || !right_head)
+                return;
         }
 
         total_matches_count.fetch_add(batch_count, std::memory_order_relaxed);
@@ -253,18 +256,19 @@ public:
         }
     }
 
-    void merge_thread_buffer(ThreadLocalMatchBuffer& tlb) {
-        if (tlb.total_count == 0) return;
-        append_batch_chains(tlb.left_head, tlb.left_tail,
-                           tlb.right_head, tlb.right_tail,
-                           tlb.total_count);
+    void merge_thread_buffer(ThreadLocalMatchBuffer &tlb) {
+        if (tlb.total_count == 0)
+            return;
+        append_batch_chains(tlb.left_head, tlb.left_tail, tlb.right_head,
+                            tlb.right_tail, tlb.total_count);
         tlb.left_head = tlb.left_tail = nullptr;
         tlb.right_head = tlb.right_tail = nullptr;
         tlb.total_count = 0;
     }
 
     void finalize_parallel() {
-        if (is_finalized) return;
+        if (is_finalized)
+            return;
 
         size_t total = total_matches_count.load();
         if (total == 0) {
@@ -272,7 +276,7 @@ public:
             return;
         }
 
-        IndexChunk* curr = left_chain_head;
+        IndexChunk *curr = left_chain_head;
         while (curr) {
             all_chunks.push_back(curr);
             curr = curr->next;
@@ -288,7 +292,8 @@ public:
     }
 
     void ensure_finalized() {
-        if (!is_finalized) finalize_parallel();
+        if (!is_finalized)
+            finalize_parallel();
     }
 
     inline size_t size() const { return total_matches_count; }
@@ -304,30 +309,47 @@ public:
 
 /**
  *
+ *  creates a vector of thread-local match buffers for parallel join processing
+ *  one buffer per worker thread, all initialized with the same collection mode
+ *
+ **/
+inline std::vector<ThreadLocalMatchBuffer>
+create_thread_local_buffers(size_t thread_count, MatchCollectionMode mode) {
+    std::vector<ThreadLocalMatchBuffer> buffers;
+    buffers.reserve(thread_count);
+    for (size_t i = 0; i < thread_count; ++i) {
+        buffers.emplace_back(mode);
+    }
+    return buffers;
+}
+
+/**
+ *
  *  merges all thread-local buffers into the global collector
  *  links all local buffers into separate left/right chains
  *  then pushes both chains with simple pointer ops
  *
  **/
-inline void merge_local_collectors(
-    std::vector<ThreadLocalMatchBuffer>& local_buffers,
-    MatchCollector& global_collector) {
+inline void
+merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &local_buffers,
+                       MatchCollector &global_collector) {
 
-    IndexChunk* left_batch_head = nullptr;
-    IndexChunk* left_batch_tail = nullptr;
-    IndexChunk* right_batch_head = nullptr;
-    IndexChunk* right_batch_tail = nullptr;
+    IndexChunk *left_batch_head = nullptr;
+    IndexChunk *left_batch_tail = nullptr;
+    IndexChunk *right_batch_head = nullptr;
+    IndexChunk *right_batch_tail = nullptr;
     size_t batch_total = 0;
     bool first_buffer = true;
 
-    for (auto& buf : local_buffers) {
-        if (buf.total_count == 0) continue;
+    for (auto &buf : local_buffers) {
+        if (buf.total_count == 0)
+            continue;
 
         batch_total += buf.total_count;
 
         if (first_buffer) {
             first_buffer = false;
-            if (buf.mode !=  MatchCollectionMode::RIGHT_ONLY) {
+            if (buf.mode != MatchCollectionMode::RIGHT_ONLY) {
                 left_batch_head = buf.left_head;
                 left_batch_tail = buf.left_tail;
             }

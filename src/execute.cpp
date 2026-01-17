@@ -21,11 +21,7 @@
 
 namespace Contest {
 
-using ExecuteResult = std::vector<mema::column_t>;
 using JoinResult = std::variant<ExecuteResult, ColumnarTable>;
-
-static thread_local int64_t current_query_build_time_us = 0;
-static thread_local int64_t total_build_time_us = 0;
 
 JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                         TimingStats &stats);
@@ -185,125 +181,10 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     return final_result;
 }
 
-static std::pair<size_t, size_t>
-find_attribute_source(const Plan &plan, size_t node_idx, size_t output_pos) {
-    const auto &node = plan.nodes[node_idx];
-
-    if (std::holds_alternative<ScanNode>(node.data)) {
-        const auto &scan = std::get<ScanNode>(node.data);
-        const auto &[col_idx, dtype] = node.output_attrs[output_pos];
-        return {scan.base_table_id, col_idx};
-    } else if (std::holds_alternative<JoinNode>(node.data)) {
-        const auto &join = std::get<JoinNode>(node.data);
-        const auto &left_node = plan.nodes[join.left];
-        const auto &right_node = plan.nodes[join.right];
-
-        const auto &[concat_idx, dtype] = node.output_attrs[output_pos];
-        size_t left_output_count = left_node.output_attrs.size();
-
-        if (concat_idx < left_output_count) {
-            return find_attribute_source(plan, join.left, concat_idx);
-        } else {
-            return find_attribute_source(plan, join.right,
-                                         concat_idx - left_output_count);
-        }
-    }
-
-    return {0, 0};
-}
-
-static void print_plan_tree(const Plan &plan, size_t node_idx,
-                            const std::string &prefix, bool is_last) {
-    const auto &node = plan.nodes[node_idx];
-    std::cout << prefix;
-    std::cout << (is_last ? "└── " : "├── ");
-
-    if (std::holds_alternative<ScanNode>(node.data)) {
-        const auto &scan = std::get<ScanNode>(node.data);
-        std::cout << "SCAN Table " << scan.base_table_id;
-
-        std::cout << "\n"
-                  << prefix << (is_last ? "    " : "│   ") << "Output: [";
-        for (size_t j = 0; j < node.output_attrs.size(); ++j) {
-            const auto &[col_idx, dtype] = node.output_attrs[j];
-            if (j > 0)
-                std::cout << ", ";
-            auto [table_id, col_id] = find_attribute_source(plan, node_idx, j);
-            std::cout << "pos" << j << "=T" << table_id << ".col" << col_id;
-            std::cout << " (";
-            switch (dtype) {
-            case DataType::INT32:
-                std::cout << "INT32";
-                break;
-            case DataType::VARCHAR:
-                std::cout << "VARCHAR";
-                break;
-            }
-            std::cout << ")";
-        }
-        std::cout << "]\n";
-
-    } else if (std::holds_alternative<JoinNode>(node.data)) {
-        const auto &join = std::get<JoinNode>(node.data);
-
-        const auto &left_node = plan.nodes[join.left];
-        const auto &right_node = plan.nodes[join.right];
-
-        std::cout << "JOIN Node" << node_idx;
-
-        auto [left_table, left_col] =
-            find_attribute_source(plan, join.left, join.left_attr);
-        auto [right_table, right_col] =
-            find_attribute_source(plan, join.right, join.right_attr);
-
-        std::cout << "\n"
-                  << prefix << (is_last ? "    " : "│   ")
-                  << "Join Condition: attr" << join.left_attr << " (T"
-                  << left_table << ".col" << left_col << ")"
-                  << " = attr" << join.right_attr << " (T" << right_table
-                  << ".col" << right_col << ")"
-                  << " [build=" << (join.build_left ? "left" : "right")
-                  << "]\n";
-
-        std::cout << prefix << (is_last ? "    " : "│   ") << "Output: [";
-
-        for (size_t j = 0; j < node.output_attrs.size(); ++j) {
-            const auto &[concat_idx, dtype] = node.output_attrs[j];
-            if (j > 0)
-                std::cout << ", ";
-
-            auto [table_id, col_id] = find_attribute_source(plan, node_idx, j);
-            std::cout << "pos" << j << "=T" << table_id << ".col" << col_id;
-
-            size_t left_output_count = left_node.output_attrs.size();
-            if (concat_idx == join.left_attr ||
-                (concat_idx >= left_output_count &&
-                 (concat_idx - left_output_count) == join.right_attr)) {
-                std::cout << "*";
-            }
-        }
-        std::cout << "]\n";
-    }
-
-    if (std::holds_alternative<JoinNode>(node.data)) {
-        const auto &join = std::get<JoinNode>(node.data);
-        std::string new_prefix = prefix + (is_last ? "    " : "│   ");
-        print_plan_tree(plan, join.left, new_prefix, false);
-        print_plan_tree(plan, join.right, new_prefix, true);
-    }
-}
-
 ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
                       bool show_detailed_timing) {
     auto total_start = std::chrono::high_resolution_clock::now();
 
-    // Print the entire plan tree before recursion starts
-    // std::cout << "\n========== QUERY PLAN TREE ==========\n";
-    // std::cout << "Total nodes: " << plan.nodes.size() << "\n";
-    // std::cout << "Total input tables: " << plan.inputs.size() << "\n\n";
-    // print_plan_tree(plan, plan.root, "", true);
-    // std::cout << "=====================================\n\n";
-    //
     TimingStats stats;
     auto result = execute_impl(plan, plan.root, true, stats);
 
@@ -340,12 +221,8 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     return std::move(std::get<ColumnarTable>(result));
 }
 
-void *build_context() {
-    // Reset total build time when context is built
-    total_build_time_us = 0;
-    return nullptr;
-}
+void *build_context() { return nullptr; }
 
-void destroy_context(void *context) {}
+void destroy_context(void *context) { (void)context; }
 
 } // namespace Contest
