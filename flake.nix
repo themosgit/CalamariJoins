@@ -23,6 +23,7 @@
           buildInputs = with pkgs; [
             llvmPackages.libcxxClang
             llvmPackages.libllvm
+            doxygen
             gef
             curl
             git

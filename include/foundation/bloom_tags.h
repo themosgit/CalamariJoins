@@ -1,18 +1,19 @@
+/**
+ * @file bloom_tags.h
+ * @brief Precomputed 16-bit tags for Bloom filter operations.
+ *
+ * Contains 2048 random 16-bit tags for fast Bloom filter membership testing.
+ * The upper 11 bits of a 64-bit hash index into this array. Using 11 bits
+ * gives 2048 entries × 2 bytes = 4KB, fitting in L1 cache while providing
+ * good false positive rates.
+ *
+ * @see UnchainedHashtable which uses these tags during probe.
+ */
 #pragma once
 #include <cstdint>
 
-/**
- *
- *  we use a set of precomputed random 16bit tags
- *  for Bloom Filter operations the upper 11bits of
- *  our 64bit hash index into this array. 11bits is
- *  chose so that in total we have 4byte * 2048 in
- *  total 4KB of tags that can easily fit and not
- *  polute L1 caches while also providing a good
- *  false positive rate.
- *
- **/
-
+/** @brief Precomputed 16-bit Bloom filter tags; indexed by upper 11 bits of
+ * hash. */
 static constexpr uint16_t BLOOM_TAGS[2048] = {
     0x001f, 0x002f, 0x0037, 0x003b, 0x003d, 0x003e, 0x004f, 0x0057, 0x005b,
     0x005d, 0x005e, 0x0067, 0x006b, 0x006d, 0x006e, 0x0073, 0x0075, 0x0076,

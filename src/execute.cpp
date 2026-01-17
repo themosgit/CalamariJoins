@@ -1,3 +1,32 @@
+/**
+ * @file execute.cpp
+ * @brief Recursive join tree execution engine.
+ *
+ * Executes multi-way joins by traversing the plan tree depth-first.
+ * Each join node: resolve inputs -> select build/probe sides -> choose
+ * algorithm (hash vs nested loop) -> collect matches -> materialize or
+ * construct intermediate.
+ *
+ * **Execution flow:**
+ * 1. execute() is called with the Plan and root node index
+ * 2. execute_impl() recursively processes join nodes
+ * 3. resolve_join_input() handles ScanNode (returns ColumnarTable*) or
+ *    JoinNode (recurses, returns ExecuteResult)
+ * 4. Root joins produce ColumnarTable via materialize()
+ * 5. Non-root joins produce ExecuteResult via construct_intermediate()
+ *
+ * **Data lifetimes:**
+ * - Base tables (ColumnarTable*) live for entire query execution
+ * - ExecuteResult from child joins is held on call stack until parent completes
+ * - VARCHAR value_t references remain valid because base tables outlive them
+ *
+ * Row ordering is non-deterministic due to work-stealing parallelism.
+ * This is semantically correct as SQL joins don't guarantee order.
+ *
+ * @see plan.h for Plan structure and output_attrs mapping.
+ * @see match_collector.h for parallel match accumulation.
+ * @see materialize.h and construct_intermediate.h for output construction.
+ */
 #include <foundation/attribute.h>
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <platform/hardware_darwin.h>
@@ -21,11 +50,42 @@
 
 namespace Contest {
 
+/**
+ * @brief Result of execute_impl(): either intermediate or final output.
+ *
+ * - ExecuteResult (vector<column_t>): Intermediate format for non-root joins.
+ *   Values stored as value_t with VARCHAR encoded as page/offset references.
+ * - ColumnarTable: Final output format for root join, per contest API.
+ */
 using JoinResult = std::variant<ExecuteResult, ColumnarTable>;
 
+/**
+ * @brief Recursive join execution with timing instrumentation.
+ *
+ * @param plan      Complete query plan with nodes and base tables.
+ * @param node_idx  Index of current node in plan.nodes.
+ * @param is_root   If true, produce ColumnarTable; otherwise ExecuteResult.
+ * @param stats     Accumulates timing for each execution phase.
+ * @return JoinResult containing either intermediate or final result.
+ */
 JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                         TimingStats &stats);
 
+/**
+ * @brief Resolve a plan node to its join input data.
+ *
+ * For ScanNode: Returns non-owning pointer to pre-loaded ColumnarTable.
+ * For JoinNode: Recursively executes the child join, returns owned
+ * ExecuteResult.
+ *
+ * This function embodies the depth-first traversal: leaf nodes (scans) return
+ * immediately, while join nodes trigger recursive execution.
+ *
+ * @param plan      Complete query plan.
+ * @param node_idx  Index of node to resolve.
+ * @param stats     Timing accumulator for recursive calls.
+ * @return JoinInput with data variant and metadata.
+ */
 JoinInput resolve_join_input(const Plan &plan, size_t node_idx,
                              TimingStats &stats) {
     JoinInput input;
@@ -43,6 +103,26 @@ JoinInput resolve_join_input(const Plan &plan, size_t node_idx,
     return input;
 }
 
+/**
+ * @brief Core recursive join execution.
+ *
+ * **Execution phases per join:**
+ * 1. Resolve left and right child inputs (may recurse)
+ * 2. Select build/probe sides (smaller input becomes build side)
+ * 3. Choose algorithm: hash join for larger tables, nested loop for tiny
+ * 4. Build hash table (or use stack-allocated keys for nested loop)
+ * 5. Probe in parallel, collecting matches to MatchCollector
+ * 6. Output construction based on is_root flag
+ *
+ * **Algorithm selection:**
+ * - Nested loop used when build side has fewer than HASH_TABLE_THRESHOLD rows
+ * - Hash join with radix-partitioned parallel build otherwise
+ *
+ * **Memory management:**
+ * - Hash table and MatchCollector are local to this call, freed on return
+ * - Child ExecuteResults held on stack until materialization completes
+ * - setup.results pre-allocated for non-root output
+ */
 JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                         TimingStats &stats) {
     auto &node = plan.nodes[node_idx];
@@ -181,6 +261,20 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     return final_result;
 }
 
+/**
+ * @brief Public entry point for query execution.
+ *
+ * Executes the complete join plan starting from the root node. The root
+ * join always produces a ColumnarTable as required by the contest API.
+ *
+ * Timing breakdown is captured in stats and optionally printed to stdout.
+ *
+ * @param plan      Query plan with nodes and pre-loaded base tables.
+ * @param context   Execution context (currently unused, reserved for future).
+ * @param stats_out Optional output for timing breakdown.
+ * @param show_detailed_timing If true, print timing to stdout.
+ * @return Final join result as ColumnarTable.
+ */
 ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
                       bool show_detailed_timing) {
     auto total_start = std::chrono::high_resolution_clock::now();
@@ -221,8 +315,11 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     return std::move(std::get<ColumnarTable>(result));
 }
 
+/** @brief Allocate execution context. Currently a no-op; reserved for future
+ * use. */
 void *build_context() { return nullptr; }
 
+/** @brief Release execution context. Currently a no-op. */
 void destroy_context(void *context) { (void)context; }
 
 } // namespace Contest

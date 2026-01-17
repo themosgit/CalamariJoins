@@ -1,3 +1,13 @@
+/**
+ * @file worker_pool.h
+ * @brief Global thread pool for parallel join and materialization operations.
+ *
+ * Provides persistent worker threads (SPC__THREAD_COUNT) to avoid thread
+ * creation overhead. Uses generation-based task dispatch with condition
+ * variables for synchronization.
+ *
+ * @see execute() for dispatching parallel work.
+ */
 #pragma once
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -18,12 +28,12 @@
 namespace Contest {
 
 /**
+ * @brief Global thread pool for parallel join and materialization operations.
  *
- *  global thread pool for join/materialization operations
- *  creates SPC__CORE_COUNT persistent worker threads
- *  eliminates thread creation/destruction overhead
- *
- **/
+ * Creates SPC__THREAD_COUNT persistent worker threads at startup.
+ * Eliminates thread creation/destruction overhead for each parallel phase.
+ * Uses generation counter for task dispatch and atomic counter for completion.
+ */
 class WorkerThreadPool {
   private:
     static constexpr int NUM_THREADS = SPC__THREAD_COUNT;
@@ -82,6 +92,10 @@ class WorkerThreadPool {
         }
     }
 
+    /**
+     * @brief Dispatches task to all workers and waits for completion.
+     * @param task Callable invoked with thread_id (0 to NUM_THREADS-1).
+     */
     void execute(std::function<void(size_t)> task) {
         {
             std::lock_guard<std::mutex> lock(pool_mutex);

@@ -1,4 +1,10 @@
-/*nested_loop.h*/
+/**
+ * @file nested_loop.h
+ * @brief Nested loop join for small build-side tables.
+ *
+ * Fallback join strategy when build table is small enough to fit in CPU
+ * registers. Uses parallel work-stealing to probe against the build keys.
+ */
 #pragma once
 
 #include <atomic>
@@ -13,6 +19,18 @@
 
 namespace Contest {
 
+/**
+ * @brief Iterates over non-NULL values in a join input column.
+ *
+ * Abstracts columnar vs intermediate input: for columnar, decodes pages
+ * handling NULL bitmaps; for intermediate, iterates column_t values.
+ * Invokes visitor(row_id, int32_value) for each non-NULL entry.
+ *
+ * @tparam Func Callable with signature void(uint32_t row_id, int32_t value).
+ * @param input      Source data (columnar table or intermediate result).
+ * @param attr_idx   Index into output_attrs for the column to iterate.
+ * @param visitor    Callback invoked for each non-NULL value.
+ */
 template <typename Func>
 inline void visit_rows(const JoinInput &input, size_t attr_idx,
                        Func &&visitor) {
@@ -55,6 +73,20 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
     }
 }
 
+/**
+ * @brief Nested loop join optimized for small build tables (<=64 rows).
+ *
+ * Loads build keys into stack arrays for cache-local comparison. Probes in
+ * parallel using work-stealing over probe pages/rows. Falls back to this
+ * strategy when hash table overhead exceeds benefit.
+ *
+ * @param build_input  Build side (small table, loaded into registers).
+ * @param probe_input  Probe side (scanned in parallel).
+ * @param build_attr   Index of join key in build's output_attrs.
+ * @param probe_attr   Index of join key in probe's output_attrs.
+ * @param collector    Receives matching (build_row_id, probe_row_id) pairs.
+ * @param mode         Which row IDs to collect (optimization).
+ */
 inline void
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                  size_t build_attr, size_t probe_attr,

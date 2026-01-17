@@ -1,3 +1,9 @@
+/**
+ * @file page_builders.h
+ * @brief Page builders for materializing join results.
+ *
+ * Handles INT32 and VARCHAR column page construction with null bitmaps.
+ */
 #pragma once
 
 #include <algorithm>
@@ -9,12 +15,7 @@
 
 namespace Contest {
 
-/**
- *
- *  helper to get string data from a varchar column page
- *  returns pointer to string start and its length
- *
- **/
+/** @brief Gets string data from a VARCHAR column page. */
 inline std::pair<const char *, uint16_t>
 get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     auto *page = reinterpret_cast<uint8_t *>(src_col.pages[page_idx]->data);
@@ -28,12 +29,7 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     return {char_begin + start_off, static_cast<uint16_t>(end_off - start_off)};
 }
 
-/**
- *
- *  accumulates validity bits for nullable columns
- *  flushes to page bitmap location when complete
- *
- **/
+/** @brief Accumulates validity bits for nullable columns. */
 struct alignas(8) BitmapAccumulator {
     std::vector<uint8_t> buffer;
     uint8_t pending_bits = 0;
@@ -72,11 +68,13 @@ struct alignas(8) BitmapAccumulator {
 };
 
 /**
+ * @brief Builds pages for INT32 columns during materialization.
  *
- *  builds pages for INT32 columns during materialization
- *  handles null bitmap and page overflow detection
- *
- **/
+ * Accumulates values and NULL bitmap, flushing to pages when full.
+ * Page layout: [num_rows:u16][num_values:u16][values:i32...][bitmap at page
+ * end]. Bitmap stored at page end, growing backwards; values grow forwards from
+ * +4.
+ */
 struct Int32PageBuilder {
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = (PAGE_SIZE - 4 - 256) / 5;
 
@@ -131,12 +129,18 @@ struct Int32PageBuilder {
 };
 
 /**
+ * @brief Builds pages for VARCHAR columns during materialization.
  *
- *  builds pages for VARCHAR columns during materialization
- *  handles variable-length strings, long strings spanning multiple pages,
- *  null bitmap, and page overflow detection
+ * Handles variable-length strings with gap-based layout for efficient writing.
+ * Page layout:
+ * [num_rows:u16][num_values:u16][offsets:u16...][strings...][bitmap]. Uses gap
+ * between offsets and strings that shrinks as offsets grow.
  *
- **/
+ * Special handling for long strings (>PAGE_SIZE-512): copies source pages
+ * directly using 0xffff/0xfffe markers for multi-page strings.
+ *
+ * @see get_string_view for reading source string data.
+ */
 struct VarcharPageBuilder {
     static constexpr size_t OFFSET_GAP_SIZE = 2048;
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = 100;

@@ -1,3 +1,9 @@
+/**
+ * @file construct_intermediate.h
+ * @brief Constructs intermediate results for multi-way joins.
+ *
+ * Allocates and populates ExecuteResult (column_t) from match collectors.
+ */
 #pragma once
 
 #include <data_access/columnar_reader.h>
@@ -10,9 +16,13 @@
 #include <vector>
 namespace Contest {
 
-/* this is a work in progress and will be finilized after match collector
- * is finalized and optimized to produce proper job units */
-
+/**
+ * @brief Batch memory allocator for intermediate result pages.
+ *
+ * Allocates a contiguous mmap'd block for all column_t pages, avoiding
+ * per-page allocation overhead. Shared ownership via shared_ptr ensures
+ * memory outlives columns referencing it.
+ */
 class BatchAllocator {
   private:
     void *memory_block = nullptr;
@@ -39,14 +49,28 @@ class BatchAllocator {
     BatchAllocator &operator=(const BatchAllocator &) = delete;
 };
 
+/**
+ * @brief Metadata for resolving an output column's source.
+ *
+ * Precomputed during prepare_sources() to avoid repeated lookups
+ * during the hot loop of construct_intermediate().
+ */
 struct alignas(8) SourceInfo {
-    const mema::column_t *intermediate_col = nullptr;
-    const Column *columnar_col = nullptr;
-    size_t remapped_col_idx = 0;
-    bool is_columnar = false;
-    bool from_build = false;
+    const mema::column_t *intermediate_col =
+        nullptr;                          /**< Source if intermediate. */
+    const Column *columnar_col = nullptr; /**< Source if columnar. */
+    size_t remapped_col_idx = 0; /**< Local index within source side. */
+    bool is_columnar = false;    /**< True if source is columnar table. */
+    bool from_build = false; /**< True if from build side, false if probe. */
 };
 
+/**
+ * @brief Preallocates mmap'd memory for all output columns.
+ *
+ * Computes total pages needed across all columns, allocates single block,
+ * then partitions to each column via pre_allocate_from_block().
+ * Returns allocator holding shared ownership of the memory.
+ */
 inline std::shared_ptr<BatchAllocator>
 batch_allocate_for_results(ExecuteResult &results, size_t total_matches) {
 
@@ -70,6 +94,8 @@ batch_allocate_for_results(ExecuteResult &results, size_t total_matches) {
     return allocator;
 }
 
+/** @brief Builds SourceInfo for each output column for fast lookup during copy.
+ */
 inline std::vector<SourceInfo>
 prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
                 const JoinInput &build_input, const JoinInput &probe_input,
@@ -99,6 +125,23 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     return sources;
 }
 
+/**
+ * @brief Populates ExecuteResult columns from join matches in parallel.
+ *
+ * Each worker thread processes a slice of matches, copying values from
+ * source columns (columnar or intermediate) to pre-allocated output columns.
+ * Uses ColumnarReader cursor caching for efficient page access.
+ *
+ * @param collector        Source of match row IDs.
+ * @param build_input      Build side data.
+ * @param probe_input      Probe side data.
+ * @param remapped_attrs   Output column specs (remapped to build/probe order).
+ * @param build_node       PlanNode for build side column mapping.
+ * @param probe_node       PlanNode for probe side column mapping.
+ * @param build_size       Number of columns from build side.
+ * @param columnar_reader  Reader with prepared columns for page access.
+ * @param results          Pre-initialized output columns to populate.
+ */
 inline void construct_intermediate(
     const MatchCollector &collector, const JoinInput &build_input,
     const JoinInput &probe_input,

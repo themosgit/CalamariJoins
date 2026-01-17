@@ -1,3 +1,9 @@
+/**
+ * @file materialize.h
+ * @brief Materialization of join results into ColumnarTable format.
+ *
+ * Parallel materialization using per-thread page builders and mmap allocation.
+ */
 #pragma once
 
 #include <algorithm>
@@ -16,6 +22,25 @@
 
 namespace Contest {
 
+/**
+ * @brief Parallel materialization of a single output column from match results.
+ *
+ * Divides matches across worker threads, each building pages independently
+ * using preallocated mmap'd memory. Thread-local Column objects collect pages,
+ * then merge into dest_col. Uses BuilderType (Int32PageBuilder or
+ * VarcharPageBuilder) for type-specific page construction.
+ *
+ * @tparam BuilderType     Page builder type
+ * (Int32PageBuilder/VarcharPageBuilder).
+ * @tparam ReaderFunc      Callable: (row_id, cursor) -> value_t.
+ * @tparam InitBuilderFunc Callable: (page_allocator) -> BuilderType.
+ * @param dest_col         Output column receiving materialized pages.
+ * @param collector        Source of (build_id, probe_id) match pairs.
+ * @param read_value       Function to read source value by row ID.
+ * @param init_builder     Factory creating builder with page allocator.
+ * @param from_build       True if reading from build side, false for probe.
+ * @param est_bytes_per_row Estimated bytes per row for page count calculation.
+ */
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
 inline void
 materialize_column(Column &dest_col, const MatchCollector &collector,
@@ -119,6 +144,12 @@ materialize_column(Column &dest_col, const MatchCollector &collector,
     dest_col.assign_mapped_memory(mapped_mem);
 }
 
+/**
+ * @brief Materializes a single output column from join matches.
+ *
+ * Resolves source (build vs probe, columnar vs intermediate), selects
+ * appropriate page builder, and delegates to materialize_column<>.
+ */
 inline void materialize_single_column(
     Column &dest_col, size_t col_idx, size_t build_size,
     const MatchCollector &collector, const JoinInput &build_input,
@@ -182,6 +213,12 @@ inline void materialize_single_column(
         init, from_build, 35);
 }
 
+/**
+ * @brief Materializes all output columns into a new ColumnarTable.
+ *
+ * Iterates remapped_attrs, materializing each column in parallel.
+ * Returns empty table with correct schema if no matches.
+ */
 inline ColumnarTable
 materialize(const MatchCollector &collector, const JoinInput &build_input,
             const JoinInput &probe_input,
@@ -210,6 +247,9 @@ materialize(const MatchCollector &collector, const JoinInput &build_input,
     }
     return result;
 }
+
+/** @brief Creates empty ColumnarTable with correct column types for zero-match
+ * case. */
 inline ColumnarTable create_empty_result(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs) {
     ColumnarTable empty_result;

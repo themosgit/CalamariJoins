@@ -7,26 +7,34 @@
 #include <platform/worker_pool.h>
 
 /**
+ * @file hash_join.h
+ * @brief Hash join build and probe operations.
  *
- *  hash join operations for building and probing hash tables
+ * Supports both ColumnarTable and intermediate (column_t) inputs.
+ * Build phase constructs an unchained hash table with bloom filters.
+ * Probe phase uses parallel work-stealing across pages.
  *
- *  this header contains the build and probe phases of hash joins
- *  supports both ColumnarTable columnar and column_t intermediate inputs
+ * **Probe parallelism:** Pages are distributed via atomic counter
+ * (work-stealing). Each thread maintains a thread-local match buffer to avoid
+ * contention. Buffers are merged into the final MatchCollector after all pages
+ * are processed.
  *
- *  build phase constructs unchained hash table with bloom filters
- *  probe phase searches hash table and collects matches
- *
- **/
+ * @see hashtable.h for UnchainedHashtable implementation.
+ * @see match_collector.h for match accumulation strategy.
+ */
 
 namespace Contest {
 
 /**
+ * @brief Build hash table from ColumnarTable input.
  *
- *  builds hash table from ColumnarTable columnar input
- *  reads directly from original page format
- *  constructs unchained hash table with bloom filters
+ * Extracts the join key column from the ColumnarTable and builds a
+ * hash table using radix-partitioned parallel construction.
  *
- **/
+ * @param input    JoinInput containing ColumnarTable pointer.
+ * @param attr_idx Index into input.node->output_attrs for the join key.
+ * @return Constructed hash table ready for probing.
+ */
 inline UnchainedHashtable build_from_columnar(const JoinInput &input,
                                               size_t attr_idx) {
     auto *table = std::get<const ColumnarTable *>(input.data);
@@ -41,12 +49,14 @@ inline UnchainedHashtable build_from_columnar(const JoinInput &input,
 }
 
 /**
+ * @brief Build hash table from intermediate results (column_t).
  *
- *  builds hash table from column_t intermediate results
- *  works with intermediate results from previous joins
- *  constructs unchained hash table with bloom filters
+ * Uses the join key column from ExecuteResult (intermediate format).
  *
- **/
+ * @param input    JoinInput containing ExecuteResult.
+ * @param attr_idx Index into ExecuteResult for the join key column.
+ * @return Constructed hash table ready for probing.
+ */
 inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
                                                   size_t attr_idx) {
     const auto &result = std::get<ExecuteResult>(input.data);
@@ -60,14 +70,16 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
 }
 
 /**
+ * @brief Probe hash table with intermediate input using work-stealing.
  *
- *  parallel probing of hash table with intermediate column_t input using work
- * stealing each thread processes pages via atomic counter for dynamic load
- * balancing leverages fixed-size pages for simple row offset calculation
- *  thread-local collectors merged after join for lock-free execution
- *  skips null values during probing
+ * Distributes probe pages across worker threads via atomic counter.
+ * Each thread accumulates matches locally, then all buffers are merged.
  *
- **/
+ * @param hash_table   Built hash table from build phase.
+ * @param probe_column Intermediate column_t containing probe keys.
+ * @param collector    Output match collector (receives merged results).
+ * @param mode         Which row IDs to collect (BOTH, LEFT_ONLY, RIGHT_ONLY).
+ */
 inline void
 probe_intermediate(const UnchainedHashtable &hash_table,
                    const mema::column_t &probe_column,
@@ -117,6 +129,18 @@ probe_intermediate(const UnchainedHashtable &hash_table,
     merge_local_collectors(local_buffers, collector);
 }
 
+/**
+ * @brief Probe hash table with ColumnarTable input using work-stealing.
+ *
+ * Handles both dense pages (no NULLs, fast path) and sparse pages (with
+ * bitmap). Page offsets are precomputed for row ID calculation.
+ *
+ * @param hash_table   Built hash table from build phase.
+ * @param probe_input  JoinInput containing ColumnarTable pointer.
+ * @param probe_attr   Index into probe_input.node->output_attrs for probe key.
+ * @param collector    Output match collector.
+ * @param mode         Which row IDs to collect.
+ */
 inline void
 probe_columnar(const UnchainedHashtable &hash_table,
                const JoinInput &probe_input, size_t probe_attr,

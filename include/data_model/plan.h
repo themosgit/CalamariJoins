@@ -14,8 +14,19 @@
  * limitations under the License.
  */
 
-// API of the SIGMOD 2025 Programming Contest,
-// See https://sigmod-contest-2025.github.io/index.html
+/**
+ * @file plan.h
+ * @brief Execution plan structures and columnar output format.
+ *
+ * Defines the Plan structure built by the SQL parser, containing a tree of
+ * join/scan nodes. Each node has output_attrs mapping output column indices
+ * to source columns with their types.
+ *
+ * Also defines ColumnarTable, the required output format for the contest API,
+ * using page-based columnar storage with null bitmaps.
+ *
+ * @see intermediate.h for the intermediate result format used between joins.
+ */
 #pragma once
 
 #include <data_model/statement.h>
@@ -25,6 +36,16 @@
 #include <sys/mman.h>
 #endif
 
+/**
+ * @brief RAII wrapper for mmap'd memory with reference counting.
+ *
+ * Multiple Column objects can share the same mapped region. The refs counter
+ * tracks active users; munmap is called when the last reference is released.
+ * Used by both ColumnarTable output and intermediate results from
+ * BatchAllocator.
+ *
+ * @note Move-only type to prevent accidental double-free of mapped regions.
+ */
 class MappedMemory {
   public:
     void *addr;
@@ -62,29 +83,63 @@ class MappedMemory {
     }
 };
 
-// #include <data_access/table.h>
-
-// supported attribute data types
-
+/**
+ * @brief Discriminator for plan node types.
+ */
 enum class NodeType {
-    HashJoin,
-    Scan,
+    HashJoin, /**< Inner join node with two children. */
+    Scan,     /**< Leaf node referencing a base table. */
 };
 
+/**
+ * @brief Leaf node that references a pre-loaded base table.
+ *
+ * The base_table_id indexes into Plan::inputs. ScanNodes return non-owning
+ * pointers to ColumnarTable during execution; the base table must remain
+ * valid until final materialization since intermediate VARCHAR values
+ * reference its pages.
+ */
 struct ScanNode {
-    size_t base_table_id;
+    size_t base_table_id; /**< Index into Plan::inputs. */
 };
 
+/**
+ * @brief Inner join node with two children and equi-join condition.
+ *
+ * Children are referenced by index into Plan::nodes. The join condition
+ * is an equality predicate between left_attr and right_attr columns.
+ *
+ * @note Join keys are always INT32 (contest invariant). VARCHAR columns
+ *       are never used as join keys.
+ */
 struct JoinNode {
+    /** Optimizer hint: if true, prefer left child as build side.
+     *  Execution may override based on actual cardinalities. */
     bool build_left;
-    size_t left;
-    size_t right;
-    size_t left_attr;
-    size_t right_attr;
+    size_t left;       /**< Index of left child in Plan::nodes. */
+    size_t right;      /**< Index of right child in Plan::nodes. */
+    size_t left_attr;  /**< Join key: index into left child's output_attrs. */
+    size_t right_attr; /**< Join key: index into right child's output_attrs. */
 };
 
+/**
+ * @brief A node in the execution plan tree (either Scan or Join).
+ *
+ * Each node specifies which columns appear in its output via output_attrs.
+ * This mapping tracks column provenance through the join tree.
+ *
+ * **output_attrs semantics:**
+ * - For ScanNode: index refers to column in the base ColumnarTable
+ * - For JoinNode: index refers to combined left+right child output
+ *   - Indices [0, left_output_size) map to left child's output columns
+ *   - Indices [left_output_size, ...) map to right child's output columns
+ *
+ * During execution, select_build_probe_side() may remap these indices
+ * based on which child becomes the build vs probe side.
+ */
 struct PlanNode {
-    std::variant<ScanNode, JoinNode> data;
+    std::variant<ScanNode, JoinNode> data; /**< Node-specific data. */
+    /** Output column mapping: (source_index, type) pairs. */
     std::vector<std::tuple<size_t, DataType>> output_attrs;
 
     PlanNode(std::variant<ScanNode, JoinNode> data,
@@ -92,16 +147,49 @@ struct PlanNode {
         : data(std::move(data)), output_attrs(std::move(output_attrs)) {}
 };
 
+/** @brief Page size for ColumnarTable output format (8KB). */
 constexpr size_t PAGE_SIZE = 8192;
 
+/**
+ * @brief Fixed-size memory block for columnar data storage.
+ *
+ * Pages are 8-byte aligned for efficient access to 64-bit values.
+ * Page layout depends on column type:
+ *
+ * **INT32 page format:**
+ * - Bytes 0-1: num_rows (u16) - total rows including NULLs
+ * - Bytes 2-3: num_values (u16) - count of non-NULL values
+ * - Bytes 4+: packed INT32 values
+ * - End-N: validity bitmap (1=valid, 0=NULL)
+ *
+ * **VARCHAR page format:**
+ * - Bytes 0-1: num_rows (u16) or special marker (0xFFFF/0xFFFE for long
+ * strings)
+ * - Bytes 2-3: num_offsets (u16)
+ * - Bytes 4+: cumulative end offsets (u16 each)
+ * - After offsets: packed string bytes
+ * - End-N: validity bitmap
+ *
+ * If num_rows == num_values, page is "dense" (no NULLs) enabling fast paths.
+ */
 struct alignas(8) Page {
     std::byte data[PAGE_SIZE];
 };
 
+/**
+ * @brief A single column in a ColumnarTable, stored as a sequence of pages.
+ *
+ * Columns can either own their pages individually (new/delete) or share
+ * pages from a MappedMemory region (arena allocation). The mapped_memory
+ * pointer determines cleanup behavior: if set, pages are freed via the
+ * shared region's reference counting.
+ *
+ * @note Move-only type. Copy is deleted to prevent accidental page duplication.
+ */
 struct Column {
-    DataType type;
-    std::vector<Page *> pages;
-    MappedMemory *mapped_memory;
+    DataType type;               /**< INT32 or VARCHAR. */
+    std::vector<Page *> pages;   /**< Pointers to data pages. */
+    MappedMemory *mapped_memory; /**< Shared memory region, or nullptr. */
 
     Page *new_page() {
         auto ret = new Page;
@@ -153,9 +241,18 @@ struct Column {
     }
 };
 
+/**
+ * @brief Columnar table format required by the contest API.
+ *
+ * Stores data column-by-column in pages for cache-efficient access.
+ * This is the final output format produced by materialize() for root joins.
+ *
+ * @see intermediate.h for column_t, the intermediate format used between
+ *      non-root joins (uses larger pages and value_t encoding).
+ */
 struct ColumnarTable {
-    size_t num_rows{0};
-    std::vector<Column> columns;
+    size_t num_rows{0};          /**< Total row count across all pages. */
+    std::vector<Column> columns; /**< One Column per output attribute. */
 };
 
 std::tuple<std::vector<std::vector<Data>>, std::vector<DataType>>
@@ -163,11 +260,21 @@ from_columnar(const ColumnarTable &table);
 ColumnarTable from_table(const std::vector<std::vector<Data>> &table,
                          const std::vector<DataType> &data_types);
 
+/**
+ * @brief Complete execution plan for a multi-way join query.
+ *
+ * Contains a tree of PlanNodes (stored flat in a vector) and pre-loaded
+ * base tables. The root field identifies which node produces the final result.
+ *
+ * **Lifetime:** Base tables in inputs must remain valid until execute()
+ * completes, since intermediate VARCHAR values encode references to their
+ * pages.
+ */
 struct Plan {
-    std::vector<PlanNode> nodes;
-    std::vector<ColumnarTable> inputs;
-    // std::vector<Table>         tables;
-    size_t root;
+    std::vector<PlanNode>
+        nodes; /**< All nodes; indices reference each other. */
+    std::vector<ColumnarTable> inputs; /**< Pre-loaded base tables. */
+    size_t root;                       /**< Index of root node in nodes. */
 
     size_t
     new_join_node(bool build_left, size_t left, size_t right, size_t left_attr,
@@ -201,6 +308,18 @@ struct Plan {
     }
 };
 
+/**
+ * @brief Helper for building ColumnarTable columns incrementally.
+ *
+ * Handles page allocation, value insertion, null bitmap management, and
+ * automatic page finalization when capacity is reached. Template parameter
+ * determines value type (int32_t or std::string specialization).
+ *
+ * Page format follows ColumnarTable conventions with header, packed values,
+ * and trailing validity bitmap.
+ *
+ * @tparam T Value type: int32_t for INT32 columns, std::string for VARCHAR.
+ */
 template <class T> struct ColumnInserter {
     Column &column;
     size_t last_page_idx = 0;
@@ -278,6 +397,13 @@ template <class T> struct ColumnInserter {
     }
 };
 
+/**
+ * @brief Specialization of ColumnInserter for VARCHAR columns.
+ *
+ * Handles variable-length strings with offset arrays and special handling
+ * for long strings that span multiple pages. Long strings use marker values
+ * 0xFFFF (first page) and 0xFFFE (continuation pages) in the num_rows field.
+ */
 template <> struct ColumnInserter<std::string> {
     Column &column;
     size_t last_page_idx = 0;
@@ -385,21 +511,45 @@ template <> struct ColumnInserter<std::string> {
     }
 };
 
+/** @brief Contest execution API and timing instrumentation. */
 namespace Contest {
 
+/**
+ * @brief Performance timing breakdown for query execution.
+ *
+ * Captures millisecond-resolution timings for each execution phase.
+ * Used for performance analysis and benchmark comparisons.
+ */
 struct TimingStats {
-    int64_t hashtable_build_ms = 0;
-    int64_t hash_join_probe_ms = 0;
-    int64_t nested_loop_join_ms = 0;
-    int64_t materialize_ms = 0;
-    int64_t setup_ms = 0;
-    int64_t total_execution_ms = 0;
-    int64_t intermediate_ms = 0;
+    int64_t hashtable_build_ms = 0;  /**< Hash table construction time. */
+    int64_t hash_join_probe_ms = 0;  /**< Parallel probe phase duration. */
+    int64_t nested_loop_join_ms = 0; /**< Nested loop join (for tiny tables). */
+    int64_t materialize_ms = 0;      /**< Final ColumnarTable construction. */
+    int64_t setup_ms = 0;            /**< JoinSetup + build/probe selection. */
+    int64_t total_execution_ms = 0;  /**< Wall-clock total for execute(). */
+    int64_t intermediate_ms = 0; /**< construct_intermediate for non-root. */
 };
 
+/** @brief Allocate execution context (worker pool, shared state). */
 void *build_context();
+
+/** @brief Release execution context resources. */
 void destroy_context(void *);
 
+/**
+ * @brief Execute a multi-way join query plan.
+ *
+ * Traverses the plan tree depth-first, executing joins recursively.
+ * Returns the final result as a ColumnarTable.
+ *
+ * @param plan      Query plan with nodes and pre-loaded base tables.
+ * @param context   Execution context from build_context().
+ * @param stats_out Optional output for timing breakdown.
+ * @param show_detailed_timing If true, print timing to stderr.
+ * @return Final join result in columnar format.
+ *
+ * @see execute.cpp for implementation details.
+ */
 ColumnarTable execute(const Plan &plan, void *context,
                       TimingStats *stats_out = nullptr,
                       bool show_detailed_timing = false);
