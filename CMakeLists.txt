@@ -61,6 +61,19 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     set(SKIP_EXTENSIONS jemalloc)
 endif()
 
+# Detect Xeon E5-2680 v3 CPU for benchmark VM hardware configuration
+set(IS_BENCHMARK_VM_HARDWARE OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/cpuinfo")
+    file(READ "/proc/cpuinfo" CPUINFO_CONTENT)
+    if(CPUINFO_CONTENT MATCHES "E5-2680 v3")
+        message(STATUS "Detected Intel Xeon E5-2680 v3 CPU - using benchmark VM hardware configuration")
+        add_compile_definitions(SPC__USE_BENCHMARKVM_HARDWARE)
+        set(IS_BENCHMARK_VM_HARDWARE ON)
+    endif()
+endif()
+
+# Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
+# Try re-running cmake in case changes are not recognized.
 file(GLOB ALL_SRC
     CONFIGURE_DEPENDS
     "src/*.cpp"
@@ -73,7 +86,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
     add_compile_options(-O3 -mcpu=apple-m1 -flto)
 else()
-    add_compile_options(-O3 -march=skylake -m64 -mcrc32 -fpermissive -flto)
+    add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive -flto)
 endif()
 
 add_link_options(-flto)
@@ -85,6 +98,13 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(faster PRIVATE)
     target_link_libraries(faster PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(faster PRIVATE include)
+
+    if(IS_BENCHMARK_VM_HARDWARE)
+        add_executable(leaderboard ${MANOLATES_SRC} tests/read_sql.cpp)
+        target_compile_definitions(leaderboard PRIVATE)
+        target_link_libraries(leaderboard PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+        target_include_directories(leaderboard PRIVATE include)
+    endif()
 endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
