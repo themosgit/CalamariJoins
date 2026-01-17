@@ -1,9 +1,9 @@
 #include <cassert>
 
-#include <common.h>
-#include <inner_column.h>
-#include <plan.h>
-#include <statement.h>
+#include <foundation/common.h>
+#include <data_model/inner_column.h>
+#include <data_model/plan.h>
+#include <data_model/statement.h>
 
 std::vector<uint8_t> bitmap_not(std::vector<uint8_t> bitmap) {
     auto task = [&bitmap](size_t begin, size_t end) {

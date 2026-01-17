@@ -1,8 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
-#include <plan.h>
-#include <table.h>
+#include <data_model/plan.h>
+#include <data_access/table.h>
 
 void sort(std::vector<std::vector<Data>> &table) {
     std::sort(table.begin(), table.end());

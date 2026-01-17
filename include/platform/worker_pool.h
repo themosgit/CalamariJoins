@@ -1,18 +1,18 @@
 #pragma once
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    #include <hardware_darwin.h>
+#include <platform/hardware_darwin.h>
 #elif defined(SPC__USE_BENCHMARKVM_HARDWARE)
-    #include <hardware_benchmarkvm.h>
+#include <platform/hardware_benchmarkvm.h>
 #else
-    #include <hardware.h>
+#include <platform/hardware.h>
 #endif
 
-#include <common.h>
+#include <atomic>
 #include <condition_variable>
+#include <foundation/common.h>
 #include <functional>
 #include <mutex>
-#include <atomic>
 #include <thread>
 #include <vector>
 namespace Contest {
@@ -90,13 +90,12 @@ class WorkerThreadPool {
             task_generation++;
         }
         worker_cv.notify_all();
-        
+
         /* wait for atomic counter to reach 0 */
         std::unique_lock<std::mutex> lock(pool_mutex);
         main_cv.wait(lock, [&] {
-                return tasks_remaining.load(std::memory_order_acquire) == 0;
+            return tasks_remaining.load(std::memory_order_acquire) == 0;
         });
-
     }
 
     constexpr int thread_count() const { return NUM_THREADS; }

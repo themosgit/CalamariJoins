@@ -8,9 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <inner_column.h>
-#include <plan.h>
-#include <table_entity.h>
+#include <data_model/inner_column.h>
+#include <data_model/plan.h>
+#include <data_model/table_entity.h>
 
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -21,7 +21,7 @@
 #include <duckdb.hpp>
 #endif
 
-#include <table.h>
+#include <data_access/table.h>
 
 using json = nlohmann::json;
 

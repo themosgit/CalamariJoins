@@ -1,11 +1,11 @@
 #pragma once
 
-#include <common.h>
 #include <cstdint>
-#include <plan.h>
-#include <table.h>
-#include <vector>
+#include <data_access/table.h>
+#include <data_model/plan.h>
+#include <foundation/common.h>
 #include <memory>
+#include <vector>
 
 namespace mema {
 
@@ -20,7 +20,7 @@ struct alignas(4) value_t {
 
     /* packed: offset_idx (13 bits) | page_idx (19 bits) */
     static inline value_t encode_string(int32_t page_idx, int32_t offset_idx) {
-        return { (offset_idx << 19) | (page_idx & 0x7FFFF) };
+        return {(offset_idx << 19) | (page_idx & 0x7FFFF)};
     }
 
     static inline void decode_string(int32_t encoded, int32_t &page_idx,
@@ -39,9 +39,7 @@ struct alignas(4) value_t {
 constexpr size_t IR_PAGE_SIZE = 1 << 14;
 
 /* Ensuring this aligns with system page size is good for mmap */
-constexpr size_t CAP_PER_PAGE = IR_PAGE_SIZE / sizeof(value_t); 
-
-
+constexpr size_t CAP_PER_PAGE = IR_PAGE_SIZE / sizeof(value_t);
 
 struct column_t {
   private:
@@ -61,27 +59,30 @@ struct column_t {
   public:
     column_t() = default;
 
-    column_t(column_t&& other) noexcept 
-        : num_values(other.num_values), owns_pages(other.owns_pages), 
-          external_memory(std::move(other.external_memory)), 
-          pages(std::move(other.pages)), 
-          source_table(other.source_table), source_column(other.source_column) {
+    column_t(column_t &&other) noexcept
+        : num_values(other.num_values), owns_pages(other.owns_pages),
+          external_memory(std::move(other.external_memory)),
+          pages(std::move(other.pages)), source_table(other.source_table),
+          source_column(other.source_column) {
         other.owns_pages = false;
         other.pages.clear();
         other.num_values = 0;
     }
 
-    column_t& operator=(column_t&& other) noexcept {
+    column_t &operator=(column_t &&other) noexcept {
         if (this != &other) {
-            if (owns_pages) { for (auto *p : pages) delete p; }
-            
+            if (owns_pages) {
+                for (auto *p : pages)
+                    delete p;
+            }
+
             num_values = other.num_values;
             owns_pages = other.owns_pages;
             external_memory = std::move(other.external_memory);
             pages = std::move(other.pages);
             source_table = other.source_table;
             source_column = other.source_column;
-            
+
             other.owns_pages = false;
             other.pages.clear();
             other.num_values = 0;
@@ -89,19 +90,20 @@ struct column_t {
         return *this;
     }
 
-    column_t(const column_t&) = delete;
-    column_t& operator=(const column_t&) = delete;
+    column_t(const column_t &) = delete;
+    column_t &operator=(const column_t &) = delete;
 
     ~column_t() {
         if (owns_pages) {
-            for (auto *page : pages) delete page;
+            for (auto *page : pages)
+                delete page;
         }
     }
 
     /**
-     *  
+     *
      *  Resizes the column to hold `count` elements.
-     *  Allocates new pages if necessary. 
+     *  Allocates new pages if necessary.
      *  Crucial for parallel write_at access.
      *
      **/
@@ -120,13 +122,14 @@ struct column_t {
 
     inline void append(const value_t &val) {
         if ((num_values & (CAP_PER_PAGE - 1)) == 0) {
-             pages.push_back(new Page());
+            pages.push_back(new Page());
         }
         pages.back()->data[num_values & (CAP_PER_PAGE - 1)] = val;
         num_values++;
     }
 
-    /* pre-allocate all pages for parallel writing called before spawning threads */
+    /* pre-allocate all pages for parallel writing called before spawning
+     * threads */
     inline void pre_allocate(size_t count) {
         size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
         pages.reserve(pages_needed);
@@ -140,17 +143,18 @@ struct column_t {
     inline const value_t &operator[](size_t idx) const {
         return pages[idx >> 12]->data[idx & 0xFFF];
     }
-    
+
     size_t row_count() const { return num_values; }
 
     /* pre-allocate from a contiguous memory block (batch allocation) */
-    inline void pre_allocate_from_block(void* block, size_t& offset, size_t count,
+    inline void pre_allocate_from_block(void *block, size_t &offset,
+                                        size_t count,
                                         std::shared_ptr<void> memory_keeper) {
         size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
         pages.reserve(pages_needed);
-        char* base = static_cast<char*>(block);
+        char *base = static_cast<char *>(block);
         for (size_t i = 0; i < pages_needed; ++i) {
-            pages.push_back(reinterpret_cast<Page*>(base + offset));
+            pages.push_back(reinterpret_cast<Page *>(base + offset));
             offset += sizeof(Page);
         }
         num_values = count;
@@ -166,4 +170,8 @@ struct column_t {
 
 using Columnar = std::vector<column_t>;
 ColumnarTable to_columnar(const Columnar &table, const Plan &plan);
-} // namespace mema
+} /* namespace mema */
+
+namespace Contest {
+using ExecuteResult = std::vector<mema::column_t>;
+} /* namespace Contest */

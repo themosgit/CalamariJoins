@@ -3,7 +3,7 @@
 #include <fmt/core.h>
 #include <string>
 
-#include "common.h"
+#include <foundation/common.h>
 
 struct TableEntity {
     std::string table;

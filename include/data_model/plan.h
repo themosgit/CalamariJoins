@@ -18,8 +18,8 @@
 // See https://sigmod-contest-2025.github.io/index.html
 #pragma once
 
-#include <attribute.h>
-#include <statement.h>
+#include <data_model/statement.h>
+#include <foundation/attribute.h>
 
 #if !defined(TEAMOPT_USE_DUCKDB) || defined(TEAMOPT_BUILD_CACHE)
 #include <sys/mman.h>
@@ -62,7 +62,7 @@ class MappedMemory {
     }
 };
 
-// #include <table.h>
+// #include <data_access/table.h>
 
 // supported attribute data types
 
@@ -400,6 +400,8 @@ struct TimingStats {
 void *build_context();
 void destroy_context(void *);
 
-ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out = nullptr, bool show_detailed_timing = false);
+ColumnarTable execute(const Plan &plan, void *context,
+                      TimingStats *stats_out = nullptr,
+                      bool show_detailed_timing = false);
 
 } // namespace Contest

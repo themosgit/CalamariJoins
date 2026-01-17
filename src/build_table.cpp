@@ -1,11 +1,11 @@
 #include <atomic>
 #include <charconv>
 
-#include <common.h>
-#include <csv_parser.h>
-#include <inner_column.h>
-#include <plan.h>
-#include <table.h>
+#include <foundation/common.h>
+#include <data_access/csv_parser.h>
+#include <data_model/inner_column.h>
+#include <data_model/plan.h>
+#include <data_access/table.h>
 
 #if !defined(TEAMOPT_USE_DUCKDB) || defined(TEAMOPT_BUILD_CACHE)
 #include <fcntl.h>
