@@ -28,21 +28,28 @@ jobs:
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          GITHUB_TOKEN: ${{ vars.GH_TOKEN }}
-          GITHUB_OWNER: ${{ github.repository_owner }}
-          GITHUB_REPO: ${{ github.event.repository.name }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.ref_name }}
+          GH_AUTHOR: ${{ github.event.pusher.name }}
+          GH_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          GH_COMMIT_URL: ${{ github.event.head_commit.url }}
         run: |
-          node -e "
-          require('dotenv').config();
-          const { Client, GatewayIntentBits } = require('discord.js');
+          node -e '
+          const { Client, GatewayIntentBits } = require("discord.js");
           const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-          
-          client.once('ready', async () => {
+
+          client.once("ready", async () => {
             const channel = client.channels.cache.get(process.env.CHANNEL_ID);
-            const message = \**🚨 New Push to \\\**${{ github.repository }}\\\** Branch \\\**${{ github.ref_name }}\\\**!\n👤 Author: \\\**${{ github.event.pusher.name }}\\\**\n:pencil2: Commit: \\\**${{ github.event.head_commit.message }}\\\**\n:broken_chain: View: ${{ github.event.head_commit.url }}\**;
-            await channel.send(message);
+            
+            // Using standard Bold (**) without codeblocks
+            const message = `**🚨 New Push to **${process.env.GH_REPO}** Branch **${process.env.GH_BRANCH}**!
+            👤 Author: **${process.env.GH_AUTHOR}**
+            :pencil2: Commit: **${process.env.GH_COMMIT_MSG}**
+            :broken_chain: View: ${process.env.GH_COMMIT_URL}`;
+
+            if(channel) await channel.send(message);
             process.exit(0);
           });
-          
+
           client.login(process.env.DISCORD_TOKEN);
-          "
+          '
