@@ -50,6 +50,14 @@
 
 namespace Contest {
 
+// Import join execution types into Contest namespace
+using namespace join;
+
+// Import specific materialization functions (namespace qualified for
+// materialize::materialize to avoid collision with namespace name)
+using materialize::construct_intermediate;
+using materialize::create_empty_result;
+
 /**
  * @brief Result of execute_impl(): either intermediate or final output.
  *
@@ -136,11 +144,16 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     const auto &left_node = plan.nodes[join.left];
     const auto &right_node = plan.nodes[join.right];
 
-    /* determine intermediate and columnar tables */
+    /* Resolve child inputs: ScanNodes return ColumnarTable*, JoinNodes recurse
+     */
     JoinInput left_input = resolve_join_input(plan, join.left, stats);
     JoinInput right_input = resolve_join_input(plan, join.right, stats);
 
-    /* select build probe sides based on table size and configure proper args */
+    /**
+     * Select build/probe sides: smaller input becomes build side to minimize
+     * hash table size. Remaps output_attrs accordingly if sides are swapped.
+     * @see join_setup.h::select_build_probe_side() for the heuristic.
+     */
     auto setup_start = std::chrono::high_resolution_clock::now();
     auto config =
         select_build_probe_side(join, left_input, right_input, output_attrs);
@@ -152,12 +165,22 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     bool build_is_columnar = build_input.is_columnar();
     bool probe_is_columnar = probe_input.is_columnar();
 
-    /* select join algorithm */
+    /**
+     * Algorithm selection: nested loop for tiny tables (< 8 rows) to avoid
+     * hash table overhead. At this size, linear scan is faster due to:
+     * - No hash computation or partitioning cost
+     * - Entire build side fits in L1 cache
+     * - Simple loop has better branch prediction
+     * @see nested_loop.h for the nested loop implementation.
+     */
     const size_t HASH_TABLE_THRESHOLD = 8;
     size_t build_rows = build_input.row_count(config.build_attr);
     bool use_nested_loop = (build_rows < HASH_TABLE_THRESHOLD);
 
-    /* initialize join data */
+    /**
+     * Setup pre-allocates ExecuteResult for non-root joins and prepares
+     * ColumnarReader infrastructure (PageIndex built lazily on demand).
+     */
     JoinSetup setup = setup_join(build_input, probe_input, build_node,
                                  probe_node, left_node, right_node, left_input,
                                  right_input, output_attrs, build_rows);
@@ -166,13 +189,19 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
         setup_end - setup_start);
     stats.setup_ms += setup_elapsed.count();
 
-    /* Determine collection mode based on output requirements */
+    /**
+     * Optimize match collection: if output only needs columns from one side,
+     * skip collecting row IDs from the other side (50% memory savings).
+     * @see join_setup.h::determine_collection_mode() for the optimization.
+     */
     MatchCollectionMode collection_mode = determine_collection_mode(
         config.remapped_attrs, config.build_left ? left_input.output_size()
                                                  : right_input.output_size());
 
     MatchCollector collector(collection_mode);
-    /* nested loop join path */
+
+    /* Nested loop join: used for tiny tables where hash overhead exceeds
+     * benefit */
     if (use_nested_loop) {
 
         auto nested_loop_start = std::chrono::high_resolution_clock::now();
@@ -185,7 +214,13 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                 nested_loop_end - nested_loop_start);
         stats.nested_loop_join_ms += nested_loop_elapsed.count();
     } else {
-        /* building hash table based on columnar or intermediate */
+        /**
+         * Hash join: radix-partitioned parallel build, then parallel probe.
+         * Build function dispatches on data type (ColumnarTable vs
+         * ExecuteResult).
+         * @see hashtable.h for the unchained hash table structure.
+         * @see hash_join.h for build/probe implementations.
+         */
         auto build_start = std::chrono::high_resolution_clock::now();
         UnchainedHashtable hash_table =
             build_is_columnar
@@ -197,7 +232,11 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                                                                   build_start);
         stats.hashtable_build_ms += build_elapsed.count();
 
-        /* selecting proper probe */
+        /**
+         * Parallel probe with work-stealing: threads grab probe pages
+         * atomically, accumulating matches to thread-local buffers for
+         * lock-free collection.
+         */
         auto probe_start = std::chrono::high_resolution_clock::now();
         if (probe_is_columnar) {
             probe_columnar(hash_table, probe_input, config.probe_attr,
@@ -217,18 +256,27 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     JoinResult final_result;
     if (is_root) {
         auto mat_start = std::chrono::high_resolution_clock::now();
+        /**
+         * Empty result fast path: avoid PageIndex build and materialization
+         * overhead when no matches exist. Produces schema-correct empty table.
+         */
         if (collector.size() == 0) {
             final_result = create_empty_result(config.remapped_attrs);
         } else {
-            /* prepare PageIndex now - after probing, before materialization */
+            /**
+             * Lazy PageIndex construction: only build indices for columns
+             * actually needed in output (projection pushdown optimization).
+             * Built here after probing completes, before materialization needs
+             * it.
+             */
             prepare_output_columns(
                 setup.columnar_reader, build_input, probe_input, build_node,
                 probe_node, config.remapped_attrs, build_input.output_size());
 
-            final_result = materialize(collector, build_input, probe_input,
-                                       config.remapped_attrs, build_node,
-                                       probe_node, build_input.output_size(),
-                                       setup.columnar_reader, plan);
+            final_result = materialize::materialize(
+                collector, build_input, probe_input, config.remapped_attrs,
+                build_node, probe_node, build_input.output_size(),
+                setup.columnar_reader, plan);
         }
         auto mat_end = std::chrono::high_resolution_clock::now();
         stats.materialize_ms +=
@@ -239,8 +287,10 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     } else {
         auto inter_start = std::chrono::high_resolution_clock::now();
         if (collector.size() > 0) {
-            /* prepare PageIndex now - after probing, before intermediate
-             * construction */
+            /**
+             * Lazy PageIndex construction for non-root joins.
+             * Same projection optimization as root case.
+             */
             prepare_output_columns(
                 setup.columnar_reader, build_input, probe_input, build_node,
                 probe_node, config.remapped_attrs, build_input.output_size());
@@ -250,6 +300,10 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                                    probe_node, build_input.output_size(),
                                    setup.columnar_reader, setup.results);
         }
+        /**
+         * Transfer ownership of setup.results (pre-allocated ExecuteResult)
+         * to caller. Held on stack until parent join completes materialization.
+         */
         final_result = std::move(setup.results);
         auto inter_end = std::chrono::high_resolution_clock::now();
         stats.intermediate_ms +=

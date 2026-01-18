@@ -23,17 +23,44 @@
  * @see match_collector.h for match accumulation strategy.
  */
 
-namespace Contest {
+/**
+ * @namespace Contest::join
+ * @brief Parallel hash join implementation for the SIGMOD contest.
+ *
+ * Key components in this file:
+ * - build_from_columnar(): Build hash table from base table Column
+ * - build_from_intermediate(): Build hash table from prior join results
+ * - probe_intermediate(): Work-stealing probe with column_t input
+ * - probe_columnar(): Work-stealing probe with ColumnarTable input
+ *
+ * @see hashtable.h for UnchainedHashtable implementation
+ * @see match_collector.h for thread-local match accumulation
+ */
+namespace Contest::join {
+
+// Types from Contest:: namespace
+using Contest::ExecuteResult;
+
+// Types from Contest::platform:: namespace
+using Contest::platform::worker_pool;
+
+// Note: Column, ColumnarTable, PAGE_SIZE, PlanNode are defined at global scope
+// and accessible without qualification
 
 /**
  * @brief Build hash table from ColumnarTable input.
  *
  * Extracts the join key column from the ColumnarTable and builds a
- * hash table using radix-partitioned parallel construction.
+ * hash table using radix-partitioned parallel construction. Maps logical
+ * attribute index to physical column, then delegates to
+ * UnchainedHashtable::build_columnar.
  *
- * @param input    JoinInput containing ColumnarTable pointer.
- * @param attr_idx Index into input.node->output_attrs for the join key.
+ * @param input    JoinInput containing ColumnarTable pointer and plan node
+ * metadata.
+ * @param attr_idx Logical index into input.node->output_attrs to locate the
+ * join key column.
  * @return Constructed hash table ready for probing.
+ * @see hashtable.h for UnchainedHashtable::build_columnar implementation.
  */
 inline UnchainedHashtable build_from_columnar(const JoinInput &input,
                                               size_t attr_idx) {
@@ -51,11 +78,15 @@ inline UnchainedHashtable build_from_columnar(const JoinInput &input,
 /**
  * @brief Build hash table from intermediate results (column_t).
  *
- * Uses the join key column from ExecuteResult (intermediate format).
+ * Uses the join key column from ExecuteResult (intermediate format) produced by
+ * prior pipeline stages. Direct index lookup since ExecuteResult already
+ * contains materialized columns.
  *
- * @param input    JoinInput containing ExecuteResult.
- * @param attr_idx Index into ExecuteResult for the join key column.
+ * @param input    JoinInput containing ExecuteResult with column_t arrays.
+ * @param attr_idx Direct index into ExecuteResult column array for the join
+ * key.
  * @return Constructed hash table ready for probing.
+ * @see hashtable.h for UnchainedHashtable::build_intermediate implementation.
  */
 inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
                                                   size_t attr_idx) {
@@ -72,13 +103,20 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
 /**
  * @brief Probe hash table with intermediate input using work-stealing.
  *
- * Distributes probe pages across worker threads via atomic counter.
- * Each thread accumulates matches locally, then all buffers are merged.
+ * Distributes probe pages across worker threads via atomic counter. Each thread
+ * accumulates matches locally to avoid contention, then all buffers are merged.
+ * Skips NULL keys automatically via value_t::is_null() check.
  *
- * @param hash_table   Built hash table from build phase.
- * @param probe_column Intermediate column_t containing probe keys.
- * @param collector    Output match collector (receives merged results).
- * @param mode         Which row IDs to collect (BOTH, LEFT_ONLY, RIGHT_ONLY).
+ * @param hash_table   Built hash table from build phase containing keys and row
+ * IDs.
+ * @param probe_column Intermediate column_t containing probe keys
+ * (mema::value_t array).
+ * @param collector    Output match collector that receives merged thread-local
+ * results.
+ * @param mode         Controls which row IDs to collect: BOTH (inner join),
+ * LEFT_ONLY (left outer build IDs), or RIGHT_ONLY (right outer probe IDs).
+ *                     Affects thread-local buffer allocation strategy.
+ * @see match_collector.h for MatchCollectionMode and buffer merge strategy.
  */
 inline void
 probe_intermediate(const UnchainedHashtable &hash_table,
@@ -133,13 +171,22 @@ probe_intermediate(const UnchainedHashtable &hash_table,
  * @brief Probe hash table with ColumnarTable input using work-stealing.
  *
  * Handles both dense pages (no NULLs, fast path) and sparse pages (with
- * bitmap). Page offsets are precomputed for row ID calculation.
+ * bitmap). Page offsets are precomputed to translate page-local row indices to
+ * global row IDs. Chooses decode path based on num_rows == num_values equality
+ * check.
  *
- * @param hash_table   Built hash table from build phase.
- * @param probe_input  JoinInput containing ColumnarTable pointer.
- * @param probe_attr   Index into probe_input.node->output_attrs for probe key.
- * @param collector    Output match collector.
- * @param mode         Which row IDs to collect.
+ * @param hash_table   Built hash table from build phase containing keys and row
+ * IDs.
+ * @param probe_input  JoinInput containing ColumnarTable pointer and plan node
+ * metadata.
+ * @param probe_attr   Logical index into probe_input.node->output_attrs to
+ * locate probe key column.
+ * @param collector    Output match collector that receives merged thread-local
+ * results.
+ * @param mode         Controls which row IDs to collect: BOTH (inner join),
+ * LEFT_ONLY (left outer build IDs), or RIGHT_ONLY (right outer probe IDs).
+ *                     Affects thread-local buffer allocation strategy.
+ * @see match_collector.h for MatchCollectionMode and buffer merge strategy.
  */
 inline void
 probe_columnar(const UnchainedHashtable &hash_table,
@@ -221,4 +268,4 @@ probe_columnar(const UnchainedHashtable &hash_table,
 
     merge_local_collectors(local_buffers, collector);
 }
-} // namespace Contest
+} // namespace Contest::join
