@@ -179,7 +179,6 @@ struct FilterThreadPool {
 };
 
 /// Global filter thread pool with 12 threads for CSV loading.
-/// Global filter thread pool with 12 threads for CSV loading.
 inline FilterThreadPool filter_tp(12);
 
 /**

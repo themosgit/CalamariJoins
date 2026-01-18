@@ -45,9 +45,6 @@
  */
 namespace Contest::materialize {
 
-// Types from global scope (data_model/plan.h)
-// Column, Page, PAGE_SIZE are accessible without qualification
-
 /** @brief Gets string data from a VARCHAR column page. */
 inline std::pair<const char *, uint16_t>
 get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {

@@ -38,14 +38,8 @@
  */
 namespace Contest::join {
 
-// Types from Contest:: namespace
 using Contest::ExecuteResult;
-
-// Types from Contest::platform:: namespace
 using Contest::platform::worker_pool;
-
-// Note: Column, ColumnarTable, PAGE_SIZE, PlanNode are defined at global scope
-// and accessible without qualification
 
 /**
  * @brief Build hash table from ColumnarTable input.

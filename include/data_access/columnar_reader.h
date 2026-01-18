@@ -74,7 +74,8 @@ struct alignas(8) PageIndex {
      */
     bool all_dense = true;
 
-    /** @brief Builds page index for a column, computing cumulative row counts.
+    /**
+     * @brief Builds page index for a column, computing cumulative row counts.
      */
     inline void build(const Column &column) {
         uint32_t total = 0;
@@ -161,91 +162,23 @@ class ColumnarReader {
      * sequential access patterns. Thread-local ownership eliminates
      * synchronization overhead.
      */
-    struct alignas(8) Cursor {
-        /**
-         * Cache invalidation mechanism tied to global version counters.
-         * Incremented by prepare_build/prepare_probe to invalidate all
-         * cursors when switching join phases, preventing stale page pointers.
-         */
+    struct alignas(64) Cursor {
         uint64_t version = 0;
-
-        /**
-         * Column index of the cached page. Set to ~0u when uninitialized.
-         * Used to detect column switches that require page reload.
-         */
         size_t cached_col = ~0u;
-
-        /**
-         * Inclusive start of the row range [cached_start, cached_end) covered
-         * by the cached page. Enables O(1) range checks for cursor validity.
-         */
         uint32_t cached_start = 0;
-
-        /**
-         * Exclusive end of the row range [cached_start, cached_end).
-         * Fast-path check: row_id in range implies cached page is valid.
-         */
         uint32_t cached_end = 0;
-
-        /**
-         * Page number currently cached. Set to ~0u when uninitialized.
-         * Used for sequential access optimization: if row_id == cached_end,
-         * directly load next page without binary search.
-         */
         size_t cached_page = ~0u;
 
-        /**
-         * Pointer to the page's value array (int32_t[] for INT32 or string
-         * offsets). Cached to avoid repeated pointer arithmetic from page base
-         * address.
-         */
         const int32_t *data_ptr = nullptr;
-
-        /**
-         * Pointer to the page's bitmap (for sparse pages only).
-         * Each bit indicates whether the corresponding row is non-NULL.
-         * Null for dense pages to avoid unnecessary dereferences.
-         */
         const uint8_t *bitmap_ptr = nullptr;
-
-        /**
-         * Pointer to the prefix sum array (for sparse pages only).
-         * Enables O(1) value index calculation via popcount.
-         * Null for dense pages.
-         */
         const uint32_t *prefix_sum_ptr = nullptr;
 
-        /**
-         * Page index as int32_t for string encoding (page_idx | local_offset).
-         * Stored to avoid repeated casts during string value construction.
-         */
         int32_t page_idx_val = 0;
 
-        /**
-         * True if the cached page is dense (num_rows == num_values).
-         * Dense pages skip bitmap checks, using direct indexing:
-         * data_ptr[local_row].
-         */
         bool is_dense = false;
-
-        /**
-         * True if the cached page is special (num_rows == 0xffff, multi-page
-         * string). Special pages return a constant encoded value without
-         * indexing.
-         */
         bool is_special = false;
-
-        /**
-         * True if all pages in this column are dense (copied from
-         * PageIndex.all_dense). Enables additional fast-path optimizations when
-         * no NULL handling is needed.
-         */
         bool col_all_dense = false;
 
-        /**
-         * Explicit padding for alignment. Ensures struct size is a multiple
-         * of 8 bytes for cache line efficiency. Not used for logic.
-         */
         uint8_t _padding = 0;
     };
 
@@ -530,7 +463,6 @@ class ColumnarReader {
 };
 } // namespace Contest::io
 
-// Bring types into Contest:: namespace for backward compatibility
 namespace Contest {
 using Contest::io::ColumnarReader;
 using Contest::io::global_build_version;

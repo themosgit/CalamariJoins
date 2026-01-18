@@ -2,11 +2,6 @@
  * @file intermediate.h
  * @brief Intermediate result format for multi-way joins.
  *
- * Defines column_t, a compact columnar format for passing results between
- * join stages. Uses larger pages (16KB) than ColumnarTable (8KB) for efficient
- * bulk allocation. Values stored as value_t: INT32 directly, VARCHAR as
- * encoded references to original ColumnarTable pages.
- *
  * **Key difference from ColumnarTable:** Intermediate format avoids copying
  * string data between join stages by encoding VARCHAR as page/offset references
  * into the original base tables. This requires base tables to remain valid

@@ -29,22 +29,11 @@
  */
 namespace Contest::materialize {
 
-// Types from Contest:: namespace
 using Contest::ExecuteResult;
-
-// Types from global scope (data_model/plan.h, foundation/attribute.h)
-// Column, ColumnarTable, DataType, PlanNode are accessible without
-// qualification
-
-// Types from Contest::platform::
-using Contest::platform::worker_pool;
-
-// Types from Contest::io::
 using Contest::io::ColumnarReader;
-
-// Types from Contest::join::
 using Contest::join::JoinInput;
 using Contest::join::MatchCollector;
+using Contest::platform::worker_pool;
 
 /**
  * @brief Batch memory allocator for intermediate result pages.

@@ -267,7 +267,6 @@ struct Table {
                                                                 std::string>) {
                                 return fmt::format("\"{}\"",
                                                    escape_string(arg));
-                                // return fmt::format("{}", arg);
                             }
                         },
                         field);
@@ -349,7 +348,6 @@ class DumpTable {
         std::vector<std::vector<Data>> data;
         std::vector<DataType> types;
 
-        /* Setup metadata */
         tablemeta.num_rows = duckdb_results.RowCount();
         tablemeta.num_cols = duckdb_results.ColumnCount();
         for (size_t i = 0; i < tablemeta.num_cols; ++i) {
@@ -369,7 +367,6 @@ class DumpTable {
             }
         }
 
-        /* Convert duckdb to ColumnarTable */
         auto &coll = duckdb_results.Collection();
         for (auto &row : coll.Rows()) {
             std::vector<Data> record;

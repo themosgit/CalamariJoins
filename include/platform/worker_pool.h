@@ -154,7 +154,6 @@ class WorkerThreadPool {
             if (should_exit)
                 break;
 
-            /* copy task while holding lock, then unlock */
             auto local_task = current_task;
             int current_gen = task_generation;
             lock.unlock();
@@ -222,7 +221,6 @@ class WorkerThreadPool {
         }
         worker_cv.notify_all();
 
-        /* wait for atomic counter to reach 0 */
         std::unique_lock<std::mutex> lock(pool_mutex);
         main_cv.wait(lock, [&] {
             return tasks_remaining.load(std::memory_order_acquire) == 0;
@@ -232,7 +230,6 @@ class WorkerThreadPool {
     constexpr int thread_count() const { return NUM_THREADS; }
 };
 
-/* global instance - instantiated once at program startup */
 inline WorkerThreadPool worker_pool;
 
 } // namespace Contest::platform

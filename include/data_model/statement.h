@@ -98,7 +98,6 @@ struct InnerColumnBase;
  * Represents a boolean expression that can be evaluated against row data.
  * Concrete implementations are Comparison (leaf) and LogicalOperation (node).
  */
-// AST Node
 struct Statement {
     virtual ~Statement() = default;
 
@@ -233,7 +232,6 @@ struct Comparison : Statement {
      * @return True if the string matches the pattern.
      */
     static bool like_match(std::string_view str, const std::string &pattern) {
-        // static cache and mutex
         thread_local auto regex_cache =
             std::unordered_map<std::string, std::unique_ptr<RE2>>{};
 
@@ -243,9 +241,7 @@ struct Comparison : Statement {
             re = it->second.get();
         }
 
-        // cache miss and compile
         if (!re) {
-            // conver to regex
             std::string regex_str;
             for (char c : pattern) {
                 if (c == '%') {
@@ -253,7 +249,6 @@ struct Comparison : Statement {
                 } else if (c == '_') {
                     regex_str += '.';
                 } else {
-                    // escape sepcical characters
                     if (c == '\\' || c == '.' || c == '^' || c == '$' ||
                         c == '|' || c == '?' || c == '*' || c == '+' ||
                         c == '(' || c == ')' || c == '[' || c == ']' ||
@@ -268,14 +263,13 @@ struct Comparison : Statement {
 
             auto new_re = std::make_unique<RE2>(regex_str, options);
             if (!new_re->ok()) {
-                return false; // invalid regex
+                return false;
             }
 
             re = new_re.get();
             regex_cache.emplace(pattern, std::move(new_re));
         }
 
-        // execute full match
         return RE2::FullMatch(str, *re);
     }
 

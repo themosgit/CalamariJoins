@@ -50,11 +50,8 @@
 
 namespace Contest {
 
-// Import join execution types into Contest namespace
 using namespace join;
 
-// Import specific materialization functions (namespace qualified for
-// materialize::materialize to avoid collision with namespace name)
 using materialize::construct_intermediate;
 using materialize::create_empty_result;
 
@@ -144,8 +141,6 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     const auto &left_node = plan.nodes[join.left];
     const auto &right_node = plan.nodes[join.right];
 
-    /* Resolve child inputs: ScanNodes return ColumnarTable*, JoinNodes recurse
-     */
     JoinInput left_input = resolve_join_input(plan, join.left, stats);
     JoinInput right_input = resolve_join_input(plan, join.right, stats);
 
@@ -369,11 +364,8 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     return std::move(std::get<ColumnarTable>(result));
 }
 
-/** @brief Allocate execution context. Currently a no-op; reserved for future
- * use. */
 void *build_context() { return nullptr; }
 
-/** @brief Release execution context. Currently a no-op. */
 void destroy_context(void *context) { (void)context; }
 
 } // namespace Contest

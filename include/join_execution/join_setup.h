@@ -28,14 +28,8 @@
  */
 namespace Contest::join {
 
-// Types from Contest:: namespace
 using Contest::ExecuteResult;
-
-// Types from Contest::io:: namespace
 using Contest::io::ColumnarReader;
-
-// Note: Column, ColumnarTable, DataType, JoinNode, PAGE_SIZE, PlanNode
-// are defined at global scope and accessible without qualification
 
 /**
  * @brief Unified abstraction over columnar tables and intermediate results.

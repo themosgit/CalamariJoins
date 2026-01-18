@@ -19,8 +19,6 @@
  * @see hardware.h for generic x86-64 fallback
  * @see hardware_benchmarkvm.h for contest benchmark VM configuration
  */
-// Hardware information for Apple M1 Mac
-// Darwin 25.0.0 arm64
 #define SPC__AARCH64
 #define SPC__CPU_NAME "Apple M1"
 #define SPC__CORE_COUNT 8
@@ -32,8 +30,7 @@
 #define SPC__KERNEL "Darwin 25.0.0 arm64"
 #define SPC__SUPPORTS_NEON
 
-// l1 and l2 caches from performance cores
-#define SPC__LEVEL1_ICACHE_SIZE 196608 // 128 KB
+#define SPC__LEVEL1_ICACHE_SIZE 196608
 #define SPC__LEVEL1_ICACHE_ASSOC 8
 #define SPC__LEVEL1_ICACHE_LINESIZE 128
 #define SPC__LEVEL1_DCACHE_SIZE 131072 // 64 KB

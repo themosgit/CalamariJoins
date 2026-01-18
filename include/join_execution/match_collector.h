@@ -53,7 +53,6 @@
  */
 namespace Contest::join {
 
-// Types from Contest::platform:: namespace
 using Contest::platform::worker_pool;
 
 /**
