@@ -1,26 +1,13 @@
 /**
  * @file hashtable.h
- * @brief Unchained hash table with bloom filter and radix-partitioned build.
+ * @brief Unchained hash table with bloom filter for parallel equi-joins.
  *
- * Optimized for equi-joins on INT32 keys with parallel build and probe.
- * Keys and row_ids stored in contiguous arrays (not linked lists) for
- * cache-friendly sequential access during probe.
+ * Keys/row_ids in contiguous arrays (not linked). Directory entry: bits 16-63
+ * = end offset, bits 0-15 = bloom tag. Radix-partitioned parallel build sizes
+ * partitions to fit LLC.
  *
- * **Directory entry layout (64 bits):**
- * - Bits 16-63: End offset in keys_/row_ids_ arrays
- * - Bits 0-15: Bloom filter tag (OR of all keys hashing to this slot)
- *
- * **Radix-partitioned parallel build:**
- * 1. Partition phase: Threads hash keys to thread-local partition buffers
- * 2. Scatter phase: Partitions processed in parallel, each thread handles
- *    disjoint partitions. Keys scattered to final positions in arrays.
- *
- * Partition count chosen so each fits in per-core LLC share, ensuring
- * working set stays cache-resident during scatter.
- *
- * @note Join keys are always INT32 (contest invariant).
- * @see hash_join.h for build/probe entry points.
- * @see bloom_tags.h for precomputed filter tags.
+ * @note Join keys are INT32 (contest invariant).
+ * @see hash_join.h, bloom_tags.h
  */
 #pragma once
 #include <algorithm>
@@ -60,31 +47,13 @@ using Contest::join::BLOOM_TAGS;
 using Contest::platform::worker_pool;
 
 /**
- * @brief High-performance hash table for parallel equi-joins.
+ * @brief High-performance unchained hash table for parallel equi-joins.
  *
- * **Unchained design:** Keys and row_ids stored in separate contiguous arrays,
- * not linked lists. Directory entries point to ranges in these arrays,
- * enabling:
- * - Cache-friendly sequential access during probe
- * - SIMD-friendly memory layout
- * - No pointer chasing
+ * Keys/row_ids in contiguous arrays (not linked lists) for cache-friendly
+ * sequential probe. Bloom filter tags enable early rejection. Hardware CRC32
+ * hash with multiplicative mixing.
  *
- * **Why unchained beats chained:** Chained hash tables suffer pointer-chasing
- * stalls (20-30 cycles per cache miss) and unpredictable memory access. This
- * design enables hardware prefetching and 4-8x faster probe due to sequential
- * reads. Build cost is similar (single pass + partition overhead), but probe
- * throughput dominates join performance on large tables.
- *
- * **Bloom filter acceleration:** Precomputed 16-bit tags enable early
- * rejection. If `(directory_entry & probe_tag) != probe_tag`, no matches exist
- * in that slot.
- *
- * **Hash function:** Hardware CRC32 (ARM/x86 intrinsics) with multiplicative
- * mixing for good distribution across directory slots.
- *
- * @note Build is O(n), probe is O(1) average per key.
- * @note Thread-safety: build_*() methods are parallel-safe via lock-free
- *       partitioning. Probe (find_indices) is read-only and lock-free.
+ * @note Build O(n), probe O(1) avg. Thread-safe build via lock-free partitions.
  */
 class UnchainedHashtable {
   public:
@@ -94,15 +63,13 @@ class UnchainedHashtable {
         uint32_t row_id; /**< Row index in source table. */
     };
 
-    /** @brief L2-sized chunk for cache-friendly temporary storage during build.
-     */
+    /** @brief L2-sized chunk for partition buffers. */
     static constexpr size_t CHUNK_SIZE = 4096;
     static constexpr size_t CHUNK_HEADER = 16;
     static constexpr size_t TUPLES_PER_CHUNK =
         (CHUNK_SIZE - CHUNK_HEADER) / sizeof(Tuple);
 
-    /** @brief Linked chunk for partition buffers during radix-partitioned
-     * build. */
+    /** @brief Linked chunk for partition buffers during radix build. */
     struct alignas(8) Chunk {
         Chunk *next;                  /**< Next chunk in partition chain. */
         size_t count;                 /**< Number of tuples in this chunk. */
@@ -125,8 +92,6 @@ class UnchainedHashtable {
 
     /**
      * @brief Partition of directory entries for lock-free parallel build.
-     *
-     * Contains a linked list of chunks, designed to fit in LLC.
      */
     struct alignas(8) Partition {
         Chunk *head = nullptr;
@@ -159,15 +124,8 @@ class UnchainedHashtable {
 
     /**
      * @brief CRC32-based hash with multiplicative mixing.
-     *
-     * CRC32 chosen over MurmurHash3 or xxHash because it's hardware-accelerated
-     * on both ARM (via __crc32w) and x86 (via _mm_crc32_u32), providing
-     * single-cycle latency. Multiplicative constant 0x8648DBDB provides
-     * avalanche effect, spreading bits across the full 64-bit range for
-     * uniform slot distribution.
-     *
-     * @param key INT32 join key to hash.
-     * @return 64-bit hash value (upper bits index directory slot).
+     * @param key INT32 join key.
+     * @return 64-bit hash (upper bits index directory slot).
      */
     static uint64_t hash_key(int32_t key) noexcept {
         constexpr uint64_t k = 0x8648DBDB;
@@ -180,15 +138,8 @@ class UnchainedHashtable {
     }
 
     /**
-     * @brief Returns precomputed bloom filter tag from hash.
-     *
-     * Uses upper 11 bits of hash (2048 entries) to index into BLOOM_TAGS.
-     * Precomputed tags avoid runtime bit manipulation during probe, trading
-     * 4KB of L1-resident data for faster membership tests.
-     *
-     * @param h 64-bit hash from hash_key().
-     * @return 16-bit bloom tag (OR'd into directory entry during build).
-     * @see bloom_tags.h for tag generation and false positive analysis.
+     * @brief Returns bloom tag from hash. Uses bits 32-42 to index BLOOM_TAGS.
+     * @see bloom_tags.h
      */
     static uint16_t bloom_tag(uint64_t h) noexcept {
         return BLOOM_TAGS[(h >> 32) & 0x7FF];
@@ -197,20 +148,9 @@ class UnchainedHashtable {
     size_t slot_for(uint64_t h) const noexcept { return h >> (64 - shift); }
 
     /**
-     * @brief Computes partition count to fit each partition in per-core LLC.
+     * @brief Computes partition count to fit each in per-core LLC share.
      *
-     * Sizes partitions so each thread's working set fits in its LLC share
-     * (typically L3 on Intel, L2 on Apple Silicon). Targets 50% of per-core
-     * LLC to leave headroom for directory access and other data. Power-of-2
-     * sizing enables fast modulo via bit shift (h >> (64 - log2(partitions))).
-     *
-     * Cache residency during scatter phase is critical because each partition
-     * is processed independently - keeping it L3-resident avoids DRAM stalls
-     * and maintains ~4-5 cycles/key throughput.
-     *
-     * @param tuple_count Total number of tuples to partition.
-     * @param num_threads Thread count (ensures >= 1 partition per thread).
-     * @return Power-of-2 partition count, capped at directory size.
+     * Targets 50% of per-core LLC. Power-of-2 for fast modulo via bit shift.
      */
     size_t compute_num_partitions(size_t tuple_count, int num_threads) const {
         size_t per_core_cache = LAST_LEVEL_CACHE / worker_pool.thread_count();
@@ -232,25 +172,8 @@ class UnchainedHashtable {
     /**
      * @brief Merges and scatters a single partition from thread-local buffers.
      *
-     * Three-phase scatter algorithm:
-     * 1. Count phase: Histogram keys per slot within partition (merges all
-     *    thread chunks for this partition).
-     * 2. Prefix sum: Compute final write offsets for each slot (ensures
-     *    contiguous key placement).
-     * 3. Scatter phase: Write keys/row_ids to final positions and OR bloom
-     *    tags into directory.
-     *
-     * Partition-local processing enables lock-free parallelism - each thread
-     * handles disjoint partitions, avoiding atomic ops or barriers during
-     * scatter. This is faster than global scatter with locking or atomic CAS.
-     *
-     * @param thread_parts Per-thread partition buffers (thread_parts[t][p]).
-     * @param p Partition index to build.
-     * @param slots_per_partition Number of directory slots in this partition.
-     * @param base_offset Global write offset for this partition's first key.
-     * @param partition_size Total tuples in this partition (across all
-     * threads).
-     * @param num_threads Total thread count (for merging thread-local data).
+     * Count phase → prefix sum → scatter keys/row_ids and OR bloom tags.
+     * Lock-free: each thread handles disjoint partitions.
      */
     void
     build_partition(const std::vector<std::vector<Partition>> &thread_parts,
@@ -308,8 +231,7 @@ class UnchainedHashtable {
     /**
      * @brief Construct hash table sized for expected build-side row count.
      *
-     * Directory size is rounded up to power of 2 for fast modulo via bit shift.
-     * Minimum size is 2048 slots.
+     * Directory size rounded to power of 2 (min 2048) for fast modulo.
      */
     explicit UnchainedHashtable(size_t build_size) {
         size_t pow2 = 2048;
@@ -332,13 +254,9 @@ class UnchainedHashtable {
     const uint32_t *row_ids() const noexcept { return row_ids_.data(); }
 
     /**
-     * @brief Find index range for keys matching the probe key.
+     * @brief Find index range for keys matching probe key.
      *
-     * Returns [start, end) indices into keys_/row_ids_ arrays where
-     * potential matches exist. Caller must verify actual key equality.
-     *
-     * @param key Probe key to search for.
-     * @return Pair of (start, end) indices; (0,0) if bloom filter rejects.
+     * @return [start, end) into keys_/row_ids_; (0,0) if bloom rejects.
      */
     std::pair<uint64_t, uint64_t> find_indices(int32_t key) const noexcept {
         if (keys_.empty())
@@ -360,14 +278,11 @@ class UnchainedHashtable {
     /**
      * @brief Build hash table from intermediate column_t.
      *
-     * Uses radix-partitioned parallel build when row count exceeds threshold.
-     * Thread-local partition buffers avoid contention during partitioning,
-     * then partitions are scattered in parallel to final positions.
+     * Radix-partitioned parallel build when row count > 10K threshold.
+     * Thread-local partition buffers avoid contention.
      *
-     * @param column Intermediate column containing INT32 join keys. Values
-     *               accessed via column[i].value; row_ids are implicit indices.
-     * @param num_threads Thread count hint (clamped to worker_pool size).
-     *                    Falls back to single-threaded below threshold.
+     * @param column Intermediate column with INT32 join keys.
+     * @param num_threads Thread count hint.
      */
     void build_intermediate(const mema::column_t &column, int num_threads = 4) {
         const size_t row_count = column.row_count();
@@ -375,12 +290,7 @@ class UnchainedHashtable {
             return;
 
         /**
-         * @brief Threshold for enabling parallel build.
-         *
-         * Below 10K rows, partitioning overhead (chunk allocation, prefix sums)
-         * exceeds benefits of parallelism. Single-threaded build is faster due
-         * to simpler code path and avoiding thread spawn costs. Measured on
-         * 8-core M1 Pro: breakeven at ~8-10K rows, chosen conservatively.
+         * @brief Below 10K rows, single-threaded build is faster.
          */
         static constexpr size_t PARALLEL_BUILD_THRESHOLD = 10000;
         num_threads = worker_pool.thread_count();
@@ -445,15 +355,12 @@ class UnchainedHashtable {
     /**
      * @brief Build hash table from ColumnarTable Column.
      *
-     * Handles both dense pages (no NULLs) and sparse pages (with bitmap).
-     * Uses same radix-partitioned parallel strategy as build_intermediate().
+     * Handles dense (no NULLs) and sparse (with bitmap) pages.
+     * Same radix-partitioned parallel strategy as build_intermediate().
      *
-     * @param column ColumnarTable column with paged INT32 data. Each page
-     *               header contains (n_rows, n_vals) and optional NULL bitmap
-     *               at end. Dense pages (n_rows == n_vals) use direct indexing;
-     *               sparse pages require bitmap decoding.
-     * @param num_threads Thread count hint; clamped to worker_pool size.
-     *                    Falls back to single-threaded if <16 pages.
+     * @param column Paged INT32 column. Page header: (n_rows, n_vals).
+     * @param num_threads Thread count hint; falls back to single-threaded <16
+     * pages.
      */
     void build_columnar(const Column &column, int num_threads = 4) {
         if (column.pages.empty())

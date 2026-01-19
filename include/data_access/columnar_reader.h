@@ -1,21 +1,9 @@
 /**
  * @file columnar_reader.h
- * @brief High-performance random access reader for columnar storage.
+ * @brief Columnar random access: O(log P) PageIndex + O(1) cursor caching.
  *
- * Provides O(log P) page lookup via PageIndex with O(1) amortized access
- * through per-thread Cursor caching. Handles both dense (no NULLs) and
- * sparse (with bitmap) pages, plus multi-page long strings.
- *
- * **Access pattern optimizations:**
- * - Sequential access: cursor caching avoids binary search
- * - Random access: PageIndex provides efficient page lookup
- * - Sparse pages: prefix sums enable O(1) popcount-based value index
- *
- * **Versioning:** Global version counters invalidate cursors when
- * prepare_build/prepare_probe is called for a new join phase.
- *
- * @see PageIndex for cumulative row count index.
- * @see Cursor for thread-local access state.
+ * Dense/sparse pages, long strings. Version counters invalidate cursors on
+ * prepare_build/probe. @see PageIndex, Cursor
  */
 #pragma once
 
@@ -35,14 +23,8 @@
 
 /**
  * @namespace Contest::io
- * @brief Columnar I/O access layer for Contest execution engine.
- *
- * Contains columnar storage access components:
- * - **Columnar Access**: ColumnarReader with cursor caching
- * - **Page Indexing**: PageIndex for O(log P) row lookup
- *
- * @see Plan for query plan structure.
- * @see mema namespace for intermediate result format.
+ * @brief Columnar I/O: ColumnarReader (cursor caching) + PageIndex (O(log P) lookup).
+ * @see Plan, mema
  */
 namespace Contest::io {
 
@@ -51,27 +33,14 @@ inline std::atomic<uint64_t> global_probe_version{0};
 
 /** @brief Pre-computed page index for O(log P) row lookup in ColumnarTable. */
 struct alignas(8) PageIndex {
-    /**
-     * Cumulative row counts per page, enabling O(log P) binary search.
-     * Element i contains total rows from pages [0..i], so upper_bound(row_id)
-     * yields the containing page. This avoids linear scanning for row lookup.
-     */
+    /** Cumulative row counts: upper_bound(row_id) yields containing page. */
     std::vector<uint32_t> cumulative_rows;
 
-    /**
-     * Per-page prefix sums of bitmap popcount for sparse pages.
-     * Each inner vector has one entry per 64-bit bitmap chunk, storing
-     * the cumulative count of set bits before that chunk. This enables O(1)
-     * value index calculation: prefix_sum[chunk] + popcount(word & mask).
-     * Empty for dense pages where no indirection is needed.
-     */
+    /** Per-page prefix sums of bitmap popcount for sparse pages.
+     * O(1) value index: prefix_sum[chunk] + popcount(word & mask). Empty for dense. */
     std::vector<std::vector<uint32_t>> page_prefix_sums;
 
-    /**
-     * Optimization flag: true if all pages are dense (no NULLs).
-     * When true, bitmap checks can be skipped entirely, enabling the
-     * fastest path. Set to false if any page is sparse or special.
-     */
+    /** All pages dense (no NULLs) → skip bitmap checks. */
     bool all_dense = true;
 
     /**
@@ -145,23 +114,12 @@ struct alignas(8) PageIndex {
     }
 };
 
-/**
- * @brief High-performance random access reader for columnar data.
- *
- * Uses page indices for O(log P) lookup and per-thread cursor caching
- * for O(1) sequential access. Maintains separate indices for build/probe.
- */
+/** @brief Random access reader: O(log P) page lookup + O(1) cursor caching. Separate build/probe indices. */
 class ColumnarReader {
   public:
     ColumnarReader() = default;
 
-    /**
-     * @brief Per-thread cursor for spatial locality (cache-aligned).
-     *
-     * Caches page metadata to avoid repeated binary searches during
-     * sequential access patterns. Thread-local ownership eliminates
-     * synchronization overhead.
-     */
+    /** @brief Cache-aligned cursor: caches page metadata for O(1) sequential access. Thread-local. */
     struct alignas(64) Cursor {
         uint64_t version = 0;
         size_t cached_col = ~0u;
@@ -182,18 +140,7 @@ class ColumnarReader {
         uint8_t _padding = 0;
     };
 
-    /**
-     * @brief Builds page indices for build-side columns and invalidates
-     * cursors.
-     *
-     * Constructs cumulative row counts and prefix sums for all columns.
-     * Increments global_build_version to invalidate all existing build cursors,
-     * preventing them from using stale page pointers after a new join phase.
-     * Must be called before read_value() is used for build-side access.
-     *
-     * @param columns Build-side columns to index. Null columns create empty
-     * indices.
-     */
+    /** @brief Build page indices for build-side columns. Increments global_build_version to invalidate cursors. */
     inline void prepare_build(const std::vector<const Column *> &columns) {
         build_page_indices.clear();
         build_page_indices.reserve(columns.size());
@@ -209,18 +156,7 @@ class ColumnarReader {
         global_build_version.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /**
-     * @brief Builds page indices for probe-side columns and invalidates
-     * cursors.
-     *
-     * Constructs cumulative row counts and prefix sums for all columns.
-     * Increments global_probe_version to invalidate all existing probe cursors,
-     * ensuring cursors cannot access freed or reallocated page memory.
-     * Must be called before read_value() is used for probe-side access.
-     *
-     * @param columns Probe-side columns to index. Null columns create empty
-     * indices.
-     */
+    /** @brief Build page indices for probe-side columns. Increments global_probe_version to invalidate cursors. */
     inline void prepare_probe(const std::vector<const Column *> &columns) {
         probe_page_indices.clear();
         probe_page_indices.reserve(columns.size());
@@ -291,17 +227,7 @@ class ColumnarReader {
                                         cursor, current_version);
     }
 
-    /**
-     * @brief Loads page metadata into cursor cache to enable fast-path access.
-     *
-     * Caches page boundaries, pointers, and flags so subsequent reads within
-     * the same page bypass binary search. For sparse pages, caches bitmap and
-     * prefix sum pointers to enable O(1) value index calculation via popcount.
-     *
-     * **Why cache this:** Page metadata access involves pointer chasing and
-     * branches. Caching amortizes this cost across all reads within a page,
-     * critical for sequential access patterns (e.g., full table scans).
-     */
+    /** @brief Load page metadata into cursor. Caches bounds, pointers, flags for fast-path access. */
     template <bool IsBuild>
     inline void
     load_page_into_cursor(const Column &column, const PageIndex &page_index,
@@ -332,18 +258,7 @@ class ColumnarReader {
         }
     }
 
-    /**
-     * @brief O(1) sequential access optimization: load page directly without
-     * search.
-     *
-     * Called when row_id == cursor.cached_end, indicating sequential access to
-     * the next page. Skips binary search since page_num is known (cached_page +
-     * 1). Critical for sequential scans where binary search overhead would
-     * dominate.
-     *
-     * **Performance:** O(1) page load vs. O(log P) binary search in
-     * read_value_slow.
-     */
+    /** @brief O(1) sequential optimization: load next page directly when row_id == cursor.cached_end. */
     template <bool IsBuild>
     inline mema::value_t
     read_value_load_page(const Column &column, size_t col_idx, uint32_t row_id,
@@ -356,20 +271,7 @@ class ColumnarReader {
                                             cursor);
     }
 
-    /**
-     * @brief Slow path: O(log P) binary search to find page, then load and
-     * read.
-     *
-     * Called when cursor is invalid (wrong column, version mismatch, or row_id
-     * out of cached range). Performs binary search on cumulative_rows to locate
-     * the containing page, then loads it into the cursor for subsequent fast
-     * access.
-     *
-     * **Why slow:** Binary search adds O(log P) overhead. Fast path (cursor
-     * hit) avoids this by checking cached range first. Random access patterns
-     * pay this cost on every read; sequential patterns amortize it across page
-     * boundaries.
-     */
+    /** @brief Slow path: O(log P) binary search on cursor miss, then load page into cursor. */
     template <bool IsBuild>
     inline mema::value_t read_value_slow(const Column &column, size_t col_idx,
                                          uint32_t row_id, DataType data_type,
@@ -385,34 +287,7 @@ class ColumnarReader {
                                             cursor);
     }
 
-    /**
-     * @brief Reads a single value with cursor caching for efficient access.
-     *
-     * **Fast path (cursor hit):** O(1) amortized for sequential access within
-     * the same page. Checks cached range, then directly indexes or uses
-     * popcount for sparse pages.
-     *
-     * **Slow path (cursor miss):** O(log P) binary search to find page, then
-     * loads page metadata into cursor. Subsequent reads within the same page
-     * hit the fast path.
-     *
-     * **Sequential optimization:** When row_id == cursor.cached_end, skips
-     * binary search and loads next page directly (O(1)).
-     *
-     * **Performance characteristics:**
-     * - Sequential access: O(1) amortized via cursor caching
-     * - Random access: O(log P) per read due to binary search
-     * - Sparse pages: O(1) value lookup via prefix sums + popcount
-     *
-     * @param column Column to read from (must match prepare_build/probe).
-     * @param col_idx Column index in page indices array.
-     * @param row_id Global row ID to read.
-     * @param data_type INT32 or STRING, determines value encoding.
-     * @param cursor Thread-local cursor for caching page state.
-     * @param from_build True for build side, false for probe side (selects
-     * version counter).
-     * @return Encoded value (int32_t or string page_idx|offset), or NULL_VALUE.
-     */
+    /** @brief Read value: O(1) cursor hit, O(log P) miss. Sequential → O(1) amortized, sparse → popcount. */
     inline mema::value_t read_value(const Column &column, size_t col_idx,
                                     uint32_t row_id, DataType data_type,
                                     Cursor &cursor, bool from_build) const {

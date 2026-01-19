@@ -20,19 +20,7 @@
 #include <sys/mman.h>
 #include <vector>
 
-/**
- * @namespace Contest::materialize
- * @brief Materialization of join results into columnar format.
- *
- * Key components in this file:
- * - materialize_column<>(): Parallel page construction with mmap'd memory pool
- * - materialize_single_column(): Dispatcher selecting builder type and source
- * - materialize(): Full ColumnarTable construction from join matches
- * - create_empty_result(): Zero-match fast path
- *
- * @see page_builders.h for Int32PageBuilder/VarcharPageBuilder
- * @see construct_intermediate.h for non-root join materialization
- */
+/** @namespace Contest::materialize @brief Join result materialization. */
 namespace Contest::materialize {
 
 using Contest::ExecuteResult;
@@ -45,36 +33,15 @@ using Contest::platform::worker_pool;
 /**
  * @brief Parallel materialization of a single output column from match results.
  *
- * Divides matches across worker threads, each building pages independently
- * using preallocated mmap'd memory. Thread-local Column objects collect pages,
- * then merge into dest_col. Uses BuilderType (Int32PageBuilder or
- * VarcharPageBuilder) for type-specific page construction.
+ * Divides matches across threads, each building pages from preallocated mmap'd
+ * memory. Uses BuilderType (Int32PageBuilder/VarcharPageBuilder) for
+ * type-specific page construction.
  *
- * **Why parallel construction:** Large join results (millions of rows) benefit
- * from dividing work across cores. Each thread processes a contiguous slice of
- * matches using range-based assignment (start = t*N/T, end = (t+1)*N/T) to
- * minimize cache conflicts.
- *
- * **Memory management:** Preallocates mmap'd memory pool for all threads to
- * avoid allocation contention. Each thread consumes pages from its private
- * slice; if exhausted, falls back to heap allocation (rare for properly sized
- * est_bytes_per_row).
- *
- * @tparam BuilderType     Page builder type
- * (Int32PageBuilder/VarcharPageBuilder).
+ * @tparam BuilderType     Int32PageBuilder or VarcharPageBuilder.
  * @tparam ReaderFunc      Callable: (row_id, cursor) -> value_t.
  * @tparam InitBuilderFunc Callable: (page_allocator) -> BuilderType.
- * @param dest_col         Output column receiving materialized pages.
- * @param collector        Source of (build_id, probe_id) match pairs.
- * @param read_value       Function to read source value by row ID.
- * @param init_builder     Factory creating builder with page allocator.
- * @param from_build       True if reading from build side, false for probe.
- * @param est_bytes_per_row Estimated average bytes per row including overhead
- * (4 for INT32, ~35 for VARCHAR). Used to calculate mmap pool size:
- * rows_per_page = PAGE_SIZE / est_bytes_per_row determines pages_per_thread.
- * **Too small** triggers fallback heap allocations (performance penalty);
- * **too large** wastes mmap'd memory. VARCHAR estimate should account for
- * average string length + null bitmap + offset array overhead.
+ * @param est_bytes_per_row Average bytes per row (4 for INT32, ~35 for
+ * VARCHAR).
  */
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
 inline void
@@ -182,37 +149,9 @@ materialize_column(Column &dest_col, const MatchCollector &collector,
 /**
  * @brief Materializes a single output column from join matches.
  *
- * **Purpose:** Dispatcher that determines source location, selects the correct
- * page builder type, and invokes materialize_column<> with appropriate readers.
- *
- * **Source resolution:** Column may originate from:
- * - Build side columnar table (base table leaf)
- * - Probe side columnar table (base table leaf)
- * - Build side intermediate result (ExecuteResult from previous join)
- * - Probe side intermediate result (ExecuteResult from previous join)
- *
- * **Page builder integration:** Creates builder factory (init_builder lambda)
- * that initializes Int32PageBuilder or VarcharPageBuilder with page allocator.
- * The builder accumulates values via add() calls, automatically flushing full
- * pages. See page_builders.h for builder implementations.
- *
- * **VARCHAR handling:** VarcharPageBuilder requires source Column pointer to
- * dereference value_t references (page_idx/offset_idx pairs) into actual string
- * bytes. For intermediate sources, resolves via Plan::inputs using
- * source_table/source_column metadata.
- *
- * @param dest_col         Output Column to populate with materialized pages.
- * @param col_idx          Global output column index (build columns first, then
- * probe).
- * @param build_size       Number of columns from build side (partition point).
- * @param collector        Match pairs from join execution.
- * @param build_input      Build side data (ColumnarTable or ExecuteResult).
- * @param probe_input      Probe side data (ColumnarTable or ExecuteResult).
- * @param build_node       PlanNode for build side output_attrs mapping.
- * @param probe_node       PlanNode for probe side output_attrs mapping.
- * @param columnar_reader  PageIndex-based reader for efficient page access.
- * @param plan             Full query plan, used to resolve base table metadata
- * for VARCHAR dereferencing when source is intermediate.
+ * Dispatcher that determines source location (columnar/intermediate,
+ * build/probe), selects page builder type, and invokes materialize_column<>.
+ * VARCHAR handling requires source Column pointer for string dereferencing.
  */
 inline void materialize_single_column(
     Column &dest_col, size_t col_idx, size_t build_size,
@@ -280,54 +219,23 @@ inline void materialize_single_column(
 /**
  * @brief Materializes all output columns into a new ColumnarTable.
  *
- * **Why ColumnarTable:** The contest API requires final query results in
- * ColumnarTable format - a page-based columnar layout with actual string data
- * copied into output pages. This differs from intermediate results
- * (ExecuteResult/column_t) which use compact value_t references.
+ * Dereferences VARCHAR value_t references into actual string bytes. Differs
+ * from construct_intermediate: outputs ColumnarTable (8KB pages) with copied
+ * strings vs ExecuteResult (16KB pages, value_t references).
  *
- * **Key operation:** Dereferences VARCHAR value_t references (page_idx,
- * offset_idx pairs) into actual string bytes. Intermediate results from
- * multi-way joins store pointers back to original base table pages; this
- * function copies the referenced strings into self-contained output pages.
+ * @param collector        Match collection from join execution.
+ * @param build_input      Build side data source.
+ * @param probe_input      Probe side data source.
+ * @param remapped_attrs   Output projection: (col_idx, DataType) pairs.
+ * @param build_node       Metadata for build side output_attrs mapping.
+ * @param probe_node       Metadata for probe side output_attrs mapping.
+ * @param build_size       Number of columns from build side.
+ * @param columnar_reader  PageIndex-accelerated reader for Column page access.
+ * @param plan             Full query plan for VARCHAR dereferencing.
+ * @return ColumnarTable with self-contained page data.
  *
- * **Difference from construct_intermediate:**
- * - **Output format:** ColumnarTable (8KB pages) vs ExecuteResult (16KB pages,
- * value_t)
- * - **VARCHAR handling:** Copies string bytes vs preserves references
- * - **Use case:** Final query result vs intermediate join stage
- * - **Builder type:** Int32PageBuilder/VarcharPageBuilder (materialization) vs
- * direct column_t writes (intermediate)
- *
- * **Parallelization:** Each column is materialized sequentially, but within
- * each column, rows are divided across threads via materialize_column<>.
- *
- * @param collector        Match collection from join execution, provides
- * (build_id, probe_id) pairs.
- * @param build_input      Build side data source - either ColumnarTable (base
- * table) or ExecuteResult (previous join output).
- * @param probe_input      Probe side data source - either ColumnarTable or
- * ExecuteResult.
- * @param remapped_attrs   Output projection specification: list of (col_idx,
- * DataType) pairs. col_idx < build_size indicates build column, otherwise probe
- * column. Defines output schema and column ordering.
- * @param build_node       Metadata for build side: output_attrs maps local
- * column indices to source table columns and types.
- * @param probe_node       Metadata for probe side: output_attrs for probe
- * columns.
- * @param build_size       Number of columns from build side (split point in
- * remapped_attrs).
- * @param columnar_reader  PageIndex-accelerated reader for Column page access,
- * avoids linear page scans.
- * @param plan             Full query plan, needed to resolve base table Column
- * pointers for VARCHAR dereferencing from intermediate results
- * (inter_source->source_table/source_column).
- *
- * @return ColumnarTable with self-contained page data. Empty table (num_rows=0)
- * with correct column types if no matches.
- *
- * @see construct_intermediate.h for creating intermediate ExecuteResult format.
- * @see page_builders.h for Int32PageBuilder and VarcharPageBuilder
- * implementations.
+ * @see construct_intermediate.h for creating intermediate ExecuteResult.
+ * @see page_builders.h for Int32PageBuilder and VarcharPageBuilder.
  */
 inline ColumnarTable
 materialize(const MatchCollector &collector, const JoinInput &build_input,

@@ -1,25 +1,9 @@
 /**
  * @file table.h
- * @brief Row-oriented table representation and format conversion utilities.
+ * @brief Row-oriented Table and format conversions.
  *
- * Provides the Table class for row-major storage of query results, plus
- * conversion utilities between row-oriented and columnar formats. Also
- * includes DumpTable for serializing tables to binary cache files.
- *
- * ### Table Formats
- * - **Table**: Row-oriented storage using std::vector<std::vector<Data>>,
- *   suitable for final result output and small intermediate results.
- * - **ColumnarTable**: Column-oriented storage with 8KB pages, optimized
- *   for scanning and cache-based persistence.
- *
- * ### Binary Cache Format
- * The binary cache format (used by DumpTable and from_cache) stores tables
- * as:
- * 1. TableMeta header (padded to PAGE_SIZE)
- * 2. Column pages concatenated in column-major order
- *
- * @see ColumnarTable for the column-oriented representation
- * @see CSVParser for parsing CSV input files
+ * Table: row-major vector<vector<Data>>. DumpTable: binary cache (TableMeta +
+ * pages). @see ColumnarTable, CSVParser
  */
 
 #pragma once
@@ -36,33 +20,14 @@
 #include <duckdb.hpp>
 #endif
 
-/**
- * @namespace FNVHash
- * @brief FNV-1a hash function implementation.
- *
- * Provides a fast, non-cryptographic hash function suitable for hash tables.
- * FNV-1a (Fowler-Noll-Vo) is a simple XOR-then-multiply hash with good
- * distribution properties.
- *
- * @note For join hash tables, see Contest::FNVHash in hashtable.h which
- *       provides typed overloads for Data values.
- */
+/** @namespace FNVHash @brief FNV-1a hash: XOR-then-multiply. @see Contest::FNVHash in hashtable.h for typed overloads. */
 namespace FNVHash {
 /// FNV-1a prime multiplier for 64-bit hashes.
 constexpr uint64_t FNV_prime = 1099511628211u;
 /// FNV-1a initial hash value (offset basis).
 constexpr uint64_t offset_basis = 14695981039346656037u;
 
-/**
- * @brief Compute FNV-1a hash of arbitrary byte sequence.
- *
- * @param key Pointer to data to hash.
- * @param len Number of bytes to hash.
- * @return 64-bit FNV-1a hash value.
- *
- * @note This is the byte-oriented version; for structured data,
- *       consider type-specific hash functions.
- */
+/** @brief Compute FNV-1a hash of byte sequence. */
 inline uint64_t hash(const void *key, size_t len) {
     uint64_t h = offset_basis;
     const unsigned char *p = static_cast<const unsigned char *>(key);
@@ -74,13 +39,7 @@ inline uint64_t hash(const void *key, size_t len) {
 }
 }; // namespace FNVHash
 
-/**
- * @struct TableMeta
- * @brief Metadata header for binary table cache files.
- *
- * Stored at the beginning of cache files (padded to PAGE_SIZE) to allow
- * quick table reconstruction without parsing CSV. Supports up to 16 columns.
- */
+/** @struct TableMeta @brief Binary cache header (padded to PAGE_SIZE). Max 16 columns. */
 struct TableMeta {
     uint64_t num_rows;      ///< Total number of rows in the table.
     uint64_t num_cols;      ///< Number of columns (max 16).
@@ -93,92 +52,29 @@ struct TableMeta {
 
 /**
  * @class Table
- * @brief Row-oriented table for result output and format conversion.
- *
- * Stores table data in row-major order using nested vectors. While less
- * cache-efficient than ColumnarTable for scans, this format is convenient
- * for:
- * - Final query result output (row-by-row printing)
- * - Small intermediate results
- * - Converting between row and columnar formats
- *
- * ### Data Storage
- * Each row is a vector<Data>, where Data is a variant that can hold:
- * - std::monostate (NULL)
- * - int32_t (INT32)
- * - int64_t (INT64)
- * - double (DOUBLE)
- * - std::string (VARCHAR)
- *
- * @see ColumnarTable for the column-oriented storage format
- * @see DumpTable for serializing to binary cache files
+ * @brief Row-oriented table: vector<vector<Data>>. For result output and format conversion.
+ * @see ColumnarTable, DumpTable
  */
 struct Table {
   public:
     Table() = default;
 
-    /**
-     * @brief Construct table from row data and column types.
-     *
-     * @param data Row-major data: data[row][col] is the value at (row, col).
-     * @param types Column types in order.
-     */
+    /** @brief Construct from row-major data and column types. */
     Table(std::vector<std::vector<Data>> data, std::vector<DataType> types)
         : types_(types), data_(data) {}
 
-    /**
-     * @brief Load a ColumnarTable from a binary cache file.
-     *
-     * Reads the TableMeta header and column pages from a file previously
-     * written by DumpTable::dump().
-     *
-     * @param path Path to the binary cache file.
-     * @return ColumnarTable reconstructed from the cache.
-     *
-     * @see DumpTable::dump() for the cache file format
-     */
+    /** @brief Load ColumnarTable from binary cache. @see DumpTable::dump() */
     static ColumnarTable from_cache(const std::filesystem::path &path);
 
-    /**
-     * @brief Parse a CSV file into a ColumnarTable with optional filtering.
-     *
-     * Uses CSVParser to stream through the file, applying the filter
-     * predicate to each row and converting matching rows to columnar
-     * format.
-     *
-     * @param attributes Schema defining column names and types.
-     * @param path       Path to the CSV file.
-     * @param filter     Optional filter predicate (nullptr to load all rows).
-     * @param header     If true, skip the first line as a header row.
-     * @return ColumnarTable containing filtered data.
-     *
-     * @see CSVParser for details on supported CSV formats
-     */
+    /** @brief Parse CSV to ColumnarTable with optional filter. @see CSVParser */
     static ColumnarTable from_csv(const std::vector<Attribute> &attributes,
                                   const std::filesystem::path &path,
                                   Statement *filter, bool header = false);
 
-    /**
-     * @brief Convert a ColumnarTable to row-oriented Table.
-     *
-     * Scans all columns and assembles rows for output. Used when the
-     * final result needs row-by-row access.
-     *
-     * @param input The columnar table to convert.
-     * @return Row-oriented Table with the same data.
-     */
+    /** @brief Convert ColumnarTable to row-oriented Table. */
     static Table from_columnar(const ColumnarTable &input);
 
-    /**
-     * @brief Extract selected columns from a ColumnarTable as row data.
-     *
-     * Performs a column projection during the scan, useful for
-     * materializing only needed attributes.
-     *
-     * @param table       Source columnar table.
-     * @param output_attrs List of (column_index, type) pairs to extract.
-     * @return Row-major data for the selected columns.
-     */
+    /** @brief Extract selected columns as row data (projection during scan). */
     static std::vector<std::vector<Data>>
     copy_scan(const ColumnarTable &table,
               const std::vector<std::tuple<size_t, DataType>> &output_attrs);
@@ -209,15 +105,7 @@ struct Table {
 
     /// @}
 
-    /**
-     * @brief Print row data to stdout in pipe-delimited format.
-     *
-     * Formats each row with fields separated by '|', properly escaping
-     * special characters in VARCHAR fields. NULL values print as "NULL",
-     * strings are double-quoted.
-     *
-     * @param data Row-major data to print.
-     */
+    /** @brief Print pipe-delimited rows. NULL → "NULL", strings quoted, escapes handled. */
     static void print(const std::vector<std::vector<Data>> &data) {
         namespace views = ranges::views;
 
@@ -280,10 +168,7 @@ struct Table {
     std::vector<DataType> types_;         ///< Column types in order.
     std::vector<std::vector<Data>> data_; ///< Row-major table data.
 
-    /**
-     * @brief Set column types from attribute list.
-     * @param attributes Schema attributes to extract types from.
-     */
+    /** @brief Set column types from attribute list. */
     void set_attributes(const std::vector<Attribute> &attributes) {
         this->types_.clear();
         for (auto &attr : attributes) {
@@ -294,20 +179,8 @@ struct Table {
 
 /**
  * @class DumpTable
- * @brief Serializes tables to binary cache format for fast reloading.
- *
- * Converts ColumnarTable (or DuckDB query results) to a binary format that
- * can be quickly memory-mapped and reconstructed. This avoids CSV parsing
- * overhead for frequently-accessed tables.
- *
- * ### Cache File Format
- * 1. TableMeta header (sizeof(TableMeta) bytes)
- * 2. Zero padding to PAGE_SIZE boundary
- * 3. Column 0 pages (num_pages[0] * PAGE_SIZE bytes)
- * 4. Column 1 pages (num_pages[1] * PAGE_SIZE bytes)
- * 5. ... and so on for each column
- *
- * @see Table::from_cache() to load cached tables
+ * @brief Serialize tables to binary cache. Format: TableMeta + padding + column pages.
+ * @see Table::from_cache()
  */
 class DumpTable {
   private:
@@ -315,14 +188,7 @@ class DumpTable {
     ColumnarTable *table;      ///< Table to serialize (owned externally).
 
   public:
-    /**
-     * @brief Construct serializer from a ColumnarTable.
-     *
-     * Extracts metadata from the table for the cache header. The table
-     * pointer must remain valid until dump() is called.
-     *
-     * @param table Pointer to the table to serialize.
-     */
+    /** @brief Construct from ColumnarTable. Table must remain valid until dump(). */
     DumpTable(ColumnarTable *table) : table(table) {
         tablemeta.num_rows = table->num_rows;
         tablemeta.num_cols = table->columns.size();
@@ -332,18 +198,7 @@ class DumpTable {
         }
     }
 #ifdef TEAMOPT_USE_DUCKDB
-    /**
-     * @brief Construct serializer from DuckDB query results.
-     *
-     * Converts DuckDB's MaterializedQueryResult to ColumnarTable format,
-     * sorting rows for deterministic output. Supports INT32 and VARCHAR
-     * column types.
-     *
-     * @param duckdb_results Query results to convert and serialize.
-     * @throws std::runtime_error If unsupported column types are encountered.
-     *
-     * @note Only available when compiled with TEAMOPT_USE_DUCKDB.
-     */
+    /** @brief Construct from DuckDB results. Sorts rows. INT32/VARCHAR only. Requires TEAMOPT_USE_DUCKDB. */
     DumpTable(duckdb::MaterializedQueryResult &duckdb_results) {
         std::vector<std::vector<Data>> data;
         std::vector<DataType> types;
@@ -401,14 +256,7 @@ class DumpTable {
     }
 #endif
 
-    /**
-     * @brief Write the table to a binary stream.
-     *
-     * Outputs the cache format: metadata header, padding, then all column
-     * pages in order. The stream should be opened in binary mode.
-     *
-     * @param out Output stream to write to.
-     */
+    /** @brief Write binary cache: metadata + padding + column pages. Stream must be binary mode. */
     void dump(std::ostream &out) {
         out.write(reinterpret_cast<const char *>(&tablemeta),
                   sizeof(struct TableMeta));

@@ -2,32 +2,10 @@
  * @file match_collector.h
  * @brief Lock-free parallel match collection for joins.
  *
- * Collects (build_row_id, probe_row_id) pairs from parallel probe workers.
- * Uses chunk-chains for O(1) merge: each thread accumulates to thread-local
- * buffers, then chains are linked together without copying.
+ * Collects (build_row_id, probe_row_id) pairs using chunk-chains for O(1)
+ * merge. Thread-local buffers avoid contention; chains linked without copying.
  *
- * **Ordering semantics:** Matches appear in thread-id order (thread 0, 1, 2,
- * ...), with each thread's matches in discovery order. This order is preserved
- * through materialization. The ordering is non-deterministic across runs but
- * semantically correct since SQL joins don't guarantee order.
- *
- * **Typical usage pattern:**
- * @code
- * MatchCollector collector(MatchCollectionMode::BOTH);
- * std::vector<ThreadLocalMatchBuffer> buffers =
- * create_thread_local_buffers(num_threads, mode);
- * worker_pool.execute([&](size_t t) {
- *     buffers[t].add_match(build_row, probe_row);
- * });
- * merge_local_collectors(buffers, collector);
- * collector.finalize_parallel();
- * for (uint32_t id : collector.get_left_range(0, collector.size())) {
- *     // process
- * }
- * @endcode
- *
- * @see ThreadLocalMatchBuffer for per-thread accumulation.
- * @see materialize.h and construct_intermediate.h for consumers.
+ * @see ThreadLocalMatchBuffer, materialize.h, construct_intermediate.h
  */
 #pragma once
 
@@ -39,29 +17,13 @@
 #include <sys/mman.h>
 #include <vector>
 
-/**
- * @namespace Contest::join
- * @brief Parallel hash join implementation for the SIGMOD contest.
- *
- * Key components in this file:
- * - MatchCollectionMode: Controls which row IDs to collect (memory
- * optimization)
- * - IndexChunk: Fixed-size chunk for lock-free linked-list match storage
- * - ThreadLocalMatchBuffer: Per-thread accumulator avoiding contention
- * - MatchCollector: Global aggregator with O(1) chain merge
- * - ChunkIterator/ChunkRange: Zero-copy iteration over match chains
- */
+/** @namespace Contest::join @brief Parallel hash join implementation. */
 namespace Contest::join {
 
 using Contest::platform::worker_pool;
 
-/**
- * @brief Specifies which side's row IDs to collect during join.
- *
- * Memory optimization: when output only needs columns from one join side,
- * skip collecting the other side's IDs (saves 50% match storage).
- * Determined by join_setup.h:determine_collection_mode based on output_attrs.
- */
+/** @brief Specifies which side's row IDs to collect. Saves 50% when one side
+ * unused. */
 enum class MatchCollectionMode : uint8_t {
     BOTH = 0,      /**< Collect both left and right row IDs. */
     LEFT_ONLY = 1, /**< Only left (build) side IDs needed. */
@@ -71,12 +33,7 @@ enum class MatchCollectionMode : uint8_t {
 /** @brief Capacity per IndexChunk; sized for L2 cache efficiency. */
 static constexpr size_t MATCH_CHUNK_CAP = 8192;
 
-/**
- * @brief Fixed-size chunk of row IDs forming a singly-linked list.
- *
- * Building block for lock-free match collection. New chunks are allocated
- * when current fills, linked via `next` pointer for O(1) merge of chains.
- */
+/** @brief Fixed-size chunk of row IDs forming a singly-linked list. */
 struct IndexChunk {
     uint32_t ids[MATCH_CHUNK_CAP]; /**< Row ID storage. */
     uint32_t count = 0;            /**< Valid entries in ids[0..count-1]. */
@@ -88,14 +45,8 @@ class MatchCollector;
 /**
  * @brief Per-thread buffer for collecting join matches without contention.
  *
- * Each probe worker maintains its own buffer, appending matches via
- * add_match(). Maintains separate left/right chunk chains based on
- * MatchCollectionMode. After probe completes, chains are transferred to
- * MatchCollector via merge_local_collectors() - O(1) pointer linking with no
- * copying.
- *
- * @note Allocated chunks are owned by this buffer until merge, then ownership
- *       transfers to MatchCollector. Destructor only frees unrelinquished
+ * Maintains separate left/right chunk chains. After probe, chains transfer to
+ * MatchCollector via O(1) pointer linking. Destructor frees unrelinquished
  * chunks.
  */
 class ThreadLocalMatchBuffer {
@@ -144,15 +95,7 @@ class ThreadLocalMatchBuffer {
         }
     }
 
-    /**
-     * @brief Records a match between build and probe row IDs.
-     *
-     * Hot path - inlined, branch-predicted for chunk-not-full case.
-     * Allocates new chunks in pairs (BOTH mode) to keep left/right aligned.
-     *
-     * @param left Build side row ID
-     * @param right Probe side row ID
-     */
+    /** @brief Records a match. Allocates new chunks in pairs for BOTH mode. */
     inline void add_match(uint32_t left, uint32_t right) {
         if (mode == MatchCollectionMode::BOTH) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
@@ -191,16 +134,10 @@ class ThreadLocalMatchBuffer {
 /**
  * @brief Global collector aggregating matches from all probe workers.
  *
- * Receives chunk chains from ThreadLocalMatchBuffer via merge_thread_buffer()
- * or merge_local_collectors(). Uses atomic counter for total_matches_count;
- * chain linking is single-threaded (called after parallel probe completes).
+ * Chain linking is single-threaded after probe completes. After
+ * finalize_parallel(), provides ChunkRange iterators for materialization.
  *
- * After finalize_parallel(), provides ChunkRange iterators for materialization
- * to traverse matches. The all_chunks vector consolidates ownership for
- * cleanup.
- *
- * @see hash_join.h probe functions which populate this collector.
- * @see materialize.h which consumes get_left_range/get_right_range.
+ * @see hash_join.h, materialize.h
  */
 class MatchCollector {
     IndexChunk *left_chain_head = nullptr;
@@ -215,13 +152,7 @@ class MatchCollector {
     std::vector<IndexChunk *> all_chunks;
 
   public:
-    /**
-     * @brief Forward iterator over row IDs across chunk chains.
-     *
-     * Tracks current chunk, offset within chunk, and remaining count.
-     * Seamlessly traverses chunk boundaries. Used by materialization to
-     * iterate matches without copying to contiguous storage.
-     */
+    /** @brief Forward iterator over row IDs across chunk chains. */
     class ChunkIterator {
         IndexChunk *current_chunk;
         uint32_t offset;
@@ -257,16 +188,7 @@ class MatchCollector {
             return remaining != other.remaining;
         }
 
-        /**
-         * @brief Skip forward n elements without dereferencing.
-         *
-         * Efficiently advances iterator across chunk boundaries for range
-         * slicing. Used by ChunkRange::begin() to position iterator at
-         * start_offset, enabling parallel workers to process non-overlapping
-         * match ranges.
-         *
-         * @param n Number of elements to skip forward
-         */
+        /** @brief Skip forward n elements across chunk boundaries. */
         void advance(size_t n) {
             while (n > 0 && current_chunk) {
                 size_t available = current_chunk->count - offset;
@@ -285,13 +207,7 @@ class MatchCollector {
         }
     };
 
-    /**
-     * @brief Range adapter for iterating a slice of the chunk chain.
-     *
-     * Returned by get_left_range/get_right_range for parallel materialization.
-     * Supports range-for loops: `for (uint32_t id :
-     * collector.get_left_range(start, count))`.
-     */
+    /** @brief Range adapter for iterating a slice of the chunk chain. */
     class ChunkRange {
         IndexChunk *head;
         size_t start_offset;
@@ -333,15 +249,7 @@ class MatchCollector {
 
     void reserve(size_t) {}
 
-    /**
-     * @brief Optimized merge takes linked lists of chunks via pointer ops.
-     *
-     * @param left_head Head of left chunk chain (build side IDs)
-     * @param left_tail Tail of left chunk chain
-     * @param right_head Head of right chunk chain (probe side IDs)
-     * @param right_tail Tail of right chunk chain
-     * @param batch_count Total matches in the chains
-     */
+    /** @brief Merges chunk chains via pointer ops (O(1)). */
     void append_batch_chains(IndexChunk *left_head, IndexChunk *left_tail,
                              IndexChunk *right_head, IndexChunk *right_tail,
                              size_t batch_count) {
@@ -378,16 +286,7 @@ class MatchCollector {
         }
     }
 
-    /**
-     * @brief Merges a single thread's buffer; transfers chunk ownership.
-     *
-     * Ownership transfer protocol: After append_batch_chains() links the
-     * chunks into this collector, pointers are nulled to prevent double-free.
-     * The buffer's destructor will see nullptr and skip deletion, making this
-     * collector the sole owner responsible for cleanup via all_chunks.
-     *
-     * @param tlb Thread-local buffer to merge and clear
-     */
+    /** @brief Merges a thread's buffer; transfers chunk ownership. */
     void merge_thread_buffer(ThreadLocalMatchBuffer &tlb) {
         if (tlb.total_count == 0)
             return;
@@ -398,12 +297,7 @@ class MatchCollector {
         tlb.total_count = 0;
     }
 
-    /**
-     * @brief Consolidates chunk ownership for cleanup; call after all merges.
-     *
-     * Collects all chunk pointers into all_chunks for unified deletion.
-     * Must be called before accessing matches via get_*_range().
-     */
+    /** @brief Consolidates chunk ownership; call after all merges. */
     void finalize_parallel() {
         if (is_finalized)
             return;
@@ -438,36 +332,18 @@ class MatchCollector {
     /** @brief Returns total match count across all merged buffers. */
     inline size_t size() const { return total_matches_count; }
 
-    /**
-     * @brief Returns range for iterating left (build) row IDs.
-     *
-     * @param start Offset to begin iteration
-     * @param count Number of elements to iterate
-     * @return ChunkRange for range-based for loops
-     */
+    /** @brief Returns range for iterating left (build) row IDs. */
     ChunkRange get_left_range(size_t start, size_t count) const {
         return ChunkRange(left_chain_head, start, count);
     }
 
-    /**
-     * @brief Returns range for iterating right (probe) row IDs.
-     *
-     * @param start Offset to begin iteration
-     * @param count Number of elements to iterate
-     * @return ChunkRange for range-based for loops
-     */
+    /** @brief Returns range for iterating right (probe) row IDs. */
     ChunkRange get_right_range(size_t start, size_t count) const {
         return ChunkRange(right_chain_head, start, count);
     }
 };
 
-/**
- * @brief Creates thread-local match buffers for parallel join processing.
- *
- * @param thread_count Number of worker threads
- * @param mode Collection mode (BOTH, LEFT_ONLY, or RIGHT_ONLY)
- * @return Vector of initialized buffers, one per thread
- */
+/** @brief Creates thread-local match buffers, one per thread. */
 inline std::vector<ThreadLocalMatchBuffer>
 create_thread_local_buffers(size_t thread_count, MatchCollectionMode mode) {
     std::vector<ThreadLocalMatchBuffer> buffers;
@@ -478,17 +354,8 @@ create_thread_local_buffers(size_t thread_count, MatchCollectionMode mode) {
     return buffers;
 }
 
-/**
- * @brief Merges all thread-local buffers into the global collector.
- *
- * Performs single-pass batch merge by linking chains from all non-empty
- * buffers, then submits consolidated chains to global_collector via one
- * append_batch_chains() call. This reduces atomic operations compared to
- * merging buffers individually.
- *
- * @param local_buffers Thread-local buffers to merge (will be cleared)
- * @param global_collector Destination collector receiving all matches
- */
+/** @brief Merges all thread-local buffers into global collector via batch
+ * chain linking. */
 inline void
 merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &local_buffers,
                        MatchCollector &global_collector) {

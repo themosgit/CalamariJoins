@@ -2,26 +2,13 @@
  * @file hardware_benchmarkvm.h
  * @brief Hardware configuration for SIGMOD contest benchmark VM.
  *
- * Platform-specific constants for the contest grading server. Activated via
- * SPC__USE_BENCHMARKVM_HARDWARE preprocessor define. Values obtained from
- * actual benchmark VM hardware inspection.
+ * Intel Xeon E5-2680 v3: 24 threads, 256KB L2/core, 30MB shared L3, AVX2.
+ * Activated via SPC__USE_BENCHMARKVM_HARDWARE.
  *
- * ### Benchmark VM specifications:
- * - Intel Xeon E5-2680 v3 (Haswell-EP architecture)
- * - 24 threads (12 cores × 2 hyperthreads)
- * - 256KB L2 per core, 30MB shared L3
- * - AVX2 SIMD support (256-bit vectors)
- *
- * ### Performance considerations:
- * - Large L3 cache (30MB) enables aggressive hash table sizing
- * - 64-byte cache lines (standard x86)
- * - Hyperthreading benefits memory-bound workloads
- *
- * @note These values are critical for cache-aware partitioning in
+ * @note Critical for cache-aware partitioning in
  *       UnchainedHashtable::compute_num_partitions().
- *
- * @see hardware.h for generic fallback
- * @see hardware_darwin.h for Apple Silicon configuration
+ * @see hardware.h for generic fallback.
+ * @see hardware_darwin.h for Apple Silicon.
  */
 #define SPC__X86_64
 #define SPC__CPU_NAME "Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz"

@@ -2,22 +2,12 @@
  * @file hardware_darwin.h
  * @brief Hardware configuration for Apple Silicon (M1/M2/M3).
  *
- * Platform-specific constants for Apple Silicon Macs. Detected via
- * `__APPLE__ && __aarch64__` preprocessor guards. Values reflect M1
- * performance cores (P-cores) which are used for compute-intensive work.
+ * 128-byte cache lines, 4MB L2/cluster, no L3, NEON SIMD, LSE atomics.
+ * Detected via `__APPLE__ && __aarch64__`.
  *
- * ### Apple Silicon characteristics:
- * - 128-byte cache lines (vs 64-byte on x86)
- * - Large L2 cache per P-core (4MB shared cluster)
- * - No L3 cache (unified memory architecture)
- * - NEON SIMD support (128-bit vectors)
- * - LSE atomics for efficient lock-free operations
- *
- * @note E-cores (efficiency cores) have different cache sizes but are
- *       typically not used for join processing due to lower performance.
- *
- * @see hardware.h for generic x86-64 fallback
- * @see hardware_benchmarkvm.h for contest benchmark VM configuration
+ * @note E-cores have different cache sizes but are not used for joins.
+ * @see hardware.h for generic x86-64 fallback.
+ * @see hardware_benchmarkvm.h for contest VM.
  */
 #define SPC__AARCH64
 #define SPC__CPU_NAME "Apple M1"

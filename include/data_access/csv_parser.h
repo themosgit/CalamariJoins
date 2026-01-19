@@ -1,14 +1,7 @@
 /**
  * @file csv_parser.h
- * @brief Streaming CSV parser with configurable delimiters and escape handling.
- *
- * Provides a base class for parsing CSV files in a streaming fashion, suitable
- * for processing large files without loading them entirely into memory. The
- * parser handles quoted fields, escape sequences, and validates column
- * consistency across rows.
- *
- * @note This is an abstract class; subclasses must implement on_field() to
- *       handle parsed field data.
+ * @brief Streaming CSV parser. Configurable escape/delim, validates columns.
+ * Abstract: subclass implements on_field().
  */
 
 #pragma once
@@ -19,44 +12,19 @@
 
 /**
  * @class CSVParser
- * @brief Abstract streaming CSV parser with configurable format options.
+ * @brief Abstract streaming CSV parser. Subclass implements on_field().
  *
- * Parses CSV data incrementally via execute() calls, invoking the virtual
- * on_field() callback for each parsed field. Supports:
- * - Configurable field separator (default: comma)
- * - Configurable escape/quote character (default: double-quote)
- * - Optional trailing comma after last field
- * - Proper handling of quoted fields containing separators/newlines
- * - CRLF and LF line endings
- *
- * ### Usage Pattern
- * @code
- * class MyParser : public CSVParser {
- *     void on_field(size_t col, size_t row, const char* data, size_t len)
- * override {
- *         // Process field at (col, row)
- *     }
- * };
- *
- * MyParser parser;
- * parser.execute(buffer, length);
- * parser.finish();  // Flush any remaining field
- * @endcode
- *
- * @see Table::from_csv() for high-level CSV loading with schema validation
+ * Configurable separator/escape, quoted fields, CRLF/LF. Call execute() then finish().
+ * @see Table::from_csv()
  */
 class CSVParser {
   public:
-    /**
-     * @enum Error
-     * @brief Parse error codes returned by execute() and finish().
-     */
+    /** @brief Parse error codes. */
     enum Error {
-        Ok,                  ///< No error, parsing succeeded.
-        QuoteNotClosed,      ///< Quoted field missing closing quote at EOF.
-        InconsistentColumns, ///< Row has different column count than first row.
-        NoTrailingComma,     ///< Expected trailing comma not found (when
-                             ///< has_trailing_comma=true).
+        Ok,                  ///< Success.
+        QuoteNotClosed,      ///< Missing closing quote at EOF.
+        InconsistentColumns, ///< Row column count mismatch.
+        NoTrailingComma,     ///< Missing trailing comma (when enabled).
     };
 
     /**
@@ -77,48 +45,13 @@ class CSVParser {
         : escape_(escape), comma_(sep),
           has_trailing_comma_(has_trailing_comma) {}
 
-    /**
-     * @brief Parse a chunk of CSV data.
-     *
-     * Processes the buffer incrementally, calling on_field() for each
-     * completed field. May be called multiple times with consecutive
-     * chunks of a large file. Maintains internal state between calls.
-     *
-     * @param buffer Pointer to CSV data (not null-terminated).
-     * @param len    Number of bytes in buffer.
-     * @return Error::Ok on success, or an error code on parse failure.
-     *
-     * @note The parser copies incomplete field data internally, so the
-     *       buffer need not remain valid after this call returns.
-     */
+    /** @brief Parse chunk incrementally. Calls on_field() per field. Maintains state across calls. */
     [[nodiscard]] Error execute(const char *buffer, size_t len);
 
-    /**
-     * @brief Finalize parsing and flush any remaining field.
-     *
-     * Must be called after all data has been passed to execute() to
-     * handle any final field that wasn't terminated by a newline.
-     *
-     * @return Error::Ok on success, Error::QuoteNotClosed if inside a
-     *         quoted field, or Error::InconsistentColumns if the final
-     *         row has wrong column count.
-     */
+    /** @brief Finalize parsing, flush remaining field. Returns error if inside quote or column mismatch. */
     [[nodiscard]] Error finish();
 
-    /**
-     * @brief Callback invoked for each parsed field.
-     *
-     * Subclasses must implement this to process field data. Called in
-     * row-major order (all fields of row 0, then row 1, etc.).
-     *
-     * @param col_idx Zero-based column index within the row.
-     * @param row_idx Zero-based row index (first data row is 0).
-     * @param begin   Pointer to unescaped field content.
-     * @param len     Length of field content in bytes.
-     *
-     * @note The pointer is valid only during this callback; copy the data
-     *       if needed later. Escape sequences have already been processed.
-     */
+    /** @brief Field callback. Row-major order. Pointer valid only during call; escapes pre-processed. */
     virtual void on_field(size_t col_idx, size_t row_idx, const char *begin,
                           size_t len) = 0;
 
@@ -132,17 +65,14 @@ class CSVParser {
     bool has_trailing_comma_{false};
     /// @}
 
-    /// @name Parser State
-    /// @{
-    std::vector<char> current_field_; ///< Buffer for field being assembled.
-    size_t col_idx_{0};               ///< Current column index within row.
-    size_t row_idx_{0};               ///< Current row index.
-    size_t num_cols_{0}; ///< Expected column count (set from first row).
-    bool after_first_row_{false};  ///< True after first row parsed.
-    bool quoted_{false};           ///< Currently inside quoted field.
-    bool after_field_sep_{false};  ///< Just saw field separator.
-    bool after_record_sep_{false}; ///< Just saw record separator (newline).
-    bool escaping_{false};         ///< Next char is escaped.
-    bool newlining_{false};        ///< Processing CRLF sequence.
-    /// @}
+    std::vector<char> current_field_; ///< Field buffer.
+    size_t col_idx_{0};               ///< Current column.
+    size_t row_idx_{0};               ///< Current row.
+    size_t num_cols_{0};              ///< Expected columns (from row 0).
+    bool after_first_row_{false};     ///< First row parsed.
+    bool quoted_{false};              ///< Inside quoted field.
+    bool after_field_sep_{false};     ///< After field separator.
+    bool after_record_sep_{false};    ///< After newline.
+    bool escaping_{false};            ///< Next char escaped.
+    bool newlining_{false};           ///< Processing CRLF.
 };

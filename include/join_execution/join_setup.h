@@ -17,14 +17,7 @@
 
 /**
  * @namespace Contest::join
- * @brief Parallel hash join implementation for the SIGMOD contest.
- *
- * Key components in this file:
- * - JoinInput: Unified abstraction over columnar/intermediate sources
- * - BuildProbeConfig: Build/probe side selection with attribute remapping
- * - JoinSetup: Join execution state container with lazy initialization
- * - select_build_probe_side(): Cardinality-based build side selection
- * - prepare_output_columns(): Lazy PageIndex construction for needed columns
+ * @brief JoinInput abstraction, build/probe selection, output column setup.
  */
 namespace Contest::join {
 
@@ -34,10 +27,8 @@ using Contest::io::ColumnarReader;
 /**
  * @brief Unified abstraction over columnar tables and intermediate results.
  *
- * Allows join code to handle both source types uniformly. Stores either a
- * pointer to ColumnarTable (for base table scans) or an ExecuteResult
- * (for intermediate results from child joins). The node pointer provides
- * output_attrs mapping for column resolution.
+ * Stores ColumnarTable* (base scans) or ExecuteResult (child joins). Node
+ * provides output_attrs mapping for column resolution.
  */
 struct JoinInput {
     std::variant<ExecuteResult, const ColumnarTable *> data;
@@ -50,9 +41,8 @@ struct JoinInput {
     }
 
     /**
-     * @brief Returns the number of rows for a given output column.
-     * @param col_idx Index into node->output_attrs (not physical table column).
-     * @return Row count from underlying columnar table or intermediate result.
+     * @brief Row count for a given output column.
+     * @param col_idx Index into node->output_attrs.
      */
     size_t row_count(size_t col_idx) const {
         if (is_columnar()) {
@@ -64,22 +54,14 @@ struct JoinInput {
         }
     }
 
-    /**
-     * @brief Returns the number of output columns in this input.
-     * @return Size of node->output_attrs vector.
-     */
+    /** @brief Number of output columns. */
     size_t output_size() const { return node->output_attrs.size(); }
 };
 
 /**
  * @brief Configuration for build/probe side assignment.
  *
- * Determined by select_build_probe_side(): smaller table becomes build side.
- * Contains remapped attribute indices adjusted for the chosen assignment.
- *
- * When the optimizer's hint is overridden (right becomes build), remapped_attrs
- * are reordered from (left, right) to (build, probe) format to maintain uniform
- * indexing throughout join execution.
+ * Smaller table becomes build side. Contains remapped attribute indices.
  */
 struct BuildProbeConfig {
     bool build_left; /**< True if left input is build side. */
@@ -93,17 +75,7 @@ struct BuildProbeConfig {
     size_t probe_attr; /**< Join key index in probe's output_attrs. */
 };
 
-/**
- * @brief Resolves a global output column index to its source input.
- *
- * @param global_idx Column index in the combined output schema.
- * @param split_point Boundary between input_a and input_b columns.
- * @param input_a First input (typically left or build).
- * @param node_a PlanNode for input_a.
- * @param input_b Second input (typically right or probe).
- * @param node_b PlanNode for input_b.
- * @return Tuple of (source JoinInput, source PlanNode, local column index).
- */
+/** @brief Resolves global output column index to source input. */
 inline std::tuple<const JoinInput &, const PlanNode &, size_t>
 resolve_input_source(size_t global_idx, size_t split_point,
                      const JoinInput &input_a, const PlanNode &node_a,
@@ -117,23 +89,7 @@ resolve_input_source(size_t global_idx, size_t split_point,
 /**
  * @brief Chooses build/probe sides based on cardinality.
  *
- * Smaller table becomes build side to minimize hash table size and improve
- * cache efficiency. When the optimizer's build_left hint is overridden (right
- * is smaller), this performs index remapping to maintain uniform (build, probe)
- * ordering throughout join execution.
- *
- * Remapping algorithm when sides are flipped (!build_left):
- * - Left columns [0, left_size) shift right: new_idx = build_size + old_idx
- * - Right columns [left_size, ...) shift left: new_idx = old_idx - left_size
- * This swaps the two ranges to achieve (right_cols..., left_cols...) layout
- * which matches (build_cols..., probe_cols...) semantic ordering.
- *
- * @param join JoinNode containing left_attr and right_attr join keys.
- * @param left_input Left input providing row count for comparison.
- * @param right_input Right input providing row count for comparison.
- * @param output_attrs Output schema in original (left, right) order.
- * @return BuildProbeConfig with build_left flag, remapped attributes, and join
- * keys.
+ * Smaller table becomes build. When flipped, remaps indices to (build, probe).
  */
 inline BuildProbeConfig select_build_probe_side(
     const JoinNode &join, const JoinInput &left_input,
@@ -166,25 +122,10 @@ inline BuildProbeConfig select_build_probe_side(
 }
 
 /**
- * @brief Determines which row IDs are needed based on output columns.
+ * @brief Determines which row IDs needed based on output columns.
  *
- * Analyzes remapped_attrs to check if output needs only build-side columns,
- * only probe-side columns, or both. Returns matching MatchCollectionMode
- * to avoid collecting unnecessary row IDs.
- *
- * Optimization rationale: When the query projects only columns from one side
- * (e.g., SELECT R.* FROM R JOIN S ON R.id = S.id), we can skip collecting
- * row IDs from the unused side. This saves approximately 50% of match storage
- * memory since each match pair normally stores two row IDs (build_row,
- * probe_row).
- *
- * The function short-circuits as soon as both sides are needed to minimize
- * iteration overhead.
- *
- * @param remapped_attrs Output schema with indices in (build, probe) order.
- * @param build_size Number of columns from build side (boundary point).
- * @return LEFT_ONLY if only build columns needed, RIGHT_ONLY if only probe,
- *         BOTH if columns from both sides are projected.
+ * Returns LEFT_ONLY, RIGHT_ONLY, or BOTH. Saves ~50% match storage when
+ * only one side is projected.
  */
 inline MatchCollectionMode determine_collection_mode(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
@@ -217,19 +158,6 @@ inline MatchCollectionMode determine_collection_mode(
 
 /**
  * @brief Creates output columns with provenance metadata from inputs.
- *
- * Propagates source_table and source_column tracking through the join pipeline.
- * For columnar inputs, metadata comes directly from table_id and column
- * indices. For intermediate results, metadata is inherited from child join's
- * output.
- *
- * @param output_attrs Output schema in original (left, right) order.
- * @param left_node Left child's PlanNode for column resolution.
- * @param right_node Right child's PlanNode for column resolution.
- * @param left_input Left input data and metadata.
- * @param right_input Right input data and metadata.
- * @param estimated_rows Unused parameter (reserved for future capacity hints).
- * @return ExecuteResult with empty columns but correct provenance metadata.
  */
 inline ExecuteResult initialize_output_columns(
     const std::vector<std::tuple<size_t, DataType>> &output_attrs,
@@ -267,25 +195,16 @@ inline ExecuteResult initialize_output_columns(
 }
 
 /**
- * @brief Encapsulates join output state and columnar reader.
+ * @brief Join output state and columnar reader.
  *
- * Passed through join execution to accumulate results and provide
- * access to columnar data for materialization.
- *
- * The prepared flag implements lazy PageIndex construction: ColumnarReader's
- * PageIndex structures are only built when prepare_output_columns() is called,
- * avoiding upfront cost for joins that may produce zero matches. This is
- * particularly beneficial for selective joins where early termination is
- * common.
+ * prepared flag implements lazy PageIndex construction.
  */
 struct JoinSetup {
     ExecuteResult results; /**< Output columns being populated. */
     ColumnarReader
         columnar_reader; /**< Page cursor caching for columnar access. */
     /**
-     * True after prepare_output_columns called. Guards against double
-     * preparation and signals that columnar_reader is ready for
-     * materialization.
+     * True after prepare_output_columns called.
      */
     bool prepared;
 
@@ -295,22 +214,7 @@ struct JoinSetup {
 /**
  * @brief Initializes JoinSetup with output columns; call before join execution.
  *
- * Creates the output container with proper provenance tracking but leaves
- * columnar_reader unprepared (prepared=false). Actual PageIndex construction
- * is deferred to prepare_output_columns() to avoid initialization cost when
- * joins produce no matches.
- *
- * @param build_input Build side input (after select_build_probe_side).
- * @param probe_input Probe side input (after select_build_probe_side).
- * @param build_node Build side PlanNode.
- * @param probe_node Probe side PlanNode.
- * @param left_node Original left PlanNode (for provenance).
- * @param right_node Original right PlanNode (for provenance).
- * @param left_input Original left input (for provenance).
- * @param right_input Original right input (for provenance).
- * @param output_attrs Output schema in original (left, right) order.
- * @param estimated_rows Unused (reserved for future optimizations).
- * @return JoinSetup with initialized results and prepared=false.
+ * PageIndex construction deferred to prepare_output_columns().
  */
 inline JoinSetup
 setup_join(const JoinInput &build_input, const JoinInput &probe_input,
@@ -334,14 +238,7 @@ setup_join(const JoinInput &build_input, const JoinInput &probe_input,
  * @brief Collects Column pointers for needed output columns from columnar
  * input.
  *
- * Maps logical output indices to physical table Column pointers based on the
- * needed mask. Unused columns get nullptr to signal that ColumnarReader should
- * skip building PageIndex structures for them.
- *
- * @param input Columnar JoinInput (caller must ensure is_columnar() is true).
- * @param node PlanNode providing output_attrs mapping.
- * @param needed Mask indicating which output columns are actually projected.
- * @return Vector of Column pointers, nullptr for unneeded columns.
+ * Unused columns get nullptr to skip PageIndex construction.
  */
 inline std::vector<const Column *>
 collect_needed_columns(const JoinInput &input, const PlanNode &node,
@@ -359,22 +256,7 @@ collect_needed_columns(const JoinInput &input, const PlanNode &node,
 /**
  * @brief Prepares ColumnarReader with columns needed for materialization.
  *
- * Analyzes remapped_attrs to determine which columns from build/probe sides
- * are needed, then initializes the reader with those Column pointers. This
- * triggers lazy construction of PageIndex structures only for columns that
- * appear in the output projection.
- *
- * Early returns if both inputs are intermediate (no columnar data to index).
- * For hybrid joins (one columnar, one intermediate), only the columnar side
- * gets prepared.
- *
- * @param reader ColumnarReader to populate with build/probe Column pointers.
- * @param build_input Build side input.
- * @param probe_input Probe side input.
- * @param build_node Build side PlanNode.
- * @param probe_node Probe side PlanNode.
- * @param remapped_attrs Output schema in (build, probe) order.
- * @param build_size Number of build columns (split point for remapped_attrs).
+ * Triggers lazy PageIndex construction only for projected columns.
  */
 inline void prepare_output_columns(
     ColumnarReader &reader, const JoinInput &build_input,

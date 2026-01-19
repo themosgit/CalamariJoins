@@ -1,14 +1,11 @@
 /**
  * @file nested_loop.h
- * @brief Nested loop join for small build-side tables.
+ * @brief Nested loop join for small build tables (<8 rows).
  *
- * Fallback join strategy when build table is small enough to fit in CPU cache.
- * Uses parallel work-stealing to probe against the build keys. Outperforms hash
- * join for tiny tables (< 8 rows) because cache locality and sequential
- * comparison are faster than hash computation and indirect memory access
- * overhead.
+ * Fallback when build fits in L1 cache. Parallel work-stealing probe.
+ * Outperforms hash join for tiny tables due to cache locality.
  *
- * @see execute.cpp HASH_TABLE_THRESHOLD = 8 for the switchover point.
+ * @see execute.cpp HASH_TABLE_THRESHOLD = 8
  */
 #pragma once
 
@@ -24,14 +21,7 @@
 
 /**
  * @namespace Contest::join
- * @brief Parallel hash join implementation for the SIGMOD contest.
- *
- * Key components in this file:
- * - visit_rows(): Generic row iterator abstracting columnar/intermediate
- * sources
- * - nested_loop_join(): Cache-optimized join for tiny build tables (<64 rows)
- *
- * @see execute.cpp HASH_TABLE_THRESHOLD for switchover decision
+ * @brief visit_rows() iterator, nested_loop_join() for tiny build tables.
  */
 namespace Contest::join {
 
@@ -41,14 +31,9 @@ using Contest::platform::worker_pool;
 /**
  * @brief Iterates over non-NULL values in a join input column.
  *
- * Abstracts columnar vs intermediate input: for columnar, decodes pages
- * handling NULL bitmaps; for intermediate, iterates column_t values.
- * Invokes visitor(row_id, int32_value) for each non-NULL entry.
+ * Abstracts columnar vs intermediate input. Handles NULL bitmaps.
  *
- * @tparam Func Callable with signature void(uint32_t row_id, int32_t value).
- * @param input      Source data (columnar table or intermediate result).
- * @param attr_idx   Index into output_attrs for the column to iterate.
- * @param visitor    Callback invoked for each non-NULL value.
+ * @tparam Func void(uint32_t row_id, int32_t value).
  */
 template <typename Func>
 inline void visit_rows(const JoinInput &input, size_t attr_idx,
@@ -93,32 +78,12 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
 }
 
 /**
- * @brief Nested loop join optimized for small build tables (<=64 rows).
+ * @brief Nested loop join for small build tables (<=64 rows).
  *
- * **Algorithm:** Materializes build-side keys/IDs into stack arrays (b_vals,
- * b_ids), then scans probe side in parallel. For each probe value, performs
- * linear search through build array. WHY this beats hash join for tiny tables:
- * (1) stack arrays fit in L1 cache (512 bytes total), (2) no hash computation
- * overhead, (3) sequential comparison is branch-predictor friendly, (4) no
- * pointer indirection.
+ * Build keys/IDs in stack arrays (512 bytes, L1-resident). Parallel probe
+ * via work-stealing. Beats hash join for <8 rows due to no hash overhead.
  *
- * **Performance rationale:** For build size < 8 (HASH_TABLE_THRESHOLD in
- * execute.cpp), sequential scan overhead is ~8 comparisons per probe vs hash
- * join's hash computation + bloom filter check + bucket lookup. Cache locality
- * dominates for such tiny working sets.
- *
- * @param build_input  Build side (small table), loaded into stack arrays for
- * cache efficiency.
- * @param probe_input  Probe side (arbitrary size), scanned in parallel via
- * work-stealing.
- * @param build_attr   Logical index of join key in build's output_attrs array.
- * @param probe_attr   Logical index of join key in probe's output_attrs array.
- * @param collector    Accumulates matching (build_row_id, probe_row_id) pairs
- * from all threads.
- * @param mode         Controls which row IDs to collect: BOTH (inner join),
- * LEFT_ONLY, or RIGHT_ONLY. Affects thread-local buffer allocation strategy.
- * @return void (results written to collector).
- * @see execute.cpp for HASH_TABLE_THRESHOLD = 8 decision boundary.
+ * @param mode BOTH, LEFT_ONLY, or RIGHT_ONLY.
  */
 inline void
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
@@ -132,10 +97,7 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
         return;
 
     /**
-     * MAX_BUILD_SIZE = 64 chosen to fit comfortably in L1 cache.
-     * 64 int32_t values + 64 uint32_t IDs = 512 bytes total,
-     * well below typical 32KB L1 cache. Ensures hot loop stays cache-resident
-     * during probe phase sequential scans.
+     * MAX_BUILD_SIZE = 64 fits in L1 (512 bytes).
      */
     constexpr size_t MAX_BUILD_SIZE = 64;
     int32_t b_vals[MAX_BUILD_SIZE];

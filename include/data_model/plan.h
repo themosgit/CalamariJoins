@@ -16,16 +16,12 @@
 
 /**
  * @file plan.h
- * @brief Execution plan structures and columnar output format.
+ * @brief Execution plan (Plan, PlanNode) and columnar output (ColumnarTable).
  *
- * Defines the Plan structure built by the SQL parser, containing a tree of
- * join/scan nodes. Each node has output_attrs mapping output column indices
- * to source columns with their types.
+ * Plan: tree of JoinNode/ScanNode with output_attrs mapping columns to sources.
+ * ColumnarTable: 8KB page-based columnar format for contest API output.
  *
- * Also defines ColumnarTable, the required output format for the contest API,
- * using page-based columnar storage with null bitmaps.
- *
- * @see intermediate.h for the intermediate result format used between joins.
+ * @see intermediate.h for join intermediate format.
  */
 #pragma once
 
@@ -37,14 +33,7 @@
 #endif
 
 /**
- * @brief RAII wrapper for mmap'd memory with reference counting.
- *
- * Multiple Column objects can share the same mapped region. The refs counter
- * tracks active users; munmap is called when the last reference is released.
- * Used by both ColumnarTable output and intermediate results from
- * BatchAllocator.
- *
- * @note Move-only type to prevent accidental double-free of mapped regions.
+ * @brief RAII mmap wrapper with refcount. munmap on last ref release. Move-only.
  */
 class MappedMemory {
   public:
@@ -83,34 +72,23 @@ class MappedMemory {
     }
 };
 
-/**
- * @brief Discriminator for plan node types.
- */
+/** @brief Plan node type discriminator. */
 enum class NodeType {
     HashJoin, /**< Inner join node with two children. */
     Scan,     /**< Leaf node referencing a base table. */
 };
 
 /**
- * @brief Leaf node that references a pre-loaded base table.
- *
- * The base_table_id indexes into Plan::inputs. ScanNodes return non-owning
- * pointers to ColumnarTable during execution; the base table must remain
- * valid until final materialization since intermediate VARCHAR values
- * reference its pages.
+ * @brief Leaf node referencing base table. base_table_id indexes Plan::inputs.
+ * Base tables must outlive execution (VARCHAR refs their pages).
  */
 struct ScanNode {
     size_t base_table_id; /**< Index into Plan::inputs. */
 };
 
 /**
- * @brief Inner join node with two children and equi-join condition.
- *
- * Children are referenced by index into Plan::nodes. The join condition
- * is an equality predicate between left_attr and right_attr columns.
- *
- * @note Join keys are always INT32 (contest invariant). VARCHAR columns
- *       are never used as join keys.
+ * @brief Inner join node. Children indexed in Plan::nodes.
+ * Equi-join on left_attr = right_attr. Keys always INT32 (contest invariant).
  */
 struct JoinNode {
     /** Optimizer hint: if true, prefer left child as build side.
@@ -123,19 +101,11 @@ struct JoinNode {
 };
 
 /**
- * @brief A node in the execution plan tree (either Scan or Join).
+ * @brief Plan node (Scan or Join) with output_attrs column mapping.
  *
- * Each node specifies which columns appear in its output via output_attrs.
- * This mapping tracks column provenance through the join tree.
- *
- * **output_attrs semantics:**
- * - For ScanNode: index refers to column in the base ColumnarTable
- * - For JoinNode: index refers to combined left+right child output
- *   - Indices [0, left_output_size) map to left child's output columns
- *   - Indices [left_output_size, ...) map to right child's output columns
- *
- * During execution, select_build_probe_side() may remap these indices
- * based on which child becomes the build vs probe side.
+ * output_attrs: ScanNode → base table column index; JoinNode → combined L/R
+ * index ([0,left_size) = left, [left_size,...) = right). May be remapped by
+ * select_build_probe_side(). @see join_setup.h
  */
 struct PlanNode {
     std::variant<ScanNode, JoinNode> data; /**< Node-specific data. */
@@ -148,51 +118,26 @@ struct PlanNode {
 };
 
 /**
- * @brief Page size for ColumnarTable output format (8KB).
- *
- * Chosen for cache efficiency: fits in L2 cache on most processors.
- * Smaller than intermediate format's 16KB pages since final output
- * requires more metadata (explicit null bitmaps, offset arrays).
- *
- * @see intermediate.h IR_PAGE_SIZE for larger intermediate pages.
+ * @brief ColumnarTable page size (8KB). L2-cache sized; smaller than
+ * IR_PAGE_SIZE due to null bitmap/offset overhead. @see intermediate.h
  */
 constexpr size_t PAGE_SIZE = 8192;
 
 /**
- * @brief Fixed-size memory block for columnar data storage.
+ * @brief 8-byte aligned page (8KB) for columnar data.
  *
- * Pages are 8-byte aligned for efficient access to 64-bit values.
- * Page layout depends on column type:
- *
- * **INT32 page format:**
- * - Bytes 0-1: num_rows (u16) - total rows including NULLs
- * - Bytes 2-3: num_values (u16) - count of non-NULL values
- * - Bytes 4+: packed INT32 values
- * - End-N: validity bitmap (1=valid, 0=NULL)
- *
- * **VARCHAR page format:**
- * - Bytes 0-1: num_rows (u16) or special marker (0xFFFF/0xFFFE for long
- * strings)
- * - Bytes 2-3: num_offsets (u16)
- * - Bytes 4+: cumulative end offsets (u16 each)
- * - After offsets: packed string bytes
- * - End-N: validity bitmap
- *
- * If num_rows == num_values, page is "dense" (no NULLs) enabling fast paths.
+ * INT32: [num_rows:u16][num_values:u16][values...][bitmap at end]
+ * VARCHAR: [num_rows:u16][num_offsets:u16][offsets:u16...][string bytes][bitmap]
+ * Long string markers: 0xFFFF (first), 0xFFFE (continuation).
+ * Dense page (no NULLs): num_rows == num_values → fast path.
  */
 struct alignas(8) Page {
     std::byte data[PAGE_SIZE];
 };
 
 /**
- * @brief A single column in a ColumnarTable, stored as a sequence of pages.
- *
- * Columns can either own their pages individually (new/delete) or share
- * pages from a MappedMemory region (arena allocation). The mapped_memory
- * pointer determines cleanup behavior: if set, pages are freed via the
- * shared region's reference counting.
- *
- * @note Move-only type. Copy is deleted to prevent accidental page duplication.
+ * @brief Column as page sequence. Owned (new/delete) or shared via MappedMemory
+ * refcount. Move-only.
  */
 struct Column {
     DataType type;               /**< INT32 or VARCHAR. */
@@ -250,13 +195,8 @@ struct Column {
 };
 
 /**
- * @brief Columnar table format required by the contest API.
- *
- * Stores data column-by-column in pages for cache-efficient access.
- * This is the final output format produced by materialize() for root joins.
- *
- * @see intermediate.h for column_t, the intermediate format used between
- *      non-root joins (uses larger pages and value_t encoding).
+ * @brief Contest API output format: columnar, page-based.
+ * Root join output via materialize(). @see intermediate.h for non-root format.
  */
 struct ColumnarTable {
     size_t num_rows{0};          /**< Total row count across all pages. */
@@ -269,14 +209,8 @@ ColumnarTable from_table(const std::vector<std::vector<Data>> &table,
                          const std::vector<DataType> &data_types);
 
 /**
- * @brief Complete execution plan for a multi-way join query.
- *
- * Contains a tree of PlanNodes (stored flat in a vector) and pre-loaded
- * base tables. The root field identifies which node produces the final result.
- *
- * **Lifetime:** Base tables in inputs must remain valid until execute()
- * completes, since intermediate VARCHAR values encode references to their
- * pages.
+ * @brief Multi-way join plan: flat vector of PlanNodes + base tables.
+ * root indexes final result node. Base tables must outlive execute().
  */
 struct Plan {
     std::vector<PlanNode>
@@ -285,19 +219,7 @@ struct Plan {
     size_t root;                       /**< Index of root node in nodes. */
 
     /**
-     * @brief Construct a new JoinNode in the plan tree.
-     *
-     * @param build_left   Optimizer hint: prefer left child as build side.
-     * @param left         Index of left child in Plan::nodes.
-     * @param right        Index of right child in Plan::nodes.
-     * @param left_attr    Join key: index into left child's output_attrs.
-     * @param right_attr   Join key: index into right child's output_attrs.
-     * @param output_attrs Projection: (combined_index, type) pairs where
-     *                     indices [0, left_size) refer to left child output,
-     *                     indices [left_size, ...) refer to right child output.
-     * @return Index of the newly created node in Plan::nodes.
-     *
-     * @note Execution may override build_left based on actual cardinalities.
+     * @brief Create JoinNode. @return node index. Execution may override build_left.
      */
     size_t
     new_join_node(bool build_left, size_t left, size_t right, size_t left_attr,
@@ -315,18 +237,7 @@ struct Plan {
         return ret;
     }
 
-    /**
-     * @brief Construct a new ScanNode (leaf) in the plan tree.
-     *
-     * @param base_table_id Index into Plan::inputs identifying the base table.
-     * @param output_attrs  Projection: (column_index, type) pairs where
-     *                      column_index refers to columns in the base table.
-     * @return Index of the newly created node in Plan::nodes.
-     *
-     * @note ScanNodes return non-owning pointers to ColumnarTable during
-     *       execution; base tables must remain valid until final
-     * materialization.
-     */
+    /** @brief Create ScanNode (leaf). @return node index. */
     size_t
     new_scan_node(size_t base_table_id,
                   std::vector<std::tuple<size_t, DataType>> output_attrs) {
@@ -336,15 +247,7 @@ struct Plan {
         return ret;
     }
 
-    /**
-     * @brief Add a pre-loaded base table to the plan.
-     *
-     * @param input ColumnarTable to add (ownership transferred via move).
-     * @return Index of the table in Plan::inputs, used by ScanNode.
-     *
-     * @note Base tables must remain valid until execute() completes since
-     *       intermediate VARCHAR values encode references to their pages.
-     */
+    /** @brief Add base table (moved). @return index for ScanNode. */
     size_t new_input(ColumnarTable input) {
         auto ret = inputs.size();
         inputs.emplace_back(std::move(input));
@@ -353,28 +256,12 @@ struct Plan {
 };
 
 /**
- * @brief Helper for building ColumnarTable columns incrementally.
+ * @brief Incremental column builder: page alloc, insert, bitmap, auto-finalize.
  *
- * Handles page allocation, value insertion, null bitmap management, and
- * automatic page finalization when capacity is reached. Template specialization
- * on value type enables type-specific optimizations.
+ * INT32: [num_rows:u16][num_values:u16][values...][bitmap at end].
+ * Overflow detection finalizes current page and allocates next.
  *
- * **INT32 page format (base template):**
- * - [0-1]: num_rows (u16) - total rows including NULLs
- * - [2-3]: num_values (u16) - count of non-NULL values
- * - [4+]: packed INT32 values (4 bytes each)
- * - [end-N]: validity bitmap (1=valid, 0=NULL)
- *
- * **Overflow detection:** Checks if data_end + sizeof(value) + bitmap_size
- * exceeds PAGE_SIZE before each insert. When overflow detected, finalizes
- * current page and allocates next.
- *
- * **Bitmap management:** Uses set_bitmap() to mark valid rows, unset_bitmap()
- * for NULLs. Bitmap written to page end during save_page().
- *
- * @tparam T Value type: int32_t for INT32 columns, std::string for VARCHAR.
- *
- * @see VarcharPageBuilder in page_builders.h for optimized materialization.
+ * @tparam T int32_t or std::string. @see page_builders.h for optimized variant.
  */
 template <class T> struct ColumnInserter {
     Column &column;
@@ -395,13 +282,7 @@ template <class T> struct ColumnInserter {
         bitmap.resize(PAGE_SIZE);
     }
 
-    /**
-     * @brief Get pointer to current working page, allocating if needed.
-     *
-     * @return Pointer to page data buffer.
-     *
-     * @note Does not advance last_page_idx; call save_page() to commit.
-     */
+    /** @brief Get current page, allocating if needed. Does not advance index. */
     std::byte *get_page() {
         if (last_page_idx == column.pages.size()) [[unlikely]] {
             column.new_page();
@@ -410,15 +291,7 @@ template <class T> struct ColumnInserter {
         return page->data;
     }
 
-    /**
-     * @brief Finalize current page and advance to next.
-     *
-     * Writes page header (num_rows, num_values), copies bitmap to page end,
-     * then resets builder state for next page. Appends finalized page to
-     * column.
-     *
-     * @note Bitmap stored at page end to avoid memmove when data grows forward.
-     */
+    /** @brief Finalize page (write header, bitmap) and advance to next. */
     void save_page() {
         auto *page = get_page();
         *reinterpret_cast<uint16_t *>(page) = num_rows;
@@ -443,15 +316,7 @@ template <class T> struct ColumnInserter {
         bitmap[byte_idx] &= ~(0x1 << bit_idx);
     }
 
-    /**
-     * @brief Insert a non-NULL value into the column.
-     *
-     * Checks for page overflow before insertion; finalizes current page
-     * if insufficient space. Writes value, updates bitmap, increments row
-     * count.
-     *
-     * @param value The value to insert.
-     */
+    /** @brief Insert non-NULL value; auto-finalizes on overflow. */
     void insert(T value) {
         if (data_end + 4 + num_rows / 8 + 1 > PAGE_SIZE) [[unlikely]] {
             save_page();
@@ -463,12 +328,7 @@ template <class T> struct ColumnInserter {
         ++num_rows;
     }
 
-    /**
-     * @brief Insert a NULL value into the column.
-     *
-     * Checks for page overflow (bitmap space only, no data space needed).
-     * Marks row as NULL in bitmap and increments row count.
-     */
+    /** @brief Insert NULL (bitmap only, no data). */
     void insert_null() {
         if (data_end + num_rows / 8 + 1 > PAGE_SIZE) [[unlikely]] {
             save_page();
@@ -477,12 +337,7 @@ template <class T> struct ColumnInserter {
         ++num_rows;
     }
 
-    /**
-     * @brief Complete column construction, flushing any partial page.
-     *
-     * Must be called after all inserts to ensure final page is written
-     * to the column. No-op if current page is empty.
-     */
+    /** @brief Flush partial page. Call after all inserts. */
     void finalize() {
         if (num_rows != 0) {
             save_page();
@@ -491,30 +346,12 @@ template <class T> struct ColumnInserter {
 };
 
 /**
- * @brief Specialization of ColumnInserter for VARCHAR columns.
+ * @brief VARCHAR ColumnInserter: offset array + backward string writing.
  *
- * Manages variable-length strings with offset arrays for indexed access.
- * Uses backward-writing strategy to avoid memmove when appending strings.
+ * Format: [num_rows:u16][num_offsets:u16][offsets:u16...][strings][bitmap].
+ * Long strings (>PAGE_SIZE-7): 0xFFFF (first), 0xFFFE (continuation).
  *
- * **VARCHAR page format:**
- * - [0-1]: num_rows (u16) - or 0xFFFF/0xFFFE for long strings
- * - [2-3]: num_offsets (u16) - count of offset entries
- * - [4+]: cumulative end offsets (u16 each)
- * - After offsets: packed string bytes (written backward from end)
- * - [end-N]: validity bitmap
- *
- * **Long string handling:** Strings exceeding (PAGE_SIZE - 7) bytes span
- * multiple pages with markers:
- * - First page: num_rows = 0xFFFF (65535)
- * - Continuation pages: num_rows = 0xFFFE (65534)
- * - These markers distinguish long strings from normal multi-row pages.
- *
- * **Backward writing:** Offsets written forward from byte 4, strings written
- * backward from page end (minus bitmap space). Avoids costly memmove operations
- * as more strings are added.
- *
- * @see VarcharPageBuilder in page_builders.h for optimized materialization.
- * @see intermediate.h for value_t encoding used during joins.
+ * @see page_builders.h VarcharPageBuilder, intermediate.h value_t encoding.
  */
 template <> struct ColumnInserter<std::string> {
     Column &column;
@@ -532,13 +369,7 @@ template <> struct ColumnInserter<std::string> {
         bitmap.resize(PAGE_SIZE);
     }
 
-    /**
-     * @brief Get pointer to current working page, allocating if needed.
-     *
-     * @return Pointer to page data buffer.
-     *
-     * @note Does not advance last_page_idx; call save_page() to commit.
-     */
+    /** @brief Get current page, allocating if needed. Does not advance index. */
     std::byte *get_page() {
         if (last_page_idx == column.pages.size()) [[unlikely]] {
             column.new_page();
@@ -547,18 +378,7 @@ template <> struct ColumnInserter<std::string> {
         return page->data;
     }
 
-    /**
-     * @brief Write a long string (> PAGE_SIZE - 7 bytes) across multiple pages.
-     *
-     * Splits string into chunks, marking first page with 0xFFFF and
-     * continuation pages with 0xFFFE. Each page stores chunk length in
-     * num_offsets field and data starting at offset 4.
-     *
-     * @param value The string to write (must exceed single-page capacity).
-     *
-     * @note Long strings bypass normal offset array and bitmap; entire page
-     *       (except 4-byte header) stores string data.
-     */
+    /** @brief Write long string (>PAGE_SIZE-7) across pages. 0xFFFF/0xFFFE markers. */
     void save_long_string(std::string_view value) {
         size_t offset = 0;
         auto first_page = true;
@@ -578,13 +398,7 @@ template <> struct ColumnInserter<std::string> {
         }
     }
 
-    /**
-     * @brief Finalize current VARCHAR page and advance to next.
-     *
-     * Writes header (num_rows, num_offsets), copies offset array (forward from
-     * byte 4), string data (from staging buffer), and bitmap (backward from
-     * end). Resets builder state for next page.
-     */
+    /** @brief Finalize VARCHAR page and advance. */
     void save_page() {
         auto *page = get_page();
         *reinterpret_cast<uint16_t *>(page) = num_rows;
@@ -599,38 +413,21 @@ template <> struct ColumnInserter<std::string> {
         offset_end = offset_begin();
     }
 
-    /**
-     * @brief Mark row as valid (non-NULL) in bitmap.
-     *
-     * @param idx Row index within current page (0-based).
-     */
+    /** @brief Mark row valid in bitmap. */
     void set_bitmap(size_t idx) {
         size_t byte_idx = idx / 8;
         size_t bit_idx = idx % 8;
         bitmap[byte_idx] |= (0x1 << bit_idx);
     }
 
-    /**
-     * @brief Mark row as NULL in bitmap.
-     *
-     * @param idx Row index within current page (0-based).
-     */
+    /** @brief Mark row NULL in bitmap. */
     void unset_bitmap(size_t idx) {
         size_t byte_idx = idx / 8;
         size_t bit_idx = idx % 8;
         bitmap[byte_idx] &= ~(0x1 << bit_idx);
     }
 
-    /**
-     * @brief Insert a non-NULL string into the column.
-     *
-     * For long strings (> PAGE_SIZE - 7), flushes current page and delegates
-     * to save_long_string(). For normal strings, checks overflow considering
-     * offset array, string data, and bitmap space. Appends cumulative offset
-     * to page and copies string to staging buffer.
-     *
-     * @param value The string to insert.
-     */
+    /** @brief Insert string. Long strings use save_long_string(). */
     void insert(std::string_view value) {
         if (value.size() > PAGE_SIZE - 7) {
             if (num_rows > 0) {
@@ -653,13 +450,7 @@ template <> struct ColumnInserter<std::string> {
         }
     }
 
-    /**
-     * @brief Insert a NULL value into the VARCHAR column.
-     *
-     * Checks for page overflow (no string data, just offset and bitmap space).
-     * Marks row as NULL in bitmap and increments row count. Offset array still
-     * grows to maintain 1:1 correspondence with row indices.
-     */
+    /** @brief Insert NULL (offset grows for row alignment). */
     void insert_null() {
         if (offset_end + data_size + num_rows / 8 + 1 > PAGE_SIZE)
             [[unlikely]] {
@@ -669,12 +460,7 @@ template <> struct ColumnInserter<std::string> {
         ++num_rows;
     }
 
-    /**
-     * @brief Complete column construction, flushing any partial page.
-     *
-     * Must be called after all inserts to ensure final page is written
-     * to the column. No-op if current page is empty.
-     */
+    /** @brief Flush partial page. Call after all inserts. */
     void finalize() {
         if (num_rows != 0) {
             save_page();
@@ -684,28 +470,12 @@ template <> struct ColumnInserter<std::string> {
 
 /**
  * @namespace Contest
- * @brief Contest execution API and timing instrumentation.
- *
- * Provides the main execution interface (execute()), context management
- * (build_context/destroy_context), and performance timing (TimingStats).
- * This is the primary public API for the join execution engine.
- *
- * Key functions:
- * - **build_context()**: Allocate worker pool and shared state.
- * - **execute()**: Run a query plan and return columnar results.
- * - **destroy_context()**: Release resources.
- *
- * @see Plan for query plan structure.
- * @see mema::column_t for intermediate result format.
+ * @brief Contest API: build_context/destroy_context, execute(), TimingStats.
+ * @see Plan, intermediate.h
  */
 namespace Contest {
 
-/**
- * @brief Performance timing breakdown for query execution.
- *
- * Captures millisecond-resolution timings for each execution phase.
- * Used for performance analysis and benchmark comparisons.
- */
+/** @brief Execution phase timing breakdown (ms resolution). */
 struct TimingStats {
     int64_t hashtable_build_ms = 0;  /**< Hash table construction time. */
     int64_t hash_join_probe_ms = 0;  /**< Parallel probe phase duration. */
@@ -723,18 +493,8 @@ void *build_context();
 void destroy_context(void *);
 
 /**
- * @brief Execute a multi-way join query plan.
- *
- * Traverses the plan tree depth-first, executing joins recursively.
- * Returns the final result as a ColumnarTable.
- *
- * @param plan      Query plan with nodes and pre-loaded base tables.
- * @param context   Execution context from build_context().
- * @param stats_out Optional output for timing breakdown.
- * @param show_detailed_timing If true, print timing to stderr.
- * @return Final join result in columnar format.
- *
- * @see execute.cpp for implementation details.
+ * @brief Execute plan depth-first, return ColumnarTable.
+ * @see execute.cpp for implementation.
  */
 ColumnarTable execute(const Plan &plan, void *context,
                       TimingStats *stats_out = nullptr,

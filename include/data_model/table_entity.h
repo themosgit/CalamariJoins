@@ -1,10 +1,8 @@
 /**
  * @file table_entity.h
- * @brief TableEntity identifier for referencing columns in query plans.
+ * @brief TableEntity: composite key (table + column index) for query plans.
  *
- * Provides a composite key type (table name + column index) used throughout
- * the query execution engine to identify specific columns. Includes hashing
- * support for use in hash maps and fmt formatting for debugging.
+ * Hashable, comparable, fmt-formattable.
  */
 
 #pragma once
@@ -16,21 +14,13 @@
 
 /**
  * @struct TableEntity
- * @brief Identifies a column by table name and column index.
+ * @brief Column reference: (table name, column index).
  *
- * Used in query plans to reference specific columns across joined tables.
- * Supports comparison operators for use in ordered containers and hashing
- * for unordered containers.
- *
- * ### Example
- * @code
- * TableEntity col1{"movies", 0};  // First column of movies table
- * TableEntity col2{"actors", 2};  // Third column of actors table
- * @endcode
+ * Supports comparison (ordered containers), hashing (unordered containers).
  */
 struct TableEntity {
-    std::string table; ///< Table name (or alias in query).
-    int id;            ///< Zero-based column index within the table.
+    std::string table; ///< Table name/alias.
+    int id;            ///< 0-based column index.
 
     friend bool operator==(const TableEntity &left, const TableEntity &right);
     friend bool operator!=(const TableEntity &left, const TableEntity &right);
@@ -55,13 +45,7 @@ inline bool operator<(const TableEntity &left, const TableEntity &right) {
     }
 }
 
-/**
- * @brief std::hash specialization for TableEntity.
- *
- * Enables use of TableEntity as a key in std::unordered_map and
- * std::unordered_set. Combines table name and id hashes using
- * hash_combine().
- */
+/** @brief std::hash for TableEntity (uses hash_combine). */
 namespace std {
 template <> struct hash<TableEntity> {
     size_t operator()(const TableEntity &te) const noexcept {
@@ -74,11 +58,7 @@ template <> struct hash<TableEntity> {
 
 } // namespace std
 
-/**
- * @brief fmt formatter for TableEntity.
- *
- * Formats as "(table, id)" for debug output.
- */
+/** @brief fmt formatter: outputs "(table, id)". */
 template <> struct fmt::formatter<TableEntity> {
     template <class ParseContext> constexpr auto parse(ParseContext &ctx) {
         return ctx.begin();

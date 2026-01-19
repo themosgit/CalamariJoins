@@ -2,25 +2,11 @@
  * @file page_builders.h
  * @brief Optimized page builders for materializing join results.
  *
- * Provides high-performance INT32 and VARCHAR column page construction during
- * parallel materialization. These builders optimize the hot path of
- * materialize_column() by minimizing branches, avoiding memory copies, and
- * batching expensive operations.
+ * INT32 and VARCHAR builders with amortized overflow checking, bitmap
+ * accumulation, and backward-writing strategy for VARCHAR.
  *
- * **Performance context:**
- * Materialization is often the final bottleneck after hash joins complete.
- * With millions of matches to write, every saved branch and memmove matters.
- * These builders achieve 2-3x speedup over the naive ColumnInserter approach.
- *
- * **Key optimizations implemented:**
- * - Amortized overflow checking: batch checks instead of per-insert validation
- * - Dense page fast path: skip bitmap accumulation when no NULLs present
- * - Backward writing for VARCHAR: avoid costly memmove when appending strings
- * - Pre-reserved offset gaps: eliminate dynamic growth during string insertion
- * - Zero-copy long string handling: memcpy entire source pages directly
- *
- * @see plan.h ColumnInserter for the base template these builders optimize
- * @see materialize.h materialize_column() for parallel usage pattern
+ * @see plan.h ColumnInserter for the base template these builders optimize.
+ * @see materialize.h materialize_column() for parallel usage pattern.
  */
 #pragma once
 
@@ -31,18 +17,7 @@
 #include <functional>
 #include <vector>
 
-/**
- * @namespace Contest::materialize
- * @brief Materialization of join results into columnar format.
- *
- * Key components in this file:
- * - get_string_view(): Zero-copy string access from VARCHAR pages
- * - BitmapAccumulator: Efficient bit packing for null validity bitmaps
- * - Int32PageBuilder: Amortized overflow checking for INT32 pages
- * - VarcharPageBuilder: Backward-writing strategy avoiding memmove
- *
- * @see materialize.h for parallel usage via materialize_column<>
- */
+/** @namespace Contest::materialize @brief Join result materialization. */
 namespace Contest::materialize {
 
 /** @brief Gets string data from a VARCHAR column page. */
@@ -62,21 +37,7 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
 /**
  * @brief Efficient bit packing accumulator for null validity bitmaps.
  *
- * Builds validity bitmaps incrementally during materialization, packing 8 bits
- * into each byte before flushing to the vector. This reduces overhead compared
- * to bit-by-bit vector growth and enables fast bulk writes to page memory.
- *
- * **Why this optimization:**
- * Naive approach would modify vector on every bit, triggering reallocs.
- * By accumulating 8 bits in a register before writing, we reduce vector ops
- * by 8x and improve cache locality (fewer scattered memory writes).
- *
- * **Usage pattern:**
- * 1. reserve() before processing chunk (pre-allocates exact capacity)
- * 2. add_bit() for each row (accumulates in pending_bits register)
- * 3. flush_to_memory() when page complete (memcpy entire bitmap at once)
- *
- * @note 8-byte alignment ensures efficient SIMD operations during flush.
+ * Accumulates 8 bits in register before writing to reduce vector ops by 8x.
  */
 struct alignas(8) BitmapAccumulator {
     std::vector<uint8_t> buffer;
@@ -118,69 +79,18 @@ struct alignas(8) BitmapAccumulator {
 /**
  * @brief Optimized builder for INT32 column pages during materialization.
  *
- * Constructs INT32 column pages with amortized overflow checking and efficient
- * bitmap accumulation. Significantly faster than ColumnInserter<int32_t> for
- * bulk materialization workloads.
+ * Uses amortized overflow checking and efficient bitmap accumulation.
+ * Page layout: [num_rows:u16][num_values:u16][values:i32...][bitmap at end].
  *
- * **Page layout:**
- * [num_rows:u16][num_values:u16][values:i32...][bitmap at end]
- * - Values grow forward from byte 4
- * - Bitmap stored at page end, growing backward (avoids memmove)
- *
- * **Optimization 1: Amortized overflow checking**
- * Checking page overflow on every insert adds a branch in the hot loop.
- * Instead, we calculate MIN_ROWS_PER_PAGE_CHECK as a conservative lower bound
- * on page capacity, then only check overflow every N rows. This reduces branch
- * mispredictions and enables better instruction pipelining.
- *
- * MIN_ROWS_PER_PAGE_CHECK = (PAGE_SIZE - 4 - 256) / 5
- * - Subtracts header (4 bytes) and max bitmap (256 bytes for 2048 rows)
- * - Divides by 5: worst case is 4 bytes (value) + 1 bit rounded up
- * - Result (~1575): guaranteed safe batch size before overflow possible
- *
- * **Optimization 2: Dense page fast path**
- * When num_rows == num_values (no NULLs), bitmap iteration can be skipped
- * during reads. Page checkers detect this and use faster memcpy loops.
- *
- * **Optimization 3: BitmapAccumulator**
- * Packs bits in a register before writing, reducing vector operations by 8x
- * compared to per-bit modification.
- *
- * **Typical usage (from materialize_column):**
- * @code
- * Int32PageBuilder builder(page_allocator);
- * builder.prepare(chunk_size);  // Reserve bitmap capacity
- * for (uint32_t row_id : matches) {
- *     builder.add(read_value(row_id));
- *     if (++rows_since_check >= MIN_ROWS_PER_PAGE_CHECK) {
- *         if (builder.should_check_overflow())
- *             builder.save_to_page(builder.current_page);
- *         rows_since_check = 0;
- *     }
- * }
- * builder.save_to_page(builder.current_page);  // Flush final partial page
- * @endcode
- *
- * @see plan.h ColumnInserter<int32_t> for the base template being optimized
- * @see materialize.h materialize_column() for parallel usage context
+ * @see plan.h ColumnInserter<int32_t> for the base template.
+ * @see materialize.h materialize_column() for parallel usage.
  */
 struct Int32PageBuilder {
     /**
      * @brief Conservative minimum rows before overflow check required.
      *
-     * Value: (8192 - 4 - 256) / 5 = 1585 rows
-     * - 8192: PAGE_SIZE
-     * - 4: header bytes (num_rows + num_values)
-     * - 256: max bitmap size (2048 rows / 8 bits/byte)
-     * - 5: worst-case bytes per row (4 byte value + 1/8 byte bitmap, rounded
-     * up)
-     *
-     * **Why batch checking:**
-     * Per-insert overflow checks add ~5-10% overhead due to branch
-     * misprediction in tight loops processing millions of rows. By batching
-     * checks every 1585 rows, we amortize this cost while guaranteeing safety
-     * (page cannot overflow within this interval given worst-case space
-     * consumption).
+     * Value: (8192 - 4 - 256) / 5 = 1585 rows. Amortizes overflow checking
+     * to reduce branch misprediction in tight loops.
      */
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = (PAGE_SIZE - 4 - 256) / 5;
 
@@ -237,129 +147,27 @@ struct Int32PageBuilder {
 /**
  * @brief Optimized builder for VARCHAR column pages during materialization.
  *
- * Constructs VARCHAR column pages using backward-writing strategy and
- * pre-reserved offset gaps to avoid expensive memory moves. Handles long
- * strings (> single page capacity) with zero-copy page references.
+ * Uses backward-writing strategy and pre-reserved offset gaps to avoid memmove.
+ * Handles long strings (> page capacity) with zero-copy page references.
+ * Page layout:
+ * [num_rows:u16][num_values:u16][offsets:u16...][GAP][strings...][bitmap].
  *
- * **Page layout:**
- * [num_rows:u16][num_values:u16][offsets:u16...][GAP][strings...][bitmap]
- * - Offsets written forward from byte 4 (cumulative end offsets)
- * - Strings written backward from (4 + OFFSET_GAP_SIZE), growing toward offsets
- * - Bitmap stored at page end
- *
- * **Optimization 1: Backward writing strategy**
- * ColumnInserter<std::string> accumulates strings in a staging buffer, then
- * does a final memmove to compact them after offsets. For large result sets,
- * this memmove becomes a bottleneck (copying GBs of string data).
- *
- * Solution: Write strings backward from a pre-reserved gap. As strings arrive,
- * append them backward (string_write_ptr += len). Offsets grow forward. When
- * the gap closes, finalize the page. At finalize time, only ONE memmove is
- * needed to shift strings left to close the gap.
- *
- * **Why this is faster:**
- * - Eliminates per-string memmove operations
- * - Strings already nearly in final position (minimal shift at finalize)
- * - Better cache behavior: sequential forward writes for strings
- *
- * **Optimization 2: Pre-reserved offset gap (OFFSET_GAP_SIZE)**
- * Value: 2048 bytes = space for 1024 offset entries (u16 each)
- *
- * **Why pre-reserve:**
- * Without a gap, offsets and strings compete for the same memory region.
- * Each new offset requires shifting all existing strings rightward (O(N²)).
- * By reserving 2KB upfront, we guarantee space for ~1000 strings per page
- * without any shifting until finalization.
- *
- * **Trade-off:**
- * - Cost: 2KB wasted per page if page has few strings
- * - Benefit: Zero memmove overhead for typical pages (most have 100-500
- * strings)
- * - Net: 3-5x speedup on VARCHAR-heavy workloads
- *
- * For very long strings (> PAGE_SIZE - 2048), we dynamically reduce the gap
- * to 256 bytes to fit the string.
- *
- * **Optimization 3: Zero-copy long string handling**
- * Strings exceeding single-page capacity (> PAGE_SIZE - 512) are handled
- * specially to avoid buffer copies:
- *
- * - copy_long_string_pages(): If source already uses multi-page encoding
- *   (0xFFFF/0xFFFE markers), memcpy entire source pages directly to output.
- *   This is a zero-copy operation relative to the string data itself.
- *
- * - save_long_string_buffer(): If source is a normal page with one huge string,
- *   split it across multiple pages using 0xFFFF (first) and 0xFFFE
- *   (continuation) markers. Each page stores up to (PAGE_SIZE - 4) bytes.
- *
- * **Why fast:**
- * Long strings dominate materialization time if handled naively (concatenate
- * to buffer, then split). By directly copying/splitting into final page format,
- * we avoid intermediate allocations and enable bulk memcpy operations.
- *
- * **Optimization 4: Amortized overflow checking**
- * MIN_ROWS_PER_PAGE_CHECK = 100 rows
- *
- * **Why this value:**
- * VARCHAR pages fill faster than INT32 due to variable-length data, so we
- * check more frequently (100 vs 1585 for INT32). However, checking every
- * insert is still too expensive. 100-row batches provide good balance:
- * - Typical strings (10-50 bytes): ~50-100 fit per page, so batch ≈ page size
- * - Ensures overflow detected within 1-2 batches of page becoming full
- *
- * **Typical usage (from materialize_column):**
- * @code
- * VarcharPageBuilder builder(source_column, page_allocator);
- * builder.prepare(chunk_size);
- * for (uint32_t row_id : matches) {
- *     bool flushed = builder.add(read_value(row_id));
- *     if (!flushed && ++rows_since_check >= MIN_ROWS_PER_PAGE_CHECK) {
- *         if (builder.should_check_overflow())
- *             builder.save_to_page(builder.current_page);
- *         rows_since_check = 0;
- *     }
- * }
- * builder.save_to_page(builder.current_page);
- * @endcode
- *
- * @see get_string_view for reading source string data from pages
- * @see plan.h ColumnInserter<std::string> for the base template being optimized
- * @see materialize.h materialize_column() for parallel usage context
+ * @see get_string_view for reading source string data.
+ * @see plan.h ColumnInserter<std::string> for the base template.
+ * @see materialize.h materialize_column() for parallel usage.
  */
 struct VarcharPageBuilder {
     /**
-     * @brief Pre-reserved gap between offset array and string data region.
+     * @brief Pre-reserved gap (2048 bytes) between offsets and string data.
      *
-     * Value: 2048 bytes = capacity for 1024 offset entries (u16 each)
-     *
-     * **Purpose:**
-     * Prevents offset array and string data from competing for space during
-     * incremental page construction. Without this gap, each new offset would
-     * require memmove-ing all existing strings rightward (O(N²) complexity).
-     *
-     * **Why 2048:**
-     * - Typical page holds 100-500 strings (average 20-80 bytes each)
-     * - 1024 offsets covers this range with headroom
-     * - Trade-off: 2KB overhead per page (acceptable for 8KB pages)
-     * - For pages with very long strings, gap dynamically shrinks to 256 bytes
+     * Prevents O(N²) memmove during incremental construction.
      */
     static constexpr size_t OFFSET_GAP_SIZE = 2048;
 
     /**
      * @brief Rows to process before checking page overflow.
      *
-     * Value: 100 rows
-     *
-     * **Why 100 (vs 1585 for INT32):**
-     * VARCHAR pages fill faster due to variable-length data. Typical string
-     * (20-50 bytes) + offset (2 bytes) = 22-52 bytes per row. This means:
-     * - ~100-300 rows per page (vs ~1500+ for INT32)
-     * - Need more frequent checks to avoid overflow
-     * - 100-row batch ≈ typical page capacity, ensuring timely detection
-     *
-     * **Trade-off:**
-     * More frequent checks (every 100 vs 1585) add slight overhead, but
-     * necessary given higher variance in VARCHAR page fill rates.
+     * Value: 100 rows (vs 1585 for INT32 due to variable-length data).
      */
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = 100;
 
@@ -492,26 +300,7 @@ struct VarcharPageBuilder {
         current_char_bytes = 0;
     }
 
-    /**
-     * @brief Finalize page by writing header, offsets, strings, and bitmap.
-     *
-     * **Memory layout transformation:**
-     * During construction:
-     *   [header][offsets...][GAP][...strings growing backward]
-     * After finalization:
-     *   [header][offsets...][strings...][bitmap]
-     *
-     * **Why single memmove:**
-     * Strings were written backward from (4 + OFFSET_GAP_SIZE). Now we know
-     * the final offset array size, so we shift strings left to eliminate the
-     * gap. This is ONE bulk move instead of per-string moves during insertion.
-     *
-     * **Gap calculation:**
-     * - chars_start_actual: where strings should start (4 + offsets_size)
-     * - chars_gap_end: where backward writing ended (string_write_ptr)
-     * - Distance to move: chars_gap_end - current_char_bytes →
-     * chars_start_actual
-     */
+    /** @brief Finalize page: write header, compact strings, write bitmap. */
     void finalize_page() {
         uint8_t *page_base = reinterpret_cast<uint8_t *>(current_page->data);
         size_t offsets_size = offsets.size() * 2;
@@ -535,21 +324,8 @@ struct VarcharPageBuilder {
     }
 
     /**
-     * @brief Zero-copy handling for multi-page strings already in page format.
-     *
-     * When source column contains a long string that's already split across
-     * pages with 0xFFFF/0xFFFE markers, we can directly memcpy those pages
-     * to output instead of reconstructing the string.
-     *
-     * **Marker semantics:**
-     * - 0xFFFF (65535): First page of multi-page string
-     * - 0xFFFE (65534): Continuation page of multi-page string
-     * - Normal page: num_rows < 65534
-     *
-     * **Why zero-copy:**
-     * Alternative would be: read all chunks → concatenate → re-split → write.
-     * Direct page copy eliminates the concatenation step entirely, saving
-     * both time and temporary memory allocation for large strings.
+     * @brief Zero-copy handling for multi-page strings with 0xFFFF/0xFFFE
+     * markers.
      *
      * @param start_page_idx Index of first page (marked 0xFFFF) in src_col.
      */
@@ -573,24 +349,10 @@ struct VarcharPageBuilder {
     }
 
     /**
-     * @brief Split a large string buffer across multiple pages.
+     * @brief Split large string across pages with 0xFFFF/0xFFFE markers.
      *
-     * For strings exceeding single-page capacity (> PAGE_SIZE - 512) that
-     * are NOT already in multi-page format, split them into chunks and mark
-     * with 0xFFFF (first) / 0xFFFE (continuation) markers.
-     *
-     * **Page format for long strings:**
-     * - Bytes 0-1: 0xFFFF (first page) or 0xFFFE (continuation)
-     * - Bytes 2-3: chunk length (u16)
-     * - Bytes 4+: string data (up to PAGE_SIZE - 4 bytes per page)
-     *
-     * **Why this encoding:**
-     * Distinguishes long strings from normal multi-row pages (which have
-     * num_rows < 65534). Readers check for 0xFFFF/0xFFFE and follow
-     * continuation pages to reconstruct the full string.
-     *
-     * @param data_ptr Pointer to start of large string buffer.
-     * @param total_len Total length of string in bytes.
+     * @param data_ptr Pointer to start of string buffer.
+     * @param total_len Total string length in bytes.
      */
     void save_long_string_buffer(const char *data_ptr, size_t total_len) {
         size_t offset = 0;
