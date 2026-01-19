@@ -1,3 +1,19 @@
+/**
+ * @file inner_column.h
+ * @brief Flat columnar storage with parallel filter evaluation for CSV loading.
+ *
+ * Unlike ColumnarTable (8KB pages), uses flat vectors with packed null bitmaps
+ * for SIMD-style filtering during CSV load.
+ *
+ * - InnerColumn<T>: contiguous data + 1-bit/row null bitmap, parallel comparisons
+ * - InnerColumn<string>: flat char buffer + offset array for VARCHARs
+ * - FilterThreadPool: partitions work by bitmap bytes (8 rows/unit)
+ *
+ * Null semantics: comparisons with NULL return false (SQL three-valued logic).
+ *
+ * @see ColumnarTable, Statement
+ */
+
 #pragma once
 #include <condition_variable>
 #include <functional>
@@ -10,22 +26,32 @@
 #include "statement.h"
 #include <foundation/attribute.h>
 
+/**
+ * @struct FilterThreadPool
+ * @brief Thread pool for parallel filter evaluation during CSV loading.
+ *
+ * Per-thread mutex/CV synchronization. Work partitioned by bitmap byte (8 rows).
+ * Simpler than Contest::WorkerPool, specialized for filter predicates.
+ */
 struct FilterThreadPool {
-    std::vector<std::thread> threads;
-    std::vector<std::unique_ptr<std::mutex>> mtxes;
-    std::vector<std::unique_ptr<std::condition_variable>> cvs;
-    std::vector<uint8_t> has_function;
-    std::vector<uint8_t> finished;
-    std::vector<uint8_t> destructed;
-    std::function<void(size_t, size_t)> function;
-    size_t num_tasks;
+    std::vector<std::thread> threads;               ///< Worker threads.
+    std::vector<std::unique_ptr<std::mutex>> mtxes; ///< Per-thread mutexes.
+    std::vector<std::unique_ptr<std::condition_variable>>
+        cvs;                           ///< Per-thread CVs.
+    std::vector<uint8_t> has_function; ///< True if thread has work pending.
+    std::vector<uint8_t> finished;   ///< True if thread finished current work.
+    std::vector<uint8_t> destructed; ///< True to signal thread shutdown.
+    std::function<void(size_t, size_t)> function; ///< Current task to execute.
+    size_t num_tasks; ///< Total number of work units.
 
+    /** @brief Starting task index for thread (even distribution, remainder to earlier). */
     size_t begin_idx(size_t thread_id) {
         size_t base = num_tasks / threads.size();
         size_t rem = num_tasks % threads.size();
         return thread_id * base + std::min(thread_id, rem);
     }
 
+    /** @brief Worker loop: wait → execute range → signal done. Exits on destructed. */
     void run_loop(size_t thread_id) {
         auto &mtx = *mtxes[thread_id];
         auto &cv = *cvs[thread_id];
@@ -49,6 +75,7 @@ struct FilterThreadPool {
         }
     }
 
+    /** @brief Spawn num_threads workers. */
     FilterThreadPool(unsigned num_threads) {
         for (unsigned i = 0; i < num_threads; ++i) {
             mtxes.emplace_back(std::make_unique<std::mutex>());
@@ -67,6 +94,7 @@ struct FilterThreadPool {
     FilterThreadPool &operator=(const FilterThreadPool &) = delete;
     FilterThreadPool &operator=(FilterThreadPool &&) = delete;
 
+    /** @brief Signal shutdown and join all workers. */
     ~FilterThreadPool() {
         for (size_t i = 0; i < threads.size(); ++i) {
             auto &mtx = *mtxes[i];
@@ -82,6 +110,7 @@ struct FilterThreadPool {
         }
     }
 
+    /** @brief Execute function(begin, end) in parallel. Blocks until complete. */
     void run(std::function<void(size_t, size_t)> function, size_t num_tasks) {
         this->function = std::move(function);
         this->num_tasks = num_tasks;
@@ -104,17 +133,32 @@ struct FilterThreadPool {
     }
 };
 
+/// Global filter thread pool (12 threads) for CSV loading.
 inline FilterThreadPool filter_tp(12);
 
+/**
+ * @struct InnerColumnBase
+ * @brief Type-erased column base. Runtime type tag for downcasting.
+ */
 struct InnerColumnBase {
-    DataType type;
+    DataType type; ///< Runtime type tag.
 
     InnerColumnBase(DataType type) : type(type) {}
-
     virtual ~InnerColumnBase() {}
 };
 
+/**
+ * @struct InnerColumn
+ * @brief Typed column: contiguous data vector + packed null bitmap.
+ *
+ * Parallel comparisons via filter_tp return result bitmaps (bit i=1 → match).
+ * NULL comparisons always false (SQL semantics).
+ *
+ * @tparam T int32_t, int64_t, or double.
+ * @see InnerColumn<std::string> for VARCHAR specialization.
+ */
 template <class T> struct InnerColumn : InnerColumnBase {
+    /** @brief DataType for T. */
     static constexpr DataType data_type() {
         if constexpr (std::is_same_v<T, int32_t>) {
             return DataType::INT32;
@@ -127,9 +171,10 @@ template <class T> struct InnerColumn : InnerColumnBase {
 
     InnerColumn() : InnerColumnBase(data_type()) {}
 
-    std::vector<T> data;
-    std::vector<uint8_t> bitmap;
+    std::vector<T> data;         ///< Column values (row index).
+    std::vector<uint8_t> bitmap; ///< Null bitmap (1 bit/row, packed).
 
+    /** @brief Update null bitmap for current row. */
     void bitmap_push_back(bool not_null) {
         if ((data.size() + 7) / 8 > bitmap.size()) {
             if (not_null) {
@@ -148,24 +193,32 @@ template <class T> struct InnerColumn : InnerColumnBase {
         }
     }
 
+    /** @brief Append non-null value. */
     void push_back(T value) {
         data.emplace_back(value);
         bitmap_push_back(true);
     }
 
+    /** @brief Append null. */
     void push_back_null() {
         data.emplace_back();
         bitmap_push_back(false);
     }
 
+    /** @brief True if row idx is non-null. */
     bool is_not_null(size_t idx) const {
         size_t byte_idx = idx / 8;
         size_t bit_idx = idx % 8;
         return bitmap[byte_idx] & (0x1 << bit_idx);
     }
 
+    /** @brief Value at idx (undefined if null). */
     T get(size_t idx) const { return data[idx]; }
 
+    /// @name Parallel Comparisons (return bitmap: bit i=1 → row i matches)
+    /// @{
+
+    /** @brief Rows where value < rhs. */
     std::vector<uint8_t> less(T rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, rhs, &ret](size_t byte_begin, size_t byte_end) {
@@ -177,6 +230,7 @@ template <class T> struct InnerColumn : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value > rhs. */
     std::vector<uint8_t> greater(T rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, rhs, &ret](size_t byte_begin, size_t byte_end) {
@@ -188,6 +242,7 @@ template <class T> struct InnerColumn : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value <= rhs. */
     std::vector<uint8_t> less_equal(T rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, rhs, &ret](size_t byte_begin, size_t byte_end) {
@@ -200,6 +255,7 @@ template <class T> struct InnerColumn : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value >= rhs. */
     std::vector<uint8_t> greater_equal(T rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, rhs, &ret](size_t byte_begin, size_t byte_end) {
@@ -212,6 +268,7 @@ template <class T> struct InnerColumn : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value == rhs. */
     std::vector<uint8_t> equal(T rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, rhs, &ret](size_t byte_begin, size_t byte_end) {
@@ -223,6 +280,7 @@ template <class T> struct InnerColumn : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value != rhs. */
     std::vector<uint8_t> not_equal(T rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, rhs, &ret](size_t byte_begin, size_t byte_end) {
@@ -234,6 +292,11 @@ template <class T> struct InnerColumn : InnerColumnBase {
         filter_tp.run(task, (data.size() + 7) / 8);
         return ret;
     }
+
+    /// @}
+
+    /// @name Low-level Kernels (static, batch comparison for parallel tasks)
+    /// @{
 
     static void less(const T *__restrict__ data,
                      const uint8_t *__restrict__ bitmap,
@@ -307,18 +370,29 @@ template <class T> struct InnerColumn : InnerColumnBase {
                  (static_cast<uint8_t>(data[i] != rhs) << bit_idx));
         }
     }
+
+    /// @}
 };
 
+/**
+ * @struct InnerColumn<std::string>
+ * @brief VARCHAR specialization: flat char buffer + offset array.
+ *
+ * String i = data[offsets[i-1]..offsets[i]). Same comparison interface
+ * as InnerColumn<T> plus LIKE/NOT LIKE pattern matching.
+ */
 template <> struct InnerColumn<std::string> : InnerColumnBase {
+    /** @brief Returns DataType::VARCHAR. */
     static constexpr DataType data_type() { return DataType::VARCHAR; }
 
     InnerColumn() : InnerColumnBase(data_type()) {}
 
-    std::vector<char> data;
-    std::vector<size_t> offsets;
-    std::vector<uint8_t> bitmap;
-    size_t row = 0;
+    std::vector<char> data;      ///< Concatenated string bytes.
+    std::vector<size_t> offsets; ///< End offset per string.
+    std::vector<uint8_t> bitmap; ///< Null bitmap (1 bit/row).
+    size_t row = 0;              ///< Row count.
 
+    /** @brief Update null bitmap for current row. */
     void bitmap_push_back(bool not_null) {
         if (row / 8 + 1 > bitmap.size()) {
             if (not_null) {
@@ -338,23 +412,27 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         row += 1;
     }
 
+    /** @brief Append non-null string. */
     void push_back(std::string_view value) {
         data.insert(data.end(), value.begin(), value.end());
         offsets.emplace_back(data.size());
         bitmap_push_back(true);
     }
 
+    /** @brief Append null. */
     void push_back_null() {
         offsets.emplace_back(data.size());
         bitmap_push_back(false);
     }
 
+    /** @brief True if row idx is non-null. */
     bool is_not_null(size_t idx) const {
         size_t byte_idx = idx / 8;
         size_t bit_idx = idx % 8;
         return bitmap[byte_idx] & (0x1 << bit_idx);
     }
 
+    /** @brief String view at idx (check is_not_null first). */
     std::string_view get(size_t idx) const {
         size_t begin;
         if (idx == 0) [[unlikely]] {
@@ -366,6 +444,10 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return std::string_view{data.data() + begin, end - begin};
     }
 
+    /// @name Parallel Comparisons (lexicographic, return bitmap)
+    /// @{
+
+    /** @brief Rows where value < rhs. */
     std::vector<uint8_t> less(std::string_view rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -390,6 +472,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value > rhs. */
     std::vector<uint8_t> greater(std::string_view rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -414,6 +497,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value <= rhs. */
     std::vector<uint8_t> less_equal(std::string_view rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -438,6 +522,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value >= rhs. */
     std::vector<uint8_t> greater_equal(std::string_view rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -462,6 +547,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value == rhs. */
     std::vector<uint8_t> equal(std::string_view rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -486,6 +572,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows where value != rhs. */
     std::vector<uint8_t> not_equal(std::string_view rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -510,6 +597,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows matching SQL LIKE pattern. % → .*, _ → . @see Comparison::like_match */
     std::vector<uint8_t> like(const std::string &rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -535,6 +623,7 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         return ret;
     }
 
+    /** @brief Rows NOT matching SQL LIKE pattern. */
     std::vector<uint8_t> not_like(const std::string &rhs) const {
         std::vector<uint8_t> ret(bitmap.size());
         auto task = [this, &ret, &rhs](size_t byte_begin, size_t byte_end) {
@@ -560,19 +649,30 @@ template <> struct InnerColumn<std::string> : InnerColumnBase {
         filter_tp.run(task, (row + 7) / 8);
         return ret;
     }
+    /// @}
 };
 
+/**
+ * @struct InnerTable
+ * @brief Owned collection of InnerColumns. Used during CSV load before
+ * conversion to ColumnarTable.
+ */
 struct InnerTable {
-    size_t rows;
-    std::vector<std::unique_ptr<InnerColumnBase>> columns;
+    size_t rows;                                           ///< Row count.
+    std::vector<std::unique_ptr<InnerColumnBase>> columns; ///< Owned columns.
 };
 
+/**
+ * @struct InnerTableView
+ * @brief Non-owning view into InnerTable columns for filter evaluation.
+ */
 struct InnerTableView {
-    size_t rows;
-    std::vector<const InnerColumnBase *> columns;
+    size_t rows;                                  ///< Row count.
+    std::vector<const InnerColumnBase *> columns; ///< Non-owning ptrs.
 
     InnerTableView() = default;
 
+    /** @brief Create view from InnerTable. */
     InnerTableView(const InnerTable &table) : rows(table.rows) {
         for (auto &c : table.columns) {
             columns.push_back(c.get());

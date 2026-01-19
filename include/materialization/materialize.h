@@ -1,3 +1,9 @@
+/**
+ * @file materialize.h
+ * @brief Materialization of join results into ColumnarTable format.
+ *
+ * Parallel materialization using per-thread page builders and mmap allocation.
+ */
 #pragma once
 
 #include <algorithm>
@@ -14,8 +20,29 @@
 #include <sys/mman.h>
 #include <vector>
 
-namespace Contest {
+/** @namespace Contest::materialize @brief Join result materialization. */
+namespace Contest::materialize {
 
+using Contest::ExecuteResult;
+using Contest::io::ColumnarReader;
+using Contest::join::JoinInput;
+using Contest::join::MatchCollector;
+using Contest::join::resolve_input_source;
+using Contest::platform::worker_pool;
+
+/**
+ * @brief Parallel materialization of a single output column from match results.
+ *
+ * Divides matches across threads, each building pages from preallocated mmap'd
+ * memory. Uses BuilderType (Int32PageBuilder/VarcharPageBuilder) for
+ * type-specific page construction.
+ *
+ * @tparam BuilderType     Int32PageBuilder or VarcharPageBuilder.
+ * @tparam ReaderFunc      Callable: (row_id, cursor) -> value_t.
+ * @tparam InitBuilderFunc Callable: (page_allocator) -> BuilderType.
+ * @param est_bytes_per_row Average bytes per row (4 for INT32, ~35 for
+ * VARCHAR).
+ */
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
 inline void
 materialize_column(Column &dest_col, const MatchCollector &collector,
@@ -119,6 +146,13 @@ materialize_column(Column &dest_col, const MatchCollector &collector,
     dest_col.assign_mapped_memory(mapped_mem);
 }
 
+/**
+ * @brief Materializes a single output column from join matches.
+ *
+ * Dispatcher that determines source location (columnar/intermediate,
+ * build/probe), selects page builder type, and invokes materialize_column<>.
+ * VARCHAR handling requires source Column pointer for string dereferencing.
+ */
 inline void materialize_single_column(
     Column &dest_col, size_t col_idx, size_t build_size,
     const MatchCollector &collector, const JoinInput &build_input,
@@ -182,6 +216,27 @@ inline void materialize_single_column(
         init, from_build, 35);
 }
 
+/**
+ * @brief Materializes all output columns into a new ColumnarTable.
+ *
+ * Dereferences VARCHAR value_t references into actual string bytes. Differs
+ * from construct_intermediate: outputs ColumnarTable (8KB pages) with copied
+ * strings vs ExecuteResult (16KB pages, value_t references).
+ *
+ * @param collector        Match collection from join execution.
+ * @param build_input      Build side data source.
+ * @param probe_input      Probe side data source.
+ * @param remapped_attrs   Output projection: (col_idx, DataType) pairs.
+ * @param build_node       Metadata for build side output_attrs mapping.
+ * @param probe_node       Metadata for probe side output_attrs mapping.
+ * @param build_size       Number of columns from build side.
+ * @param columnar_reader  PageIndex-accelerated reader for Column page access.
+ * @param plan             Full query plan for VARCHAR dereferencing.
+ * @return ColumnarTable with self-contained page data.
+ *
+ * @see construct_intermediate.h for creating intermediate ExecuteResult.
+ * @see page_builders.h for Int32PageBuilder and VarcharPageBuilder.
+ */
 inline ColumnarTable
 materialize(const MatchCollector &collector, const JoinInput &build_input,
             const JoinInput &probe_input,
@@ -210,6 +265,9 @@ materialize(const MatchCollector &collector, const JoinInput &build_input,
     }
     return result;
 }
+
+/** @brief Creates empty ColumnarTable with correct column types for zero-match
+ * case. */
 inline ColumnarTable create_empty_result(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs) {
     ColumnarTable empty_result;
@@ -220,4 +278,4 @@ inline ColumnarTable create_empty_result(
     return empty_result;
 }
 
-} // namespace Contest
+} // namespace Contest::materialize

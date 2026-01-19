@@ -1,0 +1,816 @@
+/* ============================================================
+   Ayu Theme for Doxygen Documentation
+   Inspired by https://github.com/ayu-theme/ayu-colors
+   
+   A modern, elegant theme with warm accents and excellent
+   readability for technical documentation.
+   ============================================================ */
+
+/* ============================================================
+   LIGHT MODE - Ayu Light
+   ============================================================ */
+html {
+  /* Page base colors */
+  --page-background-color: #fafafa;
+  --page-foreground-color: #5c6166;
+  --page-link-color: #f2ae49;
+  --page-visited-link-color: #e6a243;
+  --page-external-link-color: #fa8d3e;
+
+  /* Index */
+  --index-odd-item-bg-color: #f3f3f3;
+  --index-even-item-bg-color: #fafafa;
+  --index-header-color: #5c6166;
+  --index-separator-color: #d4d4d4;
+
+  /* Header */
+  --header-background-color: #f0f0f0;
+  --header-separator-color: #e1e1e1;
+  --group-header-separator-color: #e8e8e8;
+  --group-header-color: #fa8d3e;
+  --inherit-header-color: #787b80;
+
+  --footer-foreground-color: #787b80;
+  --footer-logo-width: 75px;
+  --citation-label-color: #fa8d3e;
+  --glow-color: #f2ae49;
+
+  --title-background-color: #fafafa;
+  --title-separator-color: #e1e1e1;
+  --directory-separator-color: #d4d4d4;
+  --separator-color: #fa8d3e;
+
+  --blockquote-background-color: #f5f5f5;
+  --blockquote-border-color: #f2ae49;
+
+  --scrollbar-thumb-color: #d4d4d4;
+  --scrollbar-background-color: #f0f0f0;
+
+  --icon-background-color: #fa8d3e;
+  --icon-foreground-color: #ffffff;
+  --icon-folder-open-fill-color: #f2ae49;
+  --icon-folder-fill-color: #ffcc80;
+  --icon-folder-border-color: #fa8d3e;
+  --icon-doc-fill-color: #e8e8e8;
+  --icon-doc-border-color: #399ee6;
+
+  /* Brief member declaration list */
+  --memdecl-background-color: #f5f5f5;
+  --memdecl-separator-color: #e8e8e8;
+  --memdecl-foreground-color: #5c6166;
+  --memdecl-template-color: #a37acc;
+  --memdecl-border-color: #e1e1e1;
+
+  /* Detailed member list */
+  --memdef-border-color: #e1e1e1;
+  --memdef-title-background-color: #f0f0f0;
+  --memdef-proto-background-color: #f5f5f5;
+  --memdef-proto-text-color: #5c6166;
+  --memdef-doc-background-color: #fafafa;
+  --memdef-param-name-color: #fa8d3e;
+  --memdef-template-color: #a37acc;
+
+  /* Tables */
+  --table-cell-border-color: #d4d4d4;
+  --table-header-background-color: #fa8d3e;
+  --table-header-foreground-color: #ffffff;
+
+  /* Labels */
+  --label-background-color: #fa8d3e;
+  --label-left-top-border-color: #f2ae49;
+  --label-right-bottom-border-color: #e6a243;
+  --label-foreground-color: #ffffff;
+
+  /* Navigation bar/tree/menu */
+  --nav-background-color: #f0f0f0;
+  --nav-foreground-color: #5c6166;
+  --nav-border-color: #e1e1e1;
+  --nav-breadcrumb-separator-color: #d4d4d4;
+  --nav-breadcrumb-active-bg: #ffffff;
+  --nav-breadcrumb-color: #fa8d3e;
+  --nav-breadcrumb-border-color: #e1e1e1;
+  --nav-splitbar-bg-color: #e8e8e8;
+  --nav-splitbar-handle-color: #d4d4d4;
+  --nav-font-size-level1: 13px;
+  --nav-font-size-level2: 11px;
+  --nav-font-size-level3: 10px;
+  --nav-text-normal-color: #5c6166;
+  --nav-text-hover-color: #fa8d3e;
+  --nav-text-active-color: #fa8d3e;
+  --nav-menu-button-color: #5c6166;
+  --nav-menu-background-color: #ffffff;
+  --nav-menu-foreground-color: #5c6166;
+  --nav-menu-active-bg: #f0eacd;
+  --nav-menu-active-color: #fa8d3e;
+  --nav-menu-toggle-color: rgba(92, 97, 102, 0.3);
+  --nav-arrow-color: #d4d4d4;
+  --nav-arrow-selected-color: #fa8d3e;
+
+  /* Sync icon */
+  --sync-icon-border-color: #e1e1e1;
+  --sync-icon-background-color: #f5f5f5;
+  --sync-icon-selected-background-color: #f0eacd;
+  --sync-icon-color: #d4d4d4;
+  --sync-icon-selected-color: #fa8d3e;
+
+  /* Table of contents */
+  --toc-background-color: #f5f5f5;
+  --toc-border-color: #e1e1e1;
+  --toc-header-color: #fa8d3e;
+
+  /* Search field */
+  --search-background-color: #ffffff;
+  --search-foreground-color: #787b80;
+  --search-active-color: #5c6166;
+  --search-filter-background-color: rgba(255, 255, 255, 0.95);
+  --search-filter-backdrop-filter: blur(8px);
+  --search-filter-foreground-color: #5c6166;
+  --search-filter-border-color: #e1e1e1;
+  --search-filter-highlight-text-color: #ffffff;
+  --search-filter-highlight-bg-color: #fa8d3e;
+  --search-results-foreground-color: #5c6166;
+  --search-results-background-color: rgba(255, 255, 255, 0.95);
+  --search-results-backdrop-filter: blur(8px);
+  --search-results-border-color: #e1e1e1;
+  --search-box-border-color: #d4d4d4;
+  --search-close-icon-bg-color: #787b80;
+  --search-close-icon-fg-color: #ffffff;
+
+  /* Code fragments - Ayu Light syntax colors */
+  --code-keyword-color: #fa8d3e;
+  --code-type-keyword-color: #399ee6;
+  --code-flow-keyword-color: #fa8d3e;
+  --code-comment-color: #787b80;
+  --code-preprocessor-color: #a37acc;
+  --code-string-literal-color: #86b300;
+  --code-char-literal-color: #4cbf99;
+  --code-xml-cdata-color: #5c6166;
+  --code-vhdl-digit-color: #a37acc;
+  --code-vhdl-char-color: #5c6166;
+  --code-vhdl-keyword-color: #fa8d3e;
+  --code-vhdl-logic-color: #e65050;
+  --code-link-color: #399ee6;
+  --code-external-link-color: #55b4d4;
+  --fragment-foreground-color: #5c6166;
+  --fragment-background-color: #f8f8f8;
+  --fragment-border-color: #e1e1e1;
+  --fragment-lineno-border-color: #e1e1e1;
+  --fragment-lineno-background-color: #f0f0f0;
+  --fragment-lineno-foreground-color: #787b80;
+  --fragment-lineno-link-fg-color: #787b80;
+  --fragment-lineno-link-bg-color: #e8e8e8;
+  --fragment-lineno-link-hover-fg-color: #fa8d3e;
+  --fragment-lineno-link-hover-bg-color: #f0eacd;
+  --fragment-copy-ok-color: #86b300;
+  --fragment-highlight-filter: -3;
+  --tooltip-foreground-color: #5c6166;
+  --tooltip-background-color: rgba(255, 255, 255, 0.95);
+  --tooltip-arrow-background-color: #ffffff;
+  --tooltip-border-color: #e1e1e1;
+  --tooltip-backdrop-filter: blur(8px);
+  --tooltip-doc-color: #787b80;
+  --tooltip-declaration-color: #86b300;
+  --tooltip-link-color: #399ee6;
+  --tooltip-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  --fold-line-color: #d4d4d4;
+
+  /* Font family - Modern system fonts */
+  --font-family-normal: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-family-monospace: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+  --font-family-nav: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-family-title: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-family-toc: 'Inter', system-ui, sans-serif;
+  --font-family-search: 'Inter', system-ui, sans-serif;
+  --font-family-icon: system-ui, sans-serif;
+  --font-family-tooltip: 'Inter', system-ui, sans-serif;
+
+  /* Special sections - Ayu-styled */
+  --warning-color-bg: #fff0f0;
+  --warning-color-hl: #e65050;
+  --warning-color-text: #b83030;
+  --note-color-bg: #fff8e6;
+  --note-color-hl: #f2ae49;
+  --note-color-text: #8a6d2b;
+  --todo-color-bg: #e6f4ff;
+  --todo-color-hl: #399ee6;
+  --todo-color-text: #2a6a9e;
+  --test-color-bg: #f0e6ff;
+  --test-color-hl: #a37acc;
+  --test-color-text: #6b4d99;
+  --deprecated-color-bg: #f5f5f5;
+  --deprecated-color-hl: #787b80;
+  --deprecated-color-text: #5c6166;
+  --bug-color-bg: #ffe6e6;
+  --bug-color-hl: #e65050;
+  --bug-color-text: #a03030;
+  --invariant-color-bg: #e6fff0;
+  --invariant-color-hl: #4cbf99;
+  --invariant-color-text: #2a7a5a;
+}
+
+/* ============================================================
+   DARK MODE - Ayu Dark (Mirage variant)
+   ============================================================ */
+html.dark-mode {
+  /* Page base colors */
+  --page-background-color: #0b0e14;
+  --page-foreground-color: #bfbdb6;
+  --page-link-color: #e6b450;
+  --page-visited-link-color: #d4a545;
+  --page-external-link-color: #ff8f40;
+
+  /* Index */
+  --index-odd-item-bg-color: #0d1017;
+  --index-even-item-bg-color: #0b0e14;
+  --index-header-color: #bfbdb6;
+  --index-separator-color: #1c2433;
+
+  /* Header */
+  --header-background-color: #0d1017;
+  --header-separator-color: #1c2433;
+  --group-header-separator-color: #232d3f;
+  --group-header-color: #e6b450;
+  --inherit-header-color: #626a73;
+
+  --footer-foreground-color: #626a73;
+  --footer-logo-width: 60px;
+  --citation-label-color: #e6b450;
+  --glow-color: #ff8f40;
+
+  --title-background-color: #0b0e14;
+  --title-separator-color: #1c2433;
+  --directory-separator-color: #232d3f;
+  --separator-color: #e6b450;
+
+  --blockquote-background-color: #0d1017;
+  --blockquote-border-color: #e6b450;
+
+  --scrollbar-thumb-color: #273747;
+  --scrollbar-background-color: #0d1017;
+
+  --icon-background-color: #e6b450;
+  --icon-foreground-color: #0b0e14;
+  --icon-folder-open-fill-color: #e6b450;
+  --icon-folder-fill-color: #ff8f40;
+  --icon-folder-border-color: #ffb454;
+  --icon-doc-fill-color: #232d3f;
+  --icon-doc-border-color: #59c2ff;
+
+  /* Brief member declaration list */
+  --memdecl-background-color: #0d1017;
+  --memdecl-separator-color: #1c2433;
+  --memdecl-foreground-color: #bfbdb6;
+  --memdecl-template-color: #d2a6ff;
+  --memdecl-border-color: #232d3f;
+
+  /* Detailed member list */
+  --memdef-border-color: #1c2433;
+  --memdef-title-background-color: #0f131a;
+  --memdef-proto-background-color: #0d1017;
+  --memdef-proto-text-color: #bfbdb6;
+  --memdef-doc-background-color: #0b0e14;
+  --memdef-param-name-color: #ffb454;
+  --memdef-template-color: #d2a6ff;
+
+  /* Tables */
+  --table-cell-border-color: #1c2433;
+  --table-header-background-color: #232d3f;
+  --table-header-foreground-color: #e6b450;
+
+  /* Labels */
+  --label-background-color: #e6b450;
+  --label-left-top-border-color: #ffb454;
+  --label-right-bottom-border-color: #d4a545;
+  --label-foreground-color: #0b0e14;
+
+  /* Navigation bar/tree/menu */
+  --nav-background-color: #0d1017;
+  --nav-foreground-color: #bfbdb6;
+  --nav-border-color: #1c2433;
+  --nav-breadcrumb-separator-color: #1c2433;
+  --nav-breadcrumb-active-bg: #131721;
+  --nav-breadcrumb-color: #e6b450;
+  --nav-breadcrumb-border-color: #232d3f;
+  --nav-splitbar-bg-color: #1c2433;
+  --nav-splitbar-handle-color: #273747;
+  --nav-font-size-level1: 13px;
+  --nav-font-size-level2: 11px;
+  --nav-font-size-level3: 10px;
+  --nav-text-normal-color: #8a9199;
+  --nav-text-hover-color: #e6b450;
+  --nav-text-active-color: #e6b450;
+  --nav-menu-button-color: #bfbdb6;
+  --nav-menu-background-color: #0b0e14;
+  --nav-menu-foreground-color: #bfbdb6;
+  --nav-menu-active-bg: #273747;
+  --nav-menu-active-color: #e6b450;
+  --nav-menu-toggle-color: rgba(191, 189, 182, 0.2);
+  --nav-arrow-color: #273747;
+  --nav-arrow-selected-color: #e6b450;
+
+  /* Sync icon */
+  --sync-icon-border-color: #1c2433;
+  --sync-icon-background-color: #0d1017;
+  --sync-icon-selected-background-color: #131721;
+  --sync-icon-color: #273747;
+  --sync-icon-selected-color: #e6b450;
+
+  /* Table of contents */
+  --toc-background-color: #0d1017;
+  --toc-border-color: #1c2433;
+  --toc-header-color: #e6b450;
+
+  /* Search field */
+  --search-background-color: #0b0e14;
+  --search-foreground-color: #626a73;
+  --search-active-color: #bfbdb6;
+  --search-filter-background-color: rgba(13, 16, 23, 0.95);
+  --search-filter-backdrop-filter: blur(8px);
+  --search-filter-foreground-color: #bfbdb6;
+  --search-filter-border-color: #1c2433;
+  --search-filter-highlight-text-color: #0b0e14;
+  --search-filter-highlight-bg-color: #e6b450;
+  --search-results-background-color: rgba(13, 16, 23, 0.95);
+  --search-results-foreground-color: #bfbdb6;
+  --search-results-backdrop-filter: blur(8px);
+  --search-results-border-color: #1c2433;
+  --search-box-border-color: #273747;
+  --search-close-icon-bg-color: #626a73;
+  --search-close-icon-fg-color: #0b0e14;
+
+  /* Code fragments - Ayu Dark syntax colors */
+  --code-keyword-color: #ff8f40;
+  --code-type-keyword-color: #59c2ff;
+  --code-flow-keyword-color: #ff8f40;
+  --code-comment-color: #626a73;
+  --code-preprocessor-color: #d2a6ff;
+  --code-string-literal-color: #aad94c;
+  --code-char-literal-color: #95e6cb;
+  --code-xml-cdata-color: #bfbdb6;
+  --code-vhdl-digit-color: #d2a6ff;
+  --code-vhdl-char-color: #bfbdb6;
+  --code-vhdl-keyword-color: #ff8f40;
+  --code-vhdl-logic-color: #f07178;
+  --code-link-color: #59c2ff;
+  --code-external-link-color: #39bae6;
+  --fragment-foreground-color: #bfbdb6;
+  --fragment-background-color: #0d1017;
+  --fragment-border-color: #1c2433;
+  --fragment-lineno-border-color: #1c2433;
+  --fragment-lineno-background-color: #0b0e14;
+  --fragment-lineno-foreground-color: #626a73;
+  --fragment-lineno-link-fg-color: #626a73;
+  --fragment-lineno-link-bg-color: #131721;
+  --fragment-lineno-link-hover-fg-color: #e6b450;
+  --fragment-lineno-link-hover-bg-color: #273747;
+  --fragment-copy-ok-color: #aad94c;
+  --fragment-highlight-filter: 5;
+  --tooltip-foreground-color: #bfbdb6;
+  --tooltip-background-color: rgba(13, 16, 23, 0.95);
+  --tooltip-arrow-background-color: #0d1017;
+  --tooltip-border-color: #1c2433;
+  --tooltip-backdrop-filter: blur(8px);
+  --tooltip-doc-color: #8a9199;
+  --tooltip-declaration-color: #aad94c;
+  --tooltip-link-color: #59c2ff;
+  --tooltip-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --fold-line-color: #273747;
+
+  /* Font family - Same as light mode */
+  --font-family-normal: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-family-monospace: 'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+  --font-family-nav: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-family-title: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-family-toc: 'Inter', system-ui, sans-serif;
+  --font-family-search: 'Inter', system-ui, sans-serif;
+  --font-family-icon: system-ui, sans-serif;
+  --font-family-tooltip: 'Inter', system-ui, sans-serif;
+
+  /* Special sections - Ayu Dark styled */
+  --warning-color-bg: #2a1515;
+  --warning-color-hl: #f07178;
+  --warning-color-text: #f5b3b3;
+  --note-color-bg: #2a2210;
+  --note-color-hl: #e6b450;
+  --note-color-text: #e6d5a8;
+  --todo-color-bg: #0d2035;
+  --todo-color-hl: #59c2ff;
+  --todo-color-text: #a3d5f5;
+  --test-color-bg: #1f1530;
+  --test-color-hl: #d2a6ff;
+  --test-color-text: #d9c4f5;
+  --deprecated-color-bg: #1a1c20;
+  --deprecated-color-hl: #626a73;
+  --deprecated-color-text: #8a9199;
+  --bug-color-bg: #2a1515;
+  --bug-color-hl: #f07178;
+  --bug-color-text: #f5b3b3;
+  --invariant-color-bg: #0d2520;
+  --invariant-color-hl: #95e6cb;
+  --invariant-color-text: #a8e6d5;
+}
+
+/* ============================================================
+   CUSTOM ENHANCEMENTS
+   Additional styling for a more modern look
+   ============================================================ */
+
+/* Import Inter font from Google Fonts (optional - falls back to system fonts) */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* Smooth transitions for theme switching */
+html {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Better text rendering */
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  line-height: 1.6;
+}
+
+/* -------------------- Typography -------------------- */
+
+/* Headings */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.title {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* Links - subtle underline on hover */
+a {
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+a:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* -------------------- Layout Enhancements -------------------- */
+
+/* Main content area - better spacing */
+.contents {
+  max-width: 960px;
+  padding: 1.5rem 2rem;
+}
+
+/* Paragraphs */
+.contents p {
+  margin-bottom: 1rem;
+}
+
+/* -------------------- Code Blocks -------------------- */
+
+/* Code fragment container */
+div.fragment, pre.fragment {
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+  overflow-x: auto;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+html.dark-mode div.fragment,
+html.dark-mode pre.fragment {
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+/* Inline code */
+code, .code {
+  border-radius: 4px;
+  padding: 0.15em 0.4em;
+  font-size: 0.9em;
+}
+
+/* Line numbers */
+.lineno {
+  padding-right: 1rem;
+  border-right: 1px solid var(--fragment-lineno-border-color);
+  margin-right: 1rem;
+}
+
+/* -------------------- Member Documentation -------------------- */
+
+/* Member title bar */
+.memtitle {
+  border-radius: 8px 8px 0 0;
+  padding: 0.75rem 1rem;
+  font-weight: 600;
+}
+
+/* Member prototype */
+.memproto {
+  border-radius: 0;
+  padding: 1rem;
+}
+
+/* Member item container */
+.memitem {
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+html.dark-mode .memitem {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+/* Member documentation */
+.memdoc {
+  padding: 1rem;
+  border-radius: 0 0 8px 8px;
+}
+
+/* -------------------- Tables -------------------- */
+
+/* Markdown tables */
+table.markdownTable {
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 1rem 0;
+  width: 100%;
+}
+
+table.markdownTable th {
+  padding: 0.75rem 1rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+table.markdownTable td {
+  padding: 0.75rem 1rem;
+}
+
+table.markdownTable tr:last-child td:first-child {
+  border-bottom-left-radius: 8px;
+}
+
+table.markdownTable tr:last-child td:last-child {
+  border-bottom-right-radius: 8px;
+}
+
+/* Field tables (parameter lists, etc.) */
+table.fieldtable {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* -------------------- Navigation -------------------- */
+
+/* Navigation tree */
+#nav-tree {
+  padding: 0.5rem;
+}
+
+#nav-tree .item {
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+  transition: background-color 0.15s ease;
+}
+
+#nav-tree .item:hover {
+  background-color: var(--nav-menu-active-bg);
+}
+
+/* Selected navigation item */
+#nav-tree .selected {
+  background-color: var(--nav-menu-active-bg);
+  font-weight: 500;
+}
+
+/* Navigation sync button */
+#nav-sync {
+  border-radius: 4px;
+}
+
+/* -------------------- Search -------------------- */
+
+/* Search box */
+#MSearchBox {
+  border-radius: 6px;
+  overflow: hidden;
+  transition: box-shadow 0.2s ease;
+}
+
+#MSearchBox:focus-within {
+  box-shadow: 0 0 0 2px var(--page-link-color);
+}
+
+/* Search field */
+#MSearchField {
+  padding: 0.5rem 0.75rem;
+}
+
+/* Search results dropdown */
+#MSearchResultsWindow {
+  border-radius: 8px;
+  margin-top: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+}
+
+html.dark-mode #MSearchResultsWindow {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* -------------------- Table of Contents -------------------- */
+
+/* TOC sidebar */
+div.toc {
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+div.toc h3 {
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+}
+
+div.toc ul {
+  padding-left: 1rem;
+}
+
+div.toc li {
+  margin: 0.25rem 0;
+}
+
+/* -------------------- Special Sections -------------------- */
+
+/* Warning, note, todo boxes */
+dl.warning,
+dl.note,
+dl.todo,
+dl.deprecated,
+dl.bug,
+dl.invariant {
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+  border-left-width: 4px;
+  border-left-style: solid;
+}
+
+dl.warning {
+  border-left-color: var(--warning-color-hl);
+}
+
+dl.note {
+  border-left-color: var(--note-color-hl);
+}
+
+dl.todo {
+  border-left-color: var(--todo-color-hl);
+}
+
+dl.deprecated {
+  border-left-color: var(--deprecated-color-hl);
+}
+
+dl.bug {
+  border-left-color: var(--bug-color-hl);
+}
+
+dl.invariant {
+  border-left-color: var(--invariant-color-hl);
+}
+
+/* -------------------- Buttons & Interactive Elements -------------------- */
+
+/* Dark mode toggle button */
+doxygen-dark-mode-toggle {
+  border-radius: 6px;
+  transition: transform 0.2s ease;
+}
+
+doxygen-dark-mode-toggle:hover {
+  transform: scale(1.1);
+}
+
+/* Copy button on code blocks */
+button.copy-code {
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+  opacity: 0.6;
+  transition: opacity 0.2s ease;
+}
+
+button.copy-code:hover {
+  opacity: 1;
+}
+
+/* -------------------- Blockquotes -------------------- */
+
+blockquote {
+  border-radius: 0 8px 8px 0;
+  padding: 1rem 1.5rem;
+  margin: 1rem 0;
+  border-left-width: 4px;
+  border-left-style: solid;
+}
+
+/* -------------------- Images & Diagrams -------------------- */
+
+.image {
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* -------------------- Breadcrumbs -------------------- */
+
+.navpath ul {
+  border-radius: 6px;
+  padding: 0.5rem 1rem;
+}
+
+.navpath li {
+  padding: 0.25rem 0;
+}
+
+/* -------------------- Footer -------------------- */
+
+.footer {
+  padding: 1.5rem 2rem;
+  margin-top: 2rem;
+  text-align: center;
+  font-size: 0.875rem;
+}
+
+/* -------------------- Responsive Adjustments -------------------- */
+
+@media (max-width: 768px) {
+  .contents {
+    padding: 1rem;
+  }
+  
+  table.markdownTable {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+/* -------------------- Scrollbar Styling -------------------- */
+
+/* For WebKit browsers */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-background-color);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb-color);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--page-link-color);
+}
+
+/* -------------------- Selection Highlighting -------------------- */
+
+::selection {
+  background-color: var(--page-link-color);
+  color: var(--page-background-color);
+}
+
+html.dark-mode ::selection {
+  background-color: var(--page-link-color);
+  color: var(--page-background-color);
+}
+
+/* -------------------- Print Styles -------------------- */
+
+@media print {
+  /* Reset to light colors for printing */
+  html, html.dark-mode {
+    --page-background-color: white;
+    --page-foreground-color: black;
+    --fragment-background-color: #f5f5f5;
+    --fragment-foreground-color: black;
+  }
+  
+  /* Remove shadows */
+  .memitem, #MSearchResultsWindow {
+    box-shadow: none;
+  }
+  
+  /* Ensure links are visible */
+  a {
+    text-decoration: underline;
+  }
+}

@@ -1,3 +1,13 @@
+/**
+ * @file page_builders.h
+ * @brief Optimized page builders for materializing join results.
+ *
+ * INT32 and VARCHAR builders with amortized overflow checking, bitmap
+ * accumulation, and backward-writing strategy for VARCHAR.
+ *
+ * @see plan.h ColumnInserter for the base template these builders optimize.
+ * @see materialize.h materialize_column() for parallel usage pattern.
+ */
 #pragma once
 
 #include <algorithm>
@@ -7,14 +17,10 @@
 #include <functional>
 #include <vector>
 
-namespace Contest {
+/** @namespace Contest::materialize @brief Join result materialization. */
+namespace Contest::materialize {
 
-/**
- *
- *  helper to get string data from a varchar column page
- *  returns pointer to string start and its length
- *
- **/
+/** @brief Gets string data from a VARCHAR column page. */
 inline std::pair<const char *, uint16_t>
 get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
     auto *page = reinterpret_cast<uint8_t *>(src_col.pages[page_idx]->data);
@@ -29,11 +35,10 @@ get_string_view(const Column &src_col, int32_t page_idx, int32_t offset_idx) {
 }
 
 /**
+ * @brief Efficient bit packing accumulator for null validity bitmaps.
  *
- *  accumulates validity bits for nullable columns
- *  flushes to page bitmap location when complete
- *
- **/
+ * Accumulates 8 bits in register before writing to reduce vector ops by 8x.
+ */
 struct alignas(8) BitmapAccumulator {
     std::vector<uint8_t> buffer;
     uint8_t pending_bits = 0;
@@ -72,12 +77,21 @@ struct alignas(8) BitmapAccumulator {
 };
 
 /**
+ * @brief Optimized builder for INT32 column pages during materialization.
  *
- *  builds pages for INT32 columns during materialization
- *  handles null bitmap and page overflow detection
+ * Uses amortized overflow checking and efficient bitmap accumulation.
+ * Page layout: [num_rows:u16][num_values:u16][values:i32...][bitmap at end].
  *
- **/
+ * @see plan.h ColumnInserter<int32_t> for the base template.
+ * @see materialize.h materialize_column() for parallel usage.
+ */
 struct Int32PageBuilder {
+    /**
+     * @brief Conservative minimum rows before overflow check required.
+     *
+     * Value: (8192 - 4 - 256) / 5 = 1585 rows. Amortizes overflow checking
+     * to reduce branch misprediction in tight loops.
+     */
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = (PAGE_SIZE - 4 - 256) / 5;
 
     Page *current_page = nullptr;
@@ -131,14 +145,30 @@ struct Int32PageBuilder {
 };
 
 /**
+ * @brief Optimized builder for VARCHAR column pages during materialization.
  *
- *  builds pages for VARCHAR columns during materialization
- *  handles variable-length strings, long strings spanning multiple pages,
- *  null bitmap, and page overflow detection
+ * Uses backward-writing strategy and pre-reserved offset gaps to avoid memmove.
+ * Handles long strings (> page capacity) with zero-copy page references.
+ * Page layout:
+ * [num_rows:u16][num_values:u16][offsets:u16...][GAP][strings...][bitmap].
  *
- **/
+ * @see get_string_view for reading source string data.
+ * @see plan.h ColumnInserter<std::string> for the base template.
+ * @see materialize.h materialize_column() for parallel usage.
+ */
 struct VarcharPageBuilder {
+    /**
+     * @brief Pre-reserved gap (2048 bytes) between offsets and string data.
+     *
+     * Prevents O(N²) memmove during incremental construction.
+     */
     static constexpr size_t OFFSET_GAP_SIZE = 2048;
+
+    /**
+     * @brief Rows to process before checking page overflow.
+     *
+     * Value: 100 rows (vs 1585 for INT32 due to variable-length data).
+     */
     static constexpr size_t MIN_ROWS_PER_PAGE_CHECK = 100;
 
     Page *current_page = nullptr;
@@ -247,6 +277,8 @@ struct VarcharPageBuilder {
     }
 
   private:
+    /** @brief Initialize a new page with gap-based layout for backward writing.
+     */
     void init_new_page() {
         current_page = alloc_page();
         current_gap_size = OFFSET_GAP_SIZE;
@@ -257,6 +289,7 @@ struct VarcharPageBuilder {
         offsets.clear();
     }
 
+    /** @brief Finalize current page if non-empty and reset builder state. */
     void flush_current_page() {
         if (current_page && num_rows > 0) {
             finalize_page();
@@ -267,6 +300,7 @@ struct VarcharPageBuilder {
         current_char_bytes = 0;
     }
 
+    /** @brief Finalize page: write header, compact strings, write bitmap. */
     void finalize_page() {
         uint8_t *page_base = reinterpret_cast<uint8_t *>(current_page->data);
         size_t offsets_size = offsets.size() * 2;
@@ -289,6 +323,12 @@ struct VarcharPageBuilder {
         bitmap.flush_to_memory(page_base + PAGE_SIZE - bmp_size);
     }
 
+    /**
+     * @brief Zero-copy handling for multi-page strings with 0xFFFF/0xFFFE
+     * markers.
+     *
+     * @param start_page_idx Index of first page (marked 0xFFFF) in src_col.
+     */
     void copy_long_string_pages(int32_t start_page_idx) {
         int32_t curr_idx = start_page_idx;
         while (true) {
@@ -308,6 +348,12 @@ struct VarcharPageBuilder {
         current_page = nullptr;
     }
 
+    /**
+     * @brief Split large string across pages with 0xFFFF/0xFFFE markers.
+     *
+     * @param data_ptr Pointer to start of string buffer.
+     * @param total_len Total string length in bytes.
+     */
     void save_long_string_buffer(const char *data_ptr, size_t total_len) {
         size_t offset = 0;
         bool first_page = true;
@@ -329,4 +375,4 @@ struct VarcharPageBuilder {
     }
 };
 
-} /* namespace Contest */
+} // namespace Contest::materialize

@@ -1,18 +1,29 @@
+/**
+ * @file bloom_tags.h
+ * @brief Precomputed 16-bit Bloom filter tags for early probe rejection.
+ *
+ * 2048 entries (4KB) fit in L1. Each tag has exactly 5 bits set. Indexed by
+ * `(hash >> 32) & 0x7FF` (bits 32-42, independent from slot bits). Tags OR'd
+ * into directory during build; probe checks `(entry & tag) == tag` for early
+ * rejection (~10 cycles vs 50-200 for key scan).
+ *
+ * @see hashtable.h for bloom_tag(), find_indices(), build_partition()
+ */
 #pragma once
 #include <cstdint>
 
 /**
- *
- *  we use a set of precomputed random 16bit tags
- *  for Bloom Filter operations the upper 11bits of
- *  our 64bit hash index into this array. 11bits is
- *  chose so that in total we have 4byte * 2048 in
- *  total 4KB of tags that can easily fit and not
- *  polute L1 caches while also providing a good
- *  false positive rate.
- *
- **/
+ * @namespace Contest::join
+ * @brief Hash join algorithms: UnchainedHashtable, hash_join(), nested_loop().
+ * @see Contest::platform, Contest::io, Contest::materialize
+ */
+namespace Contest::join {
 
+/**
+ * @brief 2048 unique 16-bit Bloom tags (5 bits set each).
+ *
+ * Static constexpr: single copy in .rodata, compile-time constant, L1-resident.
+ */
 static constexpr uint16_t BLOOM_TAGS[2048] = {
     0x001f, 0x002f, 0x0037, 0x003b, 0x003d, 0x003e, 0x004f, 0x0057, 0x005b,
     0x005d, 0x005e, 0x0067, 0x006b, 0x006d, 0x006e, 0x0073, 0x0075, 0x0076,
@@ -242,3 +253,5 @@ static constexpr uint16_t BLOOM_TAGS[2048] = {
     0x405a, 0x405c, 0x4063, 0x4065, 0x4066, 0x4069, 0x406a, 0x406c, 0x4071,
     0x4072, 0x4074, 0x4078, 0x4087, 0x408b, 0x408d, 0x408e, 0x4093, 0x4095,
     0x4096, 0x4099, 0x409a, 0x409c, 0x40a3};
+
+} // namespace Contest::join

@@ -1,3 +1,13 @@
+/**
+ * @file hardware.h
+ * @brief Default hardware configuration constants.
+ *
+ * Fallback for generic x86-64 Linux when neither Darwin nor benchmarkvm
+ * defined.
+ *
+ * @see hardware_darwin.h for Apple Silicon.
+ * @see hardware_benchmarkvm.h for contest VM.
+ */
 #pragma once
 
 #define SPC__CORE_COUNT 8

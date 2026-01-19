@@ -1,3 +1,9 @@
+/**
+ * @file construct_intermediate.h
+ * @brief Constructs intermediate results for multi-way joins.
+ *
+ * Allocates and populates ExecuteResult (column_t) from match collectors.
+ */
 #pragma once
 
 #include <data_access/columnar_reader.h>
@@ -8,11 +14,31 @@
 #include <platform/worker_pool.h>
 #include <sys/mman.h>
 #include <vector>
-namespace Contest {
+/**
+ * @namespace Contest::materialize
+ * @brief Materialization of join results into columnar format.
+ *
+ * @see intermediate.h for column_t/value_t format details.
+ */
+namespace Contest::materialize {
 
-/* this is a work in progress and will be finilized after match collector
- * is finalized and optimized to produce proper job units */
+using Contest::ExecuteResult;
+using Contest::io::ColumnarReader;
+using Contest::join::JoinInput;
+using Contest::join::MatchCollector;
+using Contest::platform::worker_pool;
 
+/**
+ * @brief Batch memory allocator using single mmap for all intermediate pages.
+ *
+ * Single mmap vs per-page allocation: reduces syscalls, improves memory
+ * locality, simplifies cleanup. Columns hold shared_ptr to prevent premature
+ * munmap.
+ *
+ * @note Move-only type (no copy to prevent double-free).
+ * @see batch_allocate_for_results() for allocation orchestration.
+ * @see column_t::pre_allocate_from_block() for arena partitioning.
+ */
 class BatchAllocator {
   private:
     void *memory_block = nullptr;
@@ -39,14 +65,33 @@ class BatchAllocator {
     BatchAllocator &operator=(const BatchAllocator &) = delete;
 };
 
+/**
+ * @brief Precomputed metadata for resolving an output column's source.
+ *
+ * Avoids per-value std::variant accesses and tuple lookups in hot loop.
+ * 8-byte alignment optimizes struct packing for vector iteration.
+ *
+ * @see prepare_sources() for precomputation logic.
+ */
 struct alignas(8) SourceInfo {
-    const mema::column_t *intermediate_col = nullptr;
-    const Column *columnar_col = nullptr;
-    size_t remapped_col_idx = 0;
-    bool is_columnar = false;
-    bool from_build = false;
+    const mema::column_t *intermediate_col =
+        nullptr;                          /**< Source if intermediate. */
+    const Column *columnar_col = nullptr; /**< Source if columnar. */
+    size_t remapped_col_idx = 0; /**< Local index within source side. */
+    bool is_columnar = false;    /**< True if source is columnar table. */
+    bool from_build = false; /**< True if from build side, false if probe. */
 };
 
+/**
+ * @brief Preallocates mmap'd memory for all output columns (arena allocation).
+ *
+ * @param results       Output columns to allocate (modified in-place).
+ * @param total_matches Number of rows (match count from MatchCollector).
+ * @return Shared ownership of BatchAllocator.
+ *
+ * @see BatchAllocator for single mmap rationale.
+ * @see column_t::pre_allocate_from_block() for arena partitioning.
+ */
 inline std::shared_ptr<BatchAllocator>
 batch_allocate_for_results(ExecuteResult &results, size_t total_matches) {
 
@@ -70,6 +115,20 @@ batch_allocate_for_results(ExecuteResult &results, size_t total_matches) {
     return allocator;
 }
 
+/**
+ * @brief Builds SourceInfo for each output column for fast hot-loop lookup.
+ *
+ * @param remapped_attrs Output column specifications (global indexing).
+ * @param build_input    Build side data (ColumnarTable* or ExecuteResult).
+ * @param probe_input    Probe side data (ColumnarTable* or ExecuteResult).
+ * @param build_node     PlanNode for build side (contains output_attrs).
+ * @param probe_node     PlanNode for probe side (contains output_attrs).
+ * @param build_size     Number of columns from build side.
+ * @return Vector of SourceInfo, one per output column.
+ *
+ * @see SourceInfo for field documentation.
+ * @see construct_intermediate() for consumption in hot loop.
+ */
 inline std::vector<SourceInfo>
 prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
                 const JoinInput &build_input, const JoinInput &probe_input,
@@ -99,6 +158,28 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     return sources;
 }
 
+/**
+ * @brief Populates ExecuteResult columns from join matches in parallel.
+ *
+ * Core materialization for non-root joins. Transforms match row ID pairs into
+ * column_t with value_t encoding. Uses intermediate format (4-byte references)
+ * for cache efficiency; only root node converts to ColumnarTable.
+ *
+ * @param collector        MatchCollector with finalized match row IDs.
+ * @param build_input      Build side data (ColumnarTable* or ExecuteResult).
+ * @param probe_input      Probe side data (ColumnarTable* or ExecuteResult).
+ * @param remapped_attrs   Output column specifications (global indexing).
+ * @param build_node       PlanNode for build side output_attrs mapping.
+ * @param probe_node       PlanNode for probe side output_attrs mapping.
+ * @param build_size       Number of output columns from build side.
+ * @param columnar_reader  ColumnarReader with Cursor caching for page access.
+ * @param results          Pre-initialized ExecuteResult, populated in-place.
+ *
+ * @note For root joins, use materialize() instead.
+ * @see intermediate.h for column_t format and value_t encoding.
+ * @see prepare_sources() for source metadata precomputation.
+ * @see batch_allocate_for_results() for single mmap allocation.
+ */
 inline void construct_intermediate(
     const MatchCollector &collector, const JoinInput &build_input,
     const JoinInput &probe_input,
@@ -149,4 +230,4 @@ inline void construct_intermediate(
         }
     });
 }
-} // namespace Contest
+} // namespace Contest::materialize

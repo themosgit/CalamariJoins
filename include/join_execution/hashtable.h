@@ -1,10 +1,21 @@
+/**
+ * @file hashtable.h
+ * @brief Unchained hash table with bloom filter for parallel equi-joins.
+ *
+ * Keys/row_ids in contiguous arrays (not linked). Directory entry: bits 16-63
+ * = end offset, bits 0-15 = bloom tag. Radix-partitioned parallel build sizes
+ * partitions to fit LLC.
+ *
+ * @note Join keys are INT32 (contest invariant).
+ * @see hash_join.h, bloom_tags.h
+ */
 #pragma once
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <data_model/intermediate.h>
 #include <deque>
-#include <foundation/bloom_tags.h>
+#include <join_execution/bloom_tags.h>
 #include <platform/worker_pool.h>
 #include <vector>
 
@@ -22,7 +33,7 @@
 #include <arm_acle.h>
 #endif
 
-/* some systems do not have L3 cache ao L2 is set as LLC */
+// Use L3 if available, otherwise L2 as last-level cache
 #if defined(SPC__LEVEL3_CACHE_SIZE) && SPC__LEVEL3_CACHE_SIZE > 0
 static constexpr size_t LAST_LEVEL_CACHE = SPC__LEVEL3_CACHE_SIZE;
 #else
@@ -32,31 +43,40 @@ static constexpr size_t LAST_LEVEL_CACHE = SPC__LEVEL2_CACHE_SIZE;
 static constexpr size_t L2_CACHE = SPC__LEVEL2_CACHE_SIZE;
 static constexpr size_t CACHE_LINE = SPC__LEVEL1_DCACHE_LINESIZE;
 
-using Contest::worker_pool;
+using Contest::join::BLOOM_TAGS;
+using Contest::platform::worker_pool;
 
+/**
+ * @brief High-performance unchained hash table for parallel equi-joins.
+ *
+ * Keys/row_ids in contiguous arrays (not linked lists) for cache-friendly
+ * sequential probe. Bloom filter tags enable early rejection. Hardware CRC32
+ * hash with multiplicative mixing.
+ *
+ * @note Build O(n), probe O(1) avg. Thread-safe build via lock-free partitions.
+ */
 class UnchainedHashtable {
   public:
+    /** @brief Key-rowid pair for hash table entries. */
     struct alignas(4) Tuple {
-        int32_t key;
-        uint32_t row_id;
+        int32_t key;     /**< Join key value. */
+        uint32_t row_id; /**< Row index in source table. */
     };
 
-    /**
-     *
-     *  Chunks are the smallest possible
-     *  memory allocation unit, designed
-     *  to fit in L2 cache.
-     *
-     **/
+    /** @brief L2-sized chunk for partition buffers. */
     static constexpr size_t CHUNK_SIZE = 4096;
     static constexpr size_t CHUNK_HEADER = 16;
     static constexpr size_t TUPLES_PER_CHUNK =
         (CHUNK_SIZE - CHUNK_HEADER) / sizeof(Tuple);
+
+    /** @brief Linked chunk for partition buffers during radix build. */
     struct alignas(8) Chunk {
-        Chunk *next;
-        size_t count;
-        Tuple data[TUPLES_PER_CHUNK];
+        Chunk *next;                  /**< Next chunk in partition chain. */
+        size_t count;                 /**< Number of tuples in this chunk. */
+        Tuple data[TUPLES_PER_CHUNK]; /**< Tuple storage. */
     };
+
+    /** @brief Thread-local chunk allocator for lock-free partition building. */
     class ChunkAllocator {
         std::deque<Chunk> storage;
 
@@ -71,16 +91,8 @@ class UnchainedHashtable {
     };
 
     /**
-     *
-     *  A partition is a set of continuous directory
-     *  entries of the hashtable used to enable lock-free
-     *  parallel execution they consist of a linked list
-     *  of chunks for data storage enabling optimized
-     *  memory layout and allocations per thread.
-     *
-     *  Designed to fit in LLC.
-     *
-     **/
+     * @brief Partition of directory entries for lock-free parallel build.
+     */
     struct alignas(8) Partition {
         Chunk *head = nullptr;
         Chunk *tail = nullptr;
@@ -101,12 +113,20 @@ class UnchainedHashtable {
     };
 
   private:
-    std::vector<uint64_t> directory;
-    std::vector<int32_t> keys_;
-    std::vector<uint32_t> row_ids_;
-    int shift = 0;
+    std::vector<uint64_t>
+        directory; /**< Slot entries: (end_offset << 16) | bloom_tag. */
+    std::vector<int32_t>
+        keys_; /**< Contiguous key storage, indexed by directory. */
+    std::vector<uint32_t>
+        row_ids_; /**< Parallel row_id storage, same indexing. */
+    int shift =
+        0; /**< Bit shift for slot calculation: slot = hash >> (64-shift). */
 
-    /* crc32 hash function with large mix value */
+    /**
+     * @brief CRC32-based hash with multiplicative mixing.
+     * @param key INT32 join key.
+     * @return 64-bit hash (upper bits index directory slot).
+     */
     static uint64_t hash_key(int32_t key) noexcept {
         constexpr uint64_t k = 0x8648DBDB;
 #if defined(__aarch64__)
@@ -117,14 +137,21 @@ class UnchainedHashtable {
         return crc * ((k << 32) + 1);
     }
 
-    /* tags can be found at bloom_tags.h */
+    /**
+     * @brief Returns bloom tag from hash. Uses bits 32-42 to index BLOOM_TAGS.
+     * @see bloom_tags.h
+     */
     static uint16_t bloom_tag(uint64_t h) noexcept {
         return BLOOM_TAGS[(h >> 32) & 0x7FF];
     }
 
     size_t slot_for(uint64_t h) const noexcept { return h >> (64 - shift); }
 
-    /* compute number of partitions required */
+    /**
+     * @brief Computes partition count to fit each in per-core LLC share.
+     *
+     * Targets 50% of per-core LLC. Power-of-2 for fast modulo via bit shift.
+     */
     size_t compute_num_partitions(size_t tuple_count, int num_threads) const {
         size_t per_core_cache = LAST_LEVEL_CACHE / worker_pool.thread_count();
         size_t target_bytes = per_core_cache / 2;
@@ -143,26 +170,25 @@ class UnchainedHashtable {
     }
 
     /**
+     * @brief Merges and scatters a single partition from thread-local buffers.
      *
-     * processes the same partition from
-     * all threads follows the same workflow
-     * as the single threaded build
-     *
-     **/
+     * Count phase → prefix sum → scatter keys/row_ids and OR bloom tags.
+     * Lock-free: each thread handles disjoint partitions.
+     */
     void
     build_partition(const std::vector<std::vector<Partition>> &thread_parts,
                     size_t p, size_t slots_per_partition, size_t base_offset,
                     size_t partition_size, int num_threads) {
 
         const size_t slot_start = p * slots_per_partition;
-        /* write offset to empty partitions */
+        // Write offset for empty partitions
         if (partition_size == 0) {
             for (size_t s = 0; s < slots_per_partition; ++s) {
                 directory[slot_start + s] = base_offset << 16;
             }
             return;
         }
-        /* hash all keys and find counts for partition slots */
+        // Count keys per slot within partition
         std::vector<uint32_t> counts(slots_per_partition, 0);
         for (int t = 0; t < num_threads; ++t) {
             for (Chunk *c = thread_parts[t][p].head; c; c = c->next) {
@@ -171,7 +197,7 @@ class UnchainedHashtable {
                 }
             }
         }
-        /* prefix sum of counts in partition */
+        // Prefix sum for write offsets
         std::vector<uint32_t> offsets(slots_per_partition);
         uint32_t running = base_offset;
         for (size_t s = 0; s < slots_per_partition; ++s) {
@@ -179,7 +205,7 @@ class UnchainedHashtable {
             running += counts[s];
             counts[s] = 0;
         }
-        /* write values to correct slots update bloom filter */
+        // Scatter values and update bloom filter
         for (int t = 0; t < num_threads; ++t) {
             for (Chunk *c = thread_parts[t][p].head; c; c = c->next) {
                 for (size_t i = 0; i < c->count; ++i) {
@@ -193,7 +219,7 @@ class UnchainedHashtable {
                 }
             }
         }
-        /* finalize directory write pointer and bloom filter */
+        // Finalize directory entries with end pointer and bloom bits
         for (size_t s = 0; s < slots_per_partition; ++s) {
             uint64_t end = offsets[s] + counts[s];
             directory[slot_start + s] =
@@ -202,6 +228,11 @@ class UnchainedHashtable {
     }
 
   public:
+    /**
+     * @brief Construct hash table sized for expected build-side row count.
+     *
+     * Directory size rounded to power of 2 (min 2048) for fast modulo.
+     */
     explicit UnchainedHashtable(size_t build_size) {
         size_t pow2 = 2048;
         while (pow2 < build_size)
@@ -210,11 +241,23 @@ class UnchainedHashtable {
         shift = __builtin_ctzll(pow2);
     }
 
+    /** @brief Number of keys in the hash table. */
     size_t size() const noexcept { return keys_.size(); }
+
+    /** @brief True if hash table is empty. */
     bool empty() const noexcept { return keys_.empty(); }
+
+    /** @brief Direct access to key array for probe. */
     const int32_t *keys() const noexcept { return keys_.data(); }
+
+    /** @brief Direct access to row_id array for probe. */
     const uint32_t *row_ids() const noexcept { return row_ids_.data(); }
 
+    /**
+     * @brief Find index range for keys matching probe key.
+     *
+     * @return [start, end) into keys_/row_ids_; (0,0) if bloom rejects.
+     */
     std::pair<uint64_t, uint64_t> find_indices(int32_t key) const noexcept {
         if (keys_.empty())
             return {0, 0};
@@ -232,11 +275,23 @@ class UnchainedHashtable {
         return {start, end};
     }
 
+    /**
+     * @brief Build hash table from intermediate column_t.
+     *
+     * Radix-partitioned parallel build when row count > 10K threshold.
+     * Thread-local partition buffers avoid contention.
+     *
+     * @param column Intermediate column with INT32 join keys.
+     * @param num_threads Thread count hint.
+     */
     void build_intermediate(const mema::column_t &column, int num_threads = 4) {
         const size_t row_count = column.row_count();
         if (row_count == 0)
             return;
 
+        /**
+         * @brief Below 10K rows, single-threaded build is faster.
+         */
         static constexpr size_t PARALLEL_BUILD_THRESHOLD = 10000;
         num_threads = worker_pool.thread_count();
         if (row_count < PARALLEL_BUILD_THRESHOLD)
@@ -248,13 +303,13 @@ class UnchainedHashtable {
         const int partition_bits = __builtin_ctzll(num_partitions);
         const size_t slots_per_partition = num_slots / num_partitions;
 
-        /* all threads have a private instance of all partitions */
+        // Thread-local partitions for lock-free parallel partitioning
         std::vector<ChunkAllocator> allocators(num_threads);
         std::vector<std::vector<Partition>> thread_parts(num_threads);
         for (auto &tp : thread_parts)
             tp.resize(num_partitions);
 
-        /* partitions data to every thread based on hash */
+        // Partition data by hash
         size_t batch = (row_count + num_threads - 1) / num_threads;
         worker_pool.execute([&, partition_bits](size_t t) {
             size_t start = t * batch;
@@ -271,7 +326,7 @@ class UnchainedHashtable {
             }
         });
 
-        /* compute offsets partition data from every thread */
+        // Compute global offsets from per-thread counts
         std::vector<size_t> global_offsets(num_partitions + 1, 0);
         for (size_t p = 0; p < num_partitions; ++p) {
             for (size_t t = 0; t < num_threads; ++t) {
@@ -286,7 +341,7 @@ class UnchainedHashtable {
         keys_.resize(total);
         row_ids_.resize(total);
 
-        /* accumulates and builds partitions from all threads */
+        // Build partitions in parallel
         const int nt = num_threads;
         worker_pool.execute([&, nt](size_t t) {
             for (size_t p = t; p < num_partitions; p += nt) {
@@ -297,7 +352,16 @@ class UnchainedHashtable {
         });
     }
 
-    /* same for ColumnarTable */
+    /**
+     * @brief Build hash table from ColumnarTable Column.
+     *
+     * Handles dense (no NULLs) and sparse (with bitmap) pages.
+     * Same radix-partitioned parallel strategy as build_intermediate().
+     *
+     * @param column Paged INT32 column. Page header: (n_rows, n_vals).
+     * @param num_threads Thread count hint; falls back to single-threaded <16
+     * pages.
+     */
     void build_columnar(const Column &column, int num_threads = 4) {
         if (column.pages.empty())
             return;

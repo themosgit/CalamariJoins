@@ -1,3 +1,12 @@
+/**
+ * @file match_collector.h
+ * @brief Lock-free parallel match collection for joins.
+ *
+ * Collects (build_row_id, probe_row_id) pairs using chunk-chains for O(1)
+ * merge. Thread-local buffers avoid contention; chains linked without copying.
+ *
+ * @see ThreadLocalMatchBuffer, materialize.h, construct_intermediate.h
+ */
 #pragma once
 
 #include <algorithm>
@@ -8,24 +17,38 @@
 #include <sys/mman.h>
 #include <vector>
 
-namespace Contest {
+/** @namespace Contest::join @brief Parallel hash join implementation. */
+namespace Contest::join {
 
+using Contest::platform::worker_pool;
+
+/** @brief Specifies which side's row IDs to collect. Saves 50% when one side
+ * unused. */
 enum class MatchCollectionMode : uint8_t {
-    BOTH = 0,
-    LEFT_ONLY = 1,
-    RIGHT_ONLY = 2
+    BOTH = 0,      /**< Collect both left and right row IDs. */
+    LEFT_ONLY = 1, /**< Only left (build) side IDs needed. */
+    RIGHT_ONLY = 2 /**< Only right (probe) side IDs needed. */
 };
 
+/** @brief Capacity per IndexChunk; sized for L2 cache efficiency. */
 static constexpr size_t MATCH_CHUNK_CAP = 8192;
 
+/** @brief Fixed-size chunk of row IDs forming a singly-linked list. */
 struct IndexChunk {
-    uint32_t ids[MATCH_CHUNK_CAP];
-    uint32_t count = 0;
-    IndexChunk *next = nullptr;
+    uint32_t ids[MATCH_CHUNK_CAP]; /**< Row ID storage. */
+    uint32_t count = 0;            /**< Valid entries in ids[0..count-1]. */
+    IndexChunk *next = nullptr; /**< Next chunk in chain (nullptr if tail). */
 };
 
 class MatchCollector;
 
+/**
+ * @brief Per-thread buffer for collecting join matches without contention.
+ *
+ * Maintains separate left/right chunk chains. After probe, chains transfer to
+ * MatchCollector via O(1) pointer linking. Destructor frees unrelinquished
+ * chunks.
+ */
 class ThreadLocalMatchBuffer {
     friend void merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &,
                                        MatchCollector &);
@@ -72,6 +95,7 @@ class ThreadLocalMatchBuffer {
         }
     }
 
+    /** @brief Records a match. Allocates new chunks in pairs for BOTH mode. */
     inline void add_match(uint32_t left, uint32_t right) {
         if (mode == MatchCollectionMode::BOTH) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
@@ -107,6 +131,14 @@ class ThreadLocalMatchBuffer {
     }
 };
 
+/**
+ * @brief Global collector aggregating matches from all probe workers.
+ *
+ * Chain linking is single-threaded after probe completes. After
+ * finalize_parallel(), provides ChunkRange iterators for materialization.
+ *
+ * @see hash_join.h, materialize.h
+ */
 class MatchCollector {
     IndexChunk *left_chain_head = nullptr;
     IndexChunk *left_chain_tail = nullptr;
@@ -120,6 +152,7 @@ class MatchCollector {
     std::vector<IndexChunk *> all_chunks;
 
   public:
+    /** @brief Forward iterator over row IDs across chunk chains. */
     class ChunkIterator {
         IndexChunk *current_chunk;
         uint32_t offset;
@@ -155,6 +188,7 @@ class MatchCollector {
             return remaining != other.remaining;
         }
 
+        /** @brief Skip forward n elements across chunk boundaries. */
         void advance(size_t n) {
             while (n > 0 && current_chunk) {
                 size_t available = current_chunk->count - offset;
@@ -173,6 +207,7 @@ class MatchCollector {
         }
     };
 
+    /** @brief Range adapter for iterating a slice of the chunk chain. */
     class ChunkRange {
         IndexChunk *head;
         size_t start_offset;
@@ -214,12 +249,7 @@ class MatchCollector {
 
     void reserve(size_t) {}
 
-    /**
-     *
-     *  optimized merge takes linked lists of chunks
-     *  and does simple pointer ops
-     *
-     **/
+    /** @brief Merges chunk chains via pointer ops (O(1)). */
     void append_batch_chains(IndexChunk *left_head, IndexChunk *left_tail,
                              IndexChunk *right_head, IndexChunk *right_tail,
                              size_t batch_count) {
@@ -256,6 +286,7 @@ class MatchCollector {
         }
     }
 
+    /** @brief Merges a thread's buffer; transfers chunk ownership. */
     void merge_thread_buffer(ThreadLocalMatchBuffer &tlb) {
         if (tlb.total_count == 0)
             return;
@@ -266,6 +297,7 @@ class MatchCollector {
         tlb.total_count = 0;
     }
 
+    /** @brief Consolidates chunk ownership; call after all merges. */
     void finalize_parallel() {
         if (is_finalized)
             return;
@@ -291,28 +323,27 @@ class MatchCollector {
         is_finalized = true;
     }
 
+    /** @brief Ensures finalize_parallel() has been called. */
     void ensure_finalized() {
         if (!is_finalized)
             finalize_parallel();
     }
 
+    /** @brief Returns total match count across all merged buffers. */
     inline size_t size() const { return total_matches_count; }
 
+    /** @brief Returns range for iterating left (build) row IDs. */
     ChunkRange get_left_range(size_t start, size_t count) const {
         return ChunkRange(left_chain_head, start, count);
     }
 
+    /** @brief Returns range for iterating right (probe) row IDs. */
     ChunkRange get_right_range(size_t start, size_t count) const {
         return ChunkRange(right_chain_head, start, count);
     }
 };
 
-/**
- *
- *  creates a vector of thread-local match buffers for parallel join processing
- *  one buffer per worker thread, all initialized with the same collection mode
- *
- **/
+/** @brief Creates thread-local match buffers, one per thread. */
 inline std::vector<ThreadLocalMatchBuffer>
 create_thread_local_buffers(size_t thread_count, MatchCollectionMode mode) {
     std::vector<ThreadLocalMatchBuffer> buffers;
@@ -323,13 +354,8 @@ create_thread_local_buffers(size_t thread_count, MatchCollectionMode mode) {
     return buffers;
 }
 
-/**
- *
- *  merges all thread-local buffers into the global collector
- *  links all local buffers into separate left/right chains
- *  then pushes both chains with simple pointer ops
- *
- **/
+/** @brief Merges all thread-local buffers into global collector via batch
+ * chain linking. */
 inline void
 merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &local_buffers,
                        MatchCollector &global_collector) {
@@ -387,4 +413,4 @@ merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &local_buffers,
                                          batch_total);
 }
 
-} // namespace Contest
+} // namespace Contest::join

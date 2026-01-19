@@ -9,8 +9,10 @@
 /job-sample
 /.cache
 /cache
+/docs/html
+/docs/xml
 .clangd
 compile_commands.json
-env/
+/env/
 script.py
-output.md
+*.md

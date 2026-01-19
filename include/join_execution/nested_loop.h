@@ -1,4 +1,12 @@
-/*nested_loop.h*/
+/**
+ * @file nested_loop.h
+ * @brief Nested loop join for small build tables (<8 rows).
+ *
+ * Fallback when build fits in L1 cache. Parallel work-stealing probe.
+ * Outperforms hash join for tiny tables due to cache locality.
+ *
+ * @see execute.cpp HASH_TABLE_THRESHOLD = 8
+ */
 #pragma once
 
 #include <atomic>
@@ -11,8 +19,22 @@
 #include <platform/worker_pool.h>
 #include <vector>
 
-namespace Contest {
+/**
+ * @namespace Contest::join
+ * @brief visit_rows() iterator, nested_loop_join() for tiny build tables.
+ */
+namespace Contest::join {
 
+using Contest::ExecuteResult;
+using Contest::platform::worker_pool;
+
+/**
+ * @brief Iterates over non-NULL values in a join input column.
+ *
+ * Abstracts columnar vs intermediate input. Handles NULL bitmaps.
+ *
+ * @tparam Func void(uint32_t row_id, int32_t value).
+ */
 template <typename Func>
 inline void visit_rows(const JoinInput &input, size_t attr_idx,
                        Func &&visitor) {
@@ -55,6 +77,14 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
     }
 }
 
+/**
+ * @brief Nested loop join for small build tables (<=64 rows).
+ *
+ * Build keys/IDs in stack arrays (512 bytes, L1-resident). Parallel probe
+ * via work-stealing. Beats hash join for <8 rows due to no hash overhead.
+ *
+ * @param mode BOTH, LEFT_ONLY, or RIGHT_ONLY.
+ */
 inline void
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                  size_t build_attr, size_t probe_attr,
@@ -66,6 +96,9 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
     if (build_rows == 0 || probe_rows == 0)
         return;
 
+    /**
+     * MAX_BUILD_SIZE = 64 fits in L1 (512 bytes).
+     */
     constexpr size_t MAX_BUILD_SIZE = 64;
     int32_t b_vals[MAX_BUILD_SIZE];
     uint32_t b_ids[MAX_BUILD_SIZE];
@@ -162,4 +195,4 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
         collector.merge_thread_buffer(buf);
     }
 }
-} // namespace Contest
+} // namespace Contest::join
