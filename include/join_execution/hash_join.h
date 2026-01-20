@@ -14,6 +14,9 @@
  * Supports ColumnarTable and intermediate (column_t) inputs. Probe uses
  * parallel work-stealing; thread-local match buffers merged after processing.
  *
+ * Probe functions are templated on MatchCollectionMode for zero-overhead
+ * mode selection at compile time.
+ *
  * @see hashtable.h, match_collector.h
  */
 
@@ -68,24 +71,27 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
  * buffers.
  *
  * Each thread keeps its buffer for direct iteration without merge overhead.
+ *
+ * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
+ *              specialization of match buffer operations.
  */
-inline std::vector<ThreadLocalMatchBuffer>
+template <MatchCollectionMode Mode>
+inline std::vector<ThreadLocalMatchBuffer<Mode>>
 probe_intermediate(const UnchainedHashtable &hash_table,
-                   const mema::column_t &probe_column,
-                   MatchCollectionMode mode = MatchCollectionMode::BOTH) {
+                   const mema::column_t &probe_column) {
     const auto *keys = hash_table.keys();
     const auto *row_ids = hash_table.row_ids();
 
     size_t pool_size = THREAD_COUNT;
-    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
+    std::vector<ThreadLocalMatchBuffer<Mode>> local_buffers(pool_size);
 
     const size_t num_pages = probe_column.pages.size();
     const size_t probe_count = probe_column.row_count();
     std::atomic<size_t> page_counter(0);
 
     worker_pool().execute([&](size_t thread_id) {
-        local_buffers[thread_id] = ThreadLocalMatchBuffer(
-            Contest::platform::get_arena(thread_id), mode);
+        local_buffers[thread_id] = ThreadLocalMatchBuffer<Mode>(
+            Contest::platform::get_arena(thread_id));
         auto &local_buf = local_buffers[thread_id];
 
         while (true) {
@@ -133,11 +139,14 @@ probe_intermediate(const UnchainedHashtable &hash_table,
  * buffers.
  *
  * Each thread keeps its buffer for direct iteration without merge overhead.
+ *
+ * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
+ *              specialization of match buffer operations.
  */
-inline std::vector<ThreadLocalMatchBuffer>
+template <MatchCollectionMode Mode>
+inline std::vector<ThreadLocalMatchBuffer<Mode>>
 probe_columnar(const UnchainedHashtable &hash_table,
-               const JoinInput &probe_input, size_t probe_attr,
-               MatchCollectionMode mode = MatchCollectionMode::BOTH) {
+               const JoinInput &probe_input, size_t probe_attr) {
 
     const auto *keys = hash_table.keys();
     const auto *row_ids = hash_table.row_ids();
@@ -159,12 +168,12 @@ probe_columnar(const UnchainedHashtable &hash_table,
     }
 
     size_t pool_size = THREAD_COUNT;
-    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
+    std::vector<ThreadLocalMatchBuffer<Mode>> local_buffers(pool_size);
 
     std::atomic<size_t> page_counter(0);
     worker_pool().execute([&](size_t thread_id) {
-        local_buffers[thread_id] = ThreadLocalMatchBuffer(
-            Contest::platform::get_arena(thread_id), mode);
+        local_buffers[thread_id] = ThreadLocalMatchBuffer<Mode>(
+            Contest::platform::get_arena(thread_id));
         auto &local_buf = local_buffers[thread_id];
 
         while (true) {

@@ -5,6 +5,9 @@
  * Collects (build_row_id, probe_row_id) pairs using chunk-chains for O(1)
  * merge. Thread-local buffers avoid contention; chains linked without copying.
  *
+ * Template parameter Mode enables compile-time specialization for different
+ * collection modes, eliminating runtime branching in hot loops.
+ *
  * @see ThreadLocalMatchBuffer, materialize.h, construct_intermediate.h
  */
 #pragma once
@@ -46,16 +49,21 @@ static_assert(sizeof(IndexChunk) <=
 /**
  * @brief Per-thread buffer for collecting join matches without contention.
  *
- * Maintains separate left/right chunk chains. Uses arena allocation for chunks.
- * After probe, buffers are iterated directly without merging.
+ * Maintains separate left/right chunk chains based on Mode. Uses arena
+ * allocation for chunks. After probe, buffers are iterated directly without
+ * merging.
+ *
+ * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY). Determines which
+ *              chains are allocated and which code path is used in add_match().
+ *              Using if constexpr eliminates runtime branching.
  */
+template <MatchCollectionMode Mode = MatchCollectionMode::BOTH>
 class ThreadLocalMatchBuffer {
 
     IndexChunk *left_head = nullptr;
     IndexChunk *left_tail = nullptr;
     IndexChunk *right_head = nullptr;
     IndexChunk *right_tail = nullptr;
-    MatchCollectionMode mode = MatchCollectionMode::BOTH;
     Contest::platform::ThreadArena *arena_ = nullptr;
 
     /** @brief Allocate IndexChunk from arena. */
@@ -73,13 +81,12 @@ class ThreadLocalMatchBuffer {
 
     ThreadLocalMatchBuffer() noexcept = default;
 
-    ThreadLocalMatchBuffer(Contest::platform::ThreadArena &arena,
-                           MatchCollectionMode m = MatchCollectionMode::BOTH)
-        : mode(m), arena_(&arena) {
-        if (mode != MatchCollectionMode::RIGHT_ONLY) {
+    explicit ThreadLocalMatchBuffer(Contest::platform::ThreadArena &arena)
+        : arena_(&arena) {
+        if constexpr (Mode != MatchCollectionMode::RIGHT_ONLY) {
             left_tail = left_head = alloc_chunk();
         }
-        if (mode != MatchCollectionMode::LEFT_ONLY) {
+        if constexpr (Mode != MatchCollectionMode::LEFT_ONLY) {
             right_tail = right_head = alloc_chunk();
         }
     }
@@ -87,8 +94,7 @@ class ThreadLocalMatchBuffer {
     ThreadLocalMatchBuffer(ThreadLocalMatchBuffer &&other) noexcept
         : left_head(other.left_head), left_tail(other.left_tail),
           right_head(other.right_head), right_tail(other.right_tail),
-          mode(other.mode), arena_(other.arena_),
-          total_count(other.total_count) {
+          arena_(other.arena_), total_count(other.total_count) {
         other.left_head = other.left_tail = nullptr;
         other.right_head = other.right_tail = nullptr;
         other.total_count = 0;
@@ -100,7 +106,6 @@ class ThreadLocalMatchBuffer {
             left_tail = other.left_tail;
             right_head = other.right_head;
             right_tail = other.right_tail;
-            mode = other.mode;
             arena_ = other.arena_;
             total_count = other.total_count;
             other.left_head = other.left_tail = nullptr;
@@ -168,9 +173,14 @@ class ThreadLocalMatchBuffer {
     /** @brief Returns match count in this buffer. */
     size_t count() const { return total_count; }
 
-    /** @brief Records a match. Allocates new chunks in pairs for BOTH mode. */
+    /**
+     * @brief Records a match. Allocates new chunks as needed.
+     *
+     * Uses if constexpr for zero-overhead mode selection at compile time.
+     * Each mode specialization only includes code for the chains it uses.
+     */
     inline void add_match(uint32_t left, uint32_t right) {
-        if (mode == MatchCollectionMode::BOTH) {
+        if constexpr (Mode == MatchCollectionMode::BOTH) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
                 IndexChunk *new_left = alloc_chunk();
                 IndexChunk *new_right = alloc_chunk();
@@ -183,7 +193,7 @@ class ThreadLocalMatchBuffer {
             right_tail->ids[right_tail->count] = right;
             left_tail->count++;
             right_tail->count++;
-        } else if (mode == MatchCollectionMode::LEFT_ONLY) {
+        } else if constexpr (Mode == MatchCollectionMode::LEFT_ONLY) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
                 IndexChunk *new_left = alloc_chunk();
                 left_tail->next = new_left;

@@ -5,6 +5,8 @@
  * Fallback when build fits in L1 cache. Parallel work-stealing probe.
  * Outperforms hash join for tiny tables due to cache locality.
  *
+ * Templated on MatchCollectionMode for zero-overhead mode selection.
+ *
  * @see execute.cpp HASH_TABLE_THRESHOLD = 8
  */
 #pragma once
@@ -16,7 +18,6 @@
 #include <join_execution/join_setup.h>
 #include <join_execution/match_collector.h>
 #include <join_execution/simd_compare.h>
-#include <materialization/construct_intermediate.h>
 #include <platform/arena_vector.h>
 #include <platform/worker_pool.h>
 #include <vector>
@@ -87,13 +88,14 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
  * work-stealing. Beats hash join for <8 rows due to no hash overhead
  * and register-resident comparison.
  *
- * @param mode BOTH, LEFT_ONLY, or RIGHT_ONLY.
+ * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
+ *              specialization of match buffer operations.
  * @return Thread-local match buffers for direct iteration.
  */
-inline std::vector<ThreadLocalMatchBuffer>
+template <MatchCollectionMode Mode>
+inline std::vector<ThreadLocalMatchBuffer<Mode>>
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
-                 size_t build_attr, size_t probe_attr,
-                 MatchCollectionMode mode = MatchCollectionMode::BOTH) {
+                 size_t build_attr, size_t probe_attr) {
     size_t build_rows = build_input.row_count(build_attr);
     size_t probe_rows = probe_input.row_count(probe_attr);
 
@@ -101,7 +103,7 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
         return {};
 
     size_t num_threads = THREAD_COUNT;
-    std::vector<ThreadLocalMatchBuffer> buffers(num_threads);
+    std::vector<ThreadLocalMatchBuffer<Mode>> buffers(num_threads);
 
     constexpr size_t MAX_BUILD_SIZE = 8;
     alignas(32) int32_t b_vals[MAX_BUILD_SIZE];
@@ -142,12 +144,12 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
 
     worker_pool().execute([&](size_t t_id) {
         buffers[t_id] =
-            ThreadLocalMatchBuffer(Contest::platform::get_arena(t_id), mode);
+            ThreadLocalMatchBuffer<Mode>(Contest::platform::get_arena(t_id));
         auto &local_buffer = buffers[t_id];
 
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
-            simd::eq_scan_build(p_id, p_val, b_vals, b_ids, b_count,
-                                local_buffer);
+            simd::eq_scan_build<Mode>(p_id, p_val, b_vals, b_ids, b_count,
+                                      local_buffer);
         };
 
         if (probe_input.is_columnar()) {
@@ -167,9 +169,9 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
 
                 if (num_rows == num_values) {
                     // SIMD batch: process multiple probe values at a time
-                    uint16_t j =
-                        simd::eq_batch_columnar(data, num_rows, row_id, b_vals,
-                                                b_ids, b_count, local_buffer);
+                    uint16_t j = simd::eq_batch_columnar<Mode>(
+                        data, num_rows, row_id, b_vals, b_ids, b_count,
+                        local_buffer);
                     row_id += j;
                     // Handle remaining elements with scalar
                     for (; j < num_rows; j++) {
@@ -207,8 +209,8 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                     if (offset + BATCH_SIZE <= mema::CAP_PER_PAGE) {
                         const int32_t *vals = reinterpret_cast<const int32_t *>(
                             &col.pages[page_idx]->data[offset]);
-                        simd::eq_batch_intermediate(vals, i, b_vals, b_ids,
-                                                    b_count, local_buffer);
+                        simd::eq_batch_intermediate<Mode>(
+                            vals, i, b_vals, b_ids, b_count, local_buffer);
                     } else {
                         // Cross-page boundary: fall back to scalar
                         for (size_t j = i; j < i + BATCH_SIZE; j++) {

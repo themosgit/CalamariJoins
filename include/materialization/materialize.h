@@ -3,6 +3,7 @@
  * @brief Materialization of join results into ColumnarTable format.
  *
  * Parallel materialization using per-thread page builders and mmap allocation.
+ * Templated on MatchCollectionMode for zero-overhead mode selection.
  */
 #pragma once
 
@@ -26,6 +27,7 @@ namespace Contest::materialize {
 using Contest::ExecuteResult;
 using Contest::io::ColumnarReader;
 using Contest::join::JoinInput;
+using Contest::join::MatchCollectionMode;
 using Contest::join::resolve_input_source;
 using Contest::join::ThreadLocalMatchBuffer;
 using Contest::platform::THREAD_COUNT;
@@ -49,15 +51,17 @@ inline ColumnarTable create_empty_result(
  *
  * Each thread processes its own buffer directly without merge overhead.
  *
+ * @tparam Mode            Collection mode for compile-time specialization.
  * @tparam BuilderType     Int32PageBuilder or VarcharPageBuilder.
  * @tparam ReaderFunc      Callable: (row_id, cursor) -> value_t.
  * @tparam InitBuilderFunc Callable: (page_allocator) -> BuilderType.
  * @param est_bytes_per_row Average bytes per row (4 for INT32, ~35 for
  * VARCHAR).
  */
-template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
+template <MatchCollectionMode Mode, typename BuilderType, typename ReaderFunc,
+          typename InitBuilderFunc>
 inline void materialize_column_from_buffers(
-    Column &dest_col, std::vector<ThreadLocalMatchBuffer> &buffers,
+    Column &dest_col, std::vector<ThreadLocalMatchBuffer<Mode>> &buffers,
     size_t total_matches, ReaderFunc &&read_value,
     InitBuilderFunc &&init_builder, bool from_build, size_t est_bytes_per_row) {
 
@@ -164,10 +168,13 @@ inline void materialize_column_from_buffers(
  * build/probe), selects page builder type, and invokes
  * materialize_column_from_buffers<>. VARCHAR handling requires source Column
  * pointer for string dereferencing.
+ *
+ * @tparam Mode Collection mode for compile-time specialization.
  */
+template <MatchCollectionMode Mode>
 inline void materialize_single_column_from_buffers(
     Column &dest_col, size_t col_idx, size_t build_size,
-    std::vector<ThreadLocalMatchBuffer> &buffers, size_t total_matches,
+    std::vector<ThreadLocalMatchBuffer<Mode>> &buffers, size_t total_matches,
     const JoinInput &build_input, const JoinInput &probe_input,
     const PlanNode &build_node, const PlanNode &probe_node,
     ColumnarReader &columnar_reader, const Plan &plan) {
@@ -201,7 +208,7 @@ inline void materialize_single_column_from_buffers(
         auto init = [](std::function<Page *()> alloc) {
             return Int32PageBuilder(std::move(alloc));
         };
-        materialize_column_from_buffers<Int32PageBuilder>(
+        materialize_column_from_buffers<Mode, Int32PageBuilder>(
             dest_col, buffers, total_matches,
             [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 return reader(rid, cursor, DataType::INT32);
@@ -220,7 +227,7 @@ inline void materialize_single_column_from_buffers(
         return VarcharPageBuilder(*str_src_ptr, std::move(alloc));
     };
 
-    materialize_column_from_buffers<VarcharPageBuilder>(
+    materialize_column_from_buffers<Mode, VarcharPageBuilder>(
         dest_col, buffers, total_matches,
         [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
             return reader(rid, cursor, DataType::VARCHAR);
@@ -234,6 +241,7 @@ inline void materialize_single_column_from_buffers(
  *
  * Dereferences VARCHAR value_t references into actual string bytes.
  *
+ * @tparam Mode            Collection mode for compile-time specialization.
  * @param buffers          Thread-local match buffers from probe.
  * @param build_input      Build side data source.
  * @param probe_input      Probe side data source.
@@ -248,9 +256,10 @@ inline void materialize_single_column_from_buffers(
  * @see construct_intermediate.h for creating intermediate ExecuteResult.
  * @see page_builders.h for Int32PageBuilder and VarcharPageBuilder.
  */
+template <MatchCollectionMode Mode>
 inline ColumnarTable materialize_from_buffers(
-    std::vector<ThreadLocalMatchBuffer> &buffers, const JoinInput &build_input,
-    const JoinInput &probe_input,
+    std::vector<ThreadLocalMatchBuffer<Mode>> &buffers,
+    const JoinInput &build_input, const JoinInput &probe_input,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, const Plan &plan) {
@@ -275,7 +284,7 @@ inline ColumnarTable materialize_from_buffers(
         auto [col_idx, data_type] = remapped_attrs[out_idx];
         result.columns.emplace_back(data_type);
         Column &dest_col = result.columns.back();
-        materialize_single_column_from_buffers(
+        materialize_single_column_from_buffers<Mode>(
             dest_col, col_idx, build_size, buffers, total_matches, build_input,
             probe_input, build_node, probe_node, columnar_reader, plan);
     }

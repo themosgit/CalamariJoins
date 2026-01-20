@@ -3,7 +3,8 @@
  * @brief SIMD comparison helpers for nested loop join operations.
  *
  * Platform-specific (AVX2/NEON) vectorized comparison primitives.
- * All functions are inline for zero overhead.
+ * All functions are inline and templated on MatchCollectionMode for zero
+ * overhead.
  *
  * @see nested_loop.h
  */
@@ -27,16 +28,19 @@ namespace Contest::join::simd {
  * Used by nested loop join where build side fits in SIMD registers.
  * Build values must be 32-byte aligned for AVX2 aligned load.
  *
- * @param probe_id    Row ID of probe tuple
- * @param probe_val   Probe key value
- * @param build_vals  Pointer to 8 aligned build values (alignas(32))
- * @param build_ids   Pointer to build row IDs
- * @param build_count Actual number of valid build values (<=8)
- * @param buffer      Thread-local match buffer
+ * @tparam Mode        Collection mode for the match buffer.
+ * @param probe_id     Row ID of probe tuple
+ * @param probe_val    Probe key value
+ * @param build_vals   Pointer to 8 aligned build values (alignas(32))
+ * @param build_ids    Pointer to build row IDs
+ * @param build_count  Actual number of valid build values (<=8)
+ * @param buffer       Thread-local match buffer
  */
+template <MatchCollectionMode Mode>
 inline void eq_scan_build(uint32_t probe_id, int32_t probe_val,
                           const int32_t *build_vals, const uint32_t *build_ids,
-                          size_t build_count, ThreadLocalMatchBuffer &buffer) {
+                          size_t build_count,
+                          ThreadLocalMatchBuffer<Mode> &buffer) {
 #if defined(__x86_64__) && defined(__AVX2__)
     __m256i build_reg =
         _mm256_load_si256(reinterpret_cast<const __m256i *>(build_vals));
@@ -90,20 +94,21 @@ inline void eq_scan_build(uint32_t probe_id, int32_t probe_val,
  * Processes 8 (AVX2) or 4 (NEON) probe values per iteration.
  * Returns count of rows processed; caller handles remainder with scalar.
  *
- * @param data        Pointer to columnar int32 data
- * @param num_rows    Total rows in page
- * @param base_row_id Starting row ID
- * @param build_vals  Pointer to 8 aligned build values (alignas(32))
- * @param build_ids   Pointer to build row IDs
- * @param build_count Actual build count (<=8)
- * @param buffer      Thread-local match buffer
+ * @tparam Mode        Collection mode for the match buffer.
+ * @param data         Pointer to columnar int32 data
+ * @param num_rows     Total rows in page
+ * @param base_row_id  Starting row ID
+ * @param build_vals   Pointer to 8 aligned build values (alignas(32))
+ * @param build_ids    Pointer to build row IDs
+ * @param build_count  Actual build count (<=8)
+ * @param buffer       Thread-local match buffer
  * @return Number of rows processed with SIMD
  */
-inline uint16_t eq_batch_columnar(const int32_t *data, uint16_t num_rows,
-                                  uint32_t base_row_id,
-                                  const int32_t *build_vals,
-                                  const uint32_t *build_ids, size_t build_count,
-                                  ThreadLocalMatchBuffer &buffer) {
+template <MatchCollectionMode Mode>
+inline uint16_t
+eq_batch_columnar(const int32_t *data, uint16_t num_rows, uint32_t base_row_id,
+                  const int32_t *build_vals, const uint32_t *build_ids,
+                  size_t build_count, ThreadLocalMatchBuffer<Mode> &buffer) {
     uint16_t j = 0;
 
 #if defined(__x86_64__) && defined(__AVX2__)
@@ -163,17 +168,19 @@ inline constexpr size_t INTERMEDIATE_BATCH_SIZE = 0; // No SIMD batching
  * Handles NULL values (mema::value_t::NULL_VALUE). Caller ensures all
  * values are on same page. Processes 8 (AVX2) or 4 (NEON) values.
  *
- * @param vals        Pointer to intermediate int32 values (same page)
- * @param base_idx    Starting index in intermediate column
- * @param build_vals  Pointer to 8 aligned build values (alignas(32))
- * @param build_ids   Pointer to build row IDs
- * @param build_count Actual build count (<=8)
- * @param buffer      Thread-local match buffer
+ * @tparam Mode        Collection mode for the match buffer.
+ * @param vals         Pointer to intermediate int32 values (same page)
+ * @param base_idx     Starting index in intermediate column
+ * @param build_vals   Pointer to 8 aligned build values (alignas(32))
+ * @param build_ids    Pointer to build row IDs
+ * @param build_count  Actual build count (<=8)
+ * @param buffer       Thread-local match buffer
  */
+template <MatchCollectionMode Mode>
 inline void eq_batch_intermediate(const int32_t *vals, size_t base_idx,
                                   const int32_t *build_vals,
                                   const uint32_t *build_ids, size_t build_count,
-                                  ThreadLocalMatchBuffer &buffer) {
+                                  ThreadLocalMatchBuffer<Mode> &buffer) {
 #if defined(__x86_64__) && defined(__AVX2__)
     __m256i probe_batch =
         _mm256_loadu_si256(reinterpret_cast<const __m256i *>(vals));

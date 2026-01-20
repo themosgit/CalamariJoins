@@ -3,6 +3,7 @@
  * @brief Constructs intermediate results for multi-way joins.
  *
  * Allocates and populates ExecuteResult (column_t) from match collectors.
+ * Templated on MatchCollectionMode for zero-overhead mode selection.
  */
 #pragma once
 
@@ -25,6 +26,8 @@ namespace Contest::materialize {
 using Contest::ExecuteResult;
 using Contest::io::ColumnarReader;
 using Contest::join::JoinInput;
+using Contest::join::MatchCollectionMode;
+using Contest::join::ThreadLocalMatchBuffer;
 using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
@@ -95,6 +98,7 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
  * computed by summing buffer counts. Each thread writes its contiguous portion
  * of output pages.
  *
+ * @tparam Mode            Collection mode for compile-time specialization.
  * @param buffers          Vector of ThreadLocalMatchBuffer from probe.
  * @param build_input      Build side data (ColumnarTable* or ExecuteResult).
  * @param probe_input      Probe side data (ColumnarTable* or ExecuteResult).
@@ -105,8 +109,9 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
  * @param columnar_reader  ColumnarReader with Cursor caching for page access.
  * @param results          Pre-initialized ExecuteResult, populated in-place.
  */
+template <MatchCollectionMode Mode>
 inline void construct_intermediate_from_buffers(
-    std::vector<Contest::join::ThreadLocalMatchBuffer> &buffers,
+    std::vector<ThreadLocalMatchBuffer<Mode>> &buffers,
     const JoinInput &build_input, const JoinInput &probe_input,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
