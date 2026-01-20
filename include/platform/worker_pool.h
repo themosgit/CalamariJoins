@@ -139,11 +139,10 @@ class WorkerThreadPool {
     constexpr int thread_count() const { return NUM_THREADS; }
 };
 
-/// Global worker pool pointer (initialized by build_context, destroyed by
-/// destroy_context).
-inline WorkerThreadPool *g_worker_pool = nullptr;
+/// Global worker pool instance (inline global, constructed at program startup).
+inline WorkerThreadPool g_worker_pool{};
 
 /// Accessor for global worker pool.
-inline WorkerThreadPool &worker_pool() { return *g_worker_pool; }
+inline WorkerThreadPool &worker_pool() { return g_worker_pool; }
 
 } // namespace Contest::platform

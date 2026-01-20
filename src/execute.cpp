@@ -257,7 +257,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
 ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
                       bool show_detailed_timing) {
     // Reset arena memory from previous query
-    Contest::platform::g_arena_manager->reset_all();
+    Contest::platform::g_arena_manager.reset_all();
 
     auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -297,18 +297,8 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     return std::move(std::get<ColumnarTable>(result));
 }
 
-void *build_context() {
-    platform::g_worker_pool = new platform::WorkerThreadPool();
-    platform::g_arena_manager = new platform::ArenaManager();
-    return nullptr;
-}
+void *build_context() { return nullptr; }
 
-void destroy_context(void *context) {
-    (void)context;
-    delete platform::g_arena_manager;
-    platform::g_arena_manager = nullptr;
-    delete platform::g_worker_pool;
-    platform::g_worker_pool = nullptr;
-}
+void destroy_context(void *context) { (void)context; }
 
 } // namespace Contest

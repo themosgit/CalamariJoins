@@ -450,13 +450,12 @@ class ArenaManager {
 // Global Instance and Helper
 // ============================================================================
 
-/// Global arena manager pointer (initialized by build_context, destroyed by
-/// destroy_context).
-inline ArenaManager *g_arena_manager = nullptr;
+/// Global arena manager instance (inline global, constructed at program startup).
+inline ArenaManager g_arena_manager{};
 
 /// Get thread arena by thread ID.
 inline ThreadArena &get_arena(size_t thread_id) {
-    return g_arena_manager->get(thread_id);
+    return g_arena_manager.get(thread_id);
 }
 
 } // namespace Contest::platform
