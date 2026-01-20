@@ -50,6 +50,35 @@ template <typename T> class ArenaVector {
     /// Construct with arena reference.
     explicit ArenaVector(ThreadArena &arena) : arena_(&arena) {}
 
+    /// Move constructor - transfers ownership, leaves source empty.
+    ArenaVector(ArenaVector &&other) noexcept
+        : data_(other.data_), size_(other.size_), capacity_(other.capacity_),
+          arena_(other.arena_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
+    }
+
+    /// Move assignment - old data not freed (arena handles it).
+    ArenaVector &operator=(ArenaVector &&other) noexcept {
+        if (this != &other) {
+            data_ = other.data_;
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            arena_ = other.arena_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+        return *this;
+    }
+
+    /// Deleted copy constructor - arena memory shouldn't be shared.
+    ArenaVector(const ArenaVector &) = delete;
+
+    /// Deleted copy assignment.
+    ArenaVector &operator=(const ArenaVector &) = delete;
+
     /// Set arena after default construction.
     void set_arena(ThreadArena &arena) { arena_ = &arena; }
 

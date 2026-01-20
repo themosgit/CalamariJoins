@@ -16,6 +16,7 @@
 #include <data_model/intermediate.h>
 #include <join_execution/bloom_tags.h>
 #include <platform/arena.h>
+#include <platform/arena_vector.h>
 #include <platform/worker_pool.h>
 #include <vector>
 
@@ -121,11 +122,13 @@ class UnchainedHashtable {
     };
 
   private:
-    std::vector<uint64_t>
+    Contest::platform::ThreadArena *arena_ =
+        nullptr; /**< Arena for hash table allocations. */
+    Contest::platform::ArenaVector<uint64_t>
         directory; /**< Slot entries: (end_offset << 16) | bloom_tag. */
-    std::vector<int32_t>
+    Contest::platform::ArenaVector<int32_t>
         keys_; /**< Contiguous key storage, indexed by directory. */
-    std::vector<uint32_t>
+    Contest::platform::ArenaVector<uint32_t>
         row_ids_; /**< Parallel row_id storage, same indexing. */
     int shift =
         0; /**< Bit shift for slot calculation: slot = hash >> (64-shift). */
@@ -189,7 +192,7 @@ class UnchainedHashtable {
     void
     build_partition(const std::vector<std::vector<Partition>> &thread_parts,
                     size_t p, size_t slots_per_partition, size_t base_offset,
-                    size_t partition_size, int num_threads) {
+                    size_t partition_size, int num_threads, size_t thread_id) {
 
         const size_t slot_start = p * slots_per_partition;
         // Write offset for empty partitions
@@ -199,8 +202,11 @@ class UnchainedHashtable {
             }
             return;
         }
-        // Count keys per slot within partition
-        std::vector<uint32_t> counts(slots_per_partition, 0);
+        // Count keys per slot within partition - use thread-local arena
+        auto &arena = Contest::platform::get_arena(thread_id);
+        Contest::platform::ArenaVector<uint32_t> counts(arena);
+        counts.resize(slots_per_partition);
+        std::memset(counts.data(), 0, slots_per_partition * sizeof(uint32_t));
         for (int t = 0; t < num_threads; ++t) {
             for (Chunk *c = thread_parts[t][p].head; c; c = c->next) {
                 for (size_t i = 0; i < c->count; ++i) {
@@ -209,7 +215,8 @@ class UnchainedHashtable {
             }
         }
         // Prefix sum for write offsets
-        std::vector<uint32_t> offsets(slots_per_partition);
+        Contest::platform::ArenaVector<uint32_t> offsets(arena);
+        offsets.resize(slots_per_partition);
         uint32_t running = base_offset;
         for (size_t s = 0; s < slots_per_partition; ++s) {
             offsets[s] = running;
@@ -244,11 +251,14 @@ class UnchainedHashtable {
      *
      * Directory size rounded to power of 2 (min 2048) for fast modulo.
      */
-    explicit UnchainedHashtable(size_t build_size) {
+    explicit UnchainedHashtable(size_t build_size)
+        : arena_(&Contest::platform::get_arena(0)), directory(*arena_),
+          keys_(*arena_), row_ids_(*arena_) {
         size_t pow2 = 2048;
         while (pow2 < build_size)
             pow2 <<= 1;
-        directory.resize(pow2, 0);
+        directory.resize(pow2);
+        std::memset(directory.data(), 0, pow2 * sizeof(uint64_t));
         shift = __builtin_ctzll(pow2);
     }
 
@@ -352,7 +362,10 @@ class UnchainedHashtable {
         });
 
         // Compute global offsets from per-thread counts
-        std::vector<size_t> global_offsets(num_partitions + 1, 0);
+        Contest::platform::ArenaVector<size_t> global_offsets(*arena_);
+        global_offsets.resize(num_partitions + 1);
+        std::memset(global_offsets.data(), 0,
+                    (num_partitions + 1) * sizeof(size_t));
         for (size_t p = 0; p < num_partitions; ++p) {
             for (size_t t = 0; t < num_threads; ++t) {
                 global_offsets[p + 1] += thread_parts[t][p].total_count;
@@ -370,9 +383,9 @@ class UnchainedHashtable {
         const int nt = num_threads;
         Contest::platform::worker_pool().execute([&, nt](size_t t) {
             for (size_t p = t; p < num_partitions; p += nt) {
-                build_partition(thread_parts, p, slots_per_partition,
-                                global_offsets[p],
-                                global_offsets[p + 1] - global_offsets[p], nt);
+                build_partition(
+                    thread_parts, p, slots_per_partition, global_offsets[p],
+                    global_offsets[p + 1] - global_offsets[p], nt, t);
             }
         });
     }
@@ -391,7 +404,7 @@ class UnchainedHashtable {
         if (column.pages.empty())
             return;
 
-        std::vector<uint32_t> page_offsets;
+        Contest::platform::ArenaVector<uint32_t> page_offsets(*arena_);
         page_offsets.reserve(column.pages.size());
         size_t total_rows = 0;
         for (const auto &page : column.pages) {
@@ -462,7 +475,10 @@ class UnchainedHashtable {
             }
         });
 
-        std::vector<size_t> global_offsets(num_partitions + 1, 0);
+        Contest::platform::ArenaVector<size_t> global_offsets(*arena_);
+        global_offsets.resize(num_partitions + 1);
+        std::memset(global_offsets.data(), 0,
+                    (num_partitions + 1) * sizeof(size_t));
         for (size_t p = 0; p < num_partitions; ++p) {
             for (int t = 0; t < num_threads; ++t) {
                 global_offsets[p + 1] += thread_parts[t][p].total_count;
@@ -479,9 +495,9 @@ class UnchainedHashtable {
         const int nt = num_threads;
         Contest::platform::worker_pool().execute([&, nt](size_t t) {
             for (size_t p = t; p < num_partitions; p += nt) {
-                build_partition(thread_parts, p, slots_per_partition,
-                                global_offsets[p],
-                                global_offsets[p + 1] - global_offsets[p], nt);
+                build_partition(
+                    thread_parts, p, slots_per_partition, global_offsets[p],
+                    global_offsets[p + 1] - global_offsets[p], nt, t);
             }
         });
     }

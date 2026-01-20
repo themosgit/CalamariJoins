@@ -240,10 +240,13 @@ setup_join(const JoinInput &build_input, const JoinInput &probe_input,
  *
  * Unused columns get nullptr to skip PageIndex construction.
  */
-inline std::vector<const Column *>
+inline platform::ArenaVector<const Column *>
 collect_needed_columns(const JoinInput &input, const PlanNode &node,
-                       const std::vector<bool> &needed) {
-    std::vector<const Column *> columns(node.output_attrs.size(), nullptr);
+                       const platform::ArenaVector<uint8_t> &needed,
+                       platform::ThreadArena &arena) {
+    platform::ArenaVector<const Column *> columns(arena);
+    columns.resize(node.output_attrs.size());
+    std::memset(columns.data(), 0, columns.size() * sizeof(const Column *));
     auto *table = std::get<const ColumnarTable *>(input.data);
 
     for (size_t i = 0; i < node.output_attrs.size(); ++i) {
@@ -271,27 +274,34 @@ inline void prepare_output_columns(
     if (!build_is_columnar && !probe_is_columnar)
         return;
 
-    std::vector<bool> build_needed(build_node.output_attrs.size(), false);
-    std::vector<bool> probe_needed(probe_node.output_attrs.size(), false);
+    auto &arena = Contest::platform::get_arena(0);
+
+    platform::ArenaVector<uint8_t> build_needed(arena);
+    build_needed.resize(build_node.output_attrs.size());
+    std::memset(build_needed.data(), 0, build_needed.size());
+
+    platform::ArenaVector<uint8_t> probe_needed(arena);
+    probe_needed.resize(probe_node.output_attrs.size());
+    std::memset(probe_needed.data(), 0, probe_needed.size());
 
     for (const auto &[col_idx, dtype] : remapped_attrs) {
         if (col_idx < build_size) {
             if (build_is_columnar) {
-                build_needed[col_idx] = true;
+                build_needed[col_idx] = 1;
             }
         } else if (probe_is_columnar) {
-            probe_needed[col_idx - build_size] = true;
+            probe_needed[col_idx - build_size] = 1;
         }
     }
 
     if (build_is_columnar) {
-        reader.prepare_build(
-            collect_needed_columns(build_input, build_node, build_needed));
+        reader.prepare_build(collect_needed_columns(build_input, build_node,
+                                                    build_needed, arena));
     }
 
     if (probe_is_columnar) {
-        reader.prepare_probe(
-            collect_needed_columns(probe_input, probe_node, probe_needed));
+        reader.prepare_probe(collect_needed_columns(probe_input, probe_node,
+                                                    probe_needed, arena));
     }
 }
 

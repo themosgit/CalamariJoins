@@ -17,6 +17,7 @@
 #include <join_execution/match_collector.h>
 #include <join_execution/simd_compare.h>
 #include <materialization/construct_intermediate.h>
+#include <platform/arena_vector.h>
 #include <platform/worker_pool.h>
 #include <vector>
 
@@ -122,7 +123,8 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
     }
 
     const Column *probe_col = nullptr;
-    std::vector<uint32_t> page_offsets;
+    platform::ArenaVector<uint32_t> page_offsets(
+        Contest::platform::get_arena(0));
     if (probe_input.is_columnar()) {
         auto *table = std::get<const ColumnarTable *>(probe_input.data);
         auto [col_idx, _] = probe_input.node->output_attrs[probe_attr];

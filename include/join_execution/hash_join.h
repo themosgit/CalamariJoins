@@ -4,6 +4,7 @@
 #include <join_execution/hashtable.h>
 #include <join_execution/join_setup.h>
 #include <join_execution/match_collector.h>
+#include <platform/arena_vector.h>
 #include <platform/worker_pool.h>
 
 /**
@@ -146,7 +147,8 @@ probe_columnar(const UnchainedHashtable &hash_table,
     const Column &probe_col = table->columns[actual_idx_col];
     size_t num_pages = probe_col.pages.size();
 
-    std::vector<uint32_t> page_offsets;
+    auto &arena = Contest::platform::get_arena(0);
+    Contest::platform::ArenaVector<uint32_t> page_offsets(arena);
     page_offsets.reserve(num_pages);
     uint32_t running_offset = 0;
 
