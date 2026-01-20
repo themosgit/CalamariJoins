@@ -36,14 +36,16 @@
 #include <materialization/construct_intermediate.h>
 #include <materialization/materialize.h>
 #include <platform/arena.h>
+#include <platform/worker_pool.h>
 #include <variant>
 
 namespace Contest {
 
 using namespace join;
 
-using materialize::construct_intermediate;
+using materialize::construct_intermediate_from_buffers;
 using materialize::create_empty_result;
+using materialize::materialize_from_buffers;
 
 /**
  * @brief Result variant: ExecuteResult (intermediate, value_t columns) or
@@ -131,7 +133,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     bool build_is_columnar = build_input.is_columnar();
     bool probe_is_columnar = probe_input.is_columnar();
 
-    /* Nested loop for <8 rows (L1-resident, no hash overhead). */
+    /* Nested loop for <8 rows (L1-resident, no hash overhead, SIMD). */
     const size_t HASH_TABLE_THRESHOLD = 8;
     size_t build_rows = build_input.row_count(config.build_attr);
     bool use_nested_loop = (build_rows < HASH_TABLE_THRESHOLD);
@@ -150,20 +152,21 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
         config.remapped_attrs, config.build_left ? left_input.output_size()
                                                  : right_input.output_size());
 
-    MatchCollector collector(collection_mode);
+    JoinResult final_result;
 
-    /* Nested loop join for tiny tables. */
+    /* Unified no-merge path: always use ThreadLocalMatchBuffer */
+    std::vector<ThreadLocalMatchBuffer> match_buffers;
+
     if (use_nested_loop) {
-
         auto nested_loop_start = std::chrono::high_resolution_clock::now();
-
-        nested_loop_join(build_input, probe_input, config.build_attr,
-                         config.probe_attr, collector, collection_mode);
+        match_buffers =
+            nested_loop_join(build_input, probe_input, config.build_attr,
+                             config.probe_attr, collection_mode);
         auto nested_loop_end = std::chrono::high_resolution_clock::now();
-        auto nested_loop_elapsed =
+        stats.nested_loop_join_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                nested_loop_end - nested_loop_start);
-        stats.nested_loop_join_ms += nested_loop_elapsed.count();
+                nested_loop_end - nested_loop_start)
+                .count();
     } else {
         /* Hash join: radix-partitioned build, parallel probe. */
         auto build_start = std::chrono::high_resolution_clock::now();
@@ -172,42 +175,45 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
                 ? build_from_columnar(build_input, config.build_attr)
                 : build_from_intermediate(build_input, config.build_attr);
         auto build_end = std::chrono::high_resolution_clock::now();
-        auto build_elapsed =
+        stats.hashtable_build_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(build_end -
-                                                                  build_start);
-        stats.hashtable_build_ms += build_elapsed.count();
+                                                                  build_start)
+                .count();
 
-        /* Parallel probe: work-stealing, thread-local match buffers. */
         auto probe_start = std::chrono::high_resolution_clock::now();
         if (probe_is_columnar) {
-            probe_columnar(hash_table, probe_input, config.probe_attr,
-                           collector, collection_mode);
+            match_buffers = probe_columnar(hash_table, probe_input,
+                                           config.probe_attr, collection_mode);
         } else {
             const auto &probe_result =
                 std::get<ExecuteResult>(probe_input.data);
-            probe_intermediate(hash_table, probe_result[config.probe_attr],
-                               collector, collection_mode);
+            match_buffers = probe_intermediate(
+                hash_table, probe_result[config.probe_attr], collection_mode);
         }
         auto probe_end = std::chrono::high_resolution_clock::now();
-        auto probe_elapsed =
+        stats.hash_join_probe_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(probe_end -
-                                                                  probe_start);
-        stats.hash_join_probe_ms += probe_elapsed.count();
+                                                                  probe_start)
+                .count();
     }
-    JoinResult final_result;
+
+    size_t total_matches = 0;
+    for (const auto &buf : match_buffers) {
+        total_matches += buf.count();
+    }
+
     if (is_root) {
+        /* Root join: materialize to ColumnarTable */
         auto mat_start = std::chrono::high_resolution_clock::now();
-        /* Empty result: skip PageIndex/materialization overhead. */
-        if (collector.size() == 0) {
+        if (total_matches == 0) {
             final_result = create_empty_result(config.remapped_attrs);
         } else {
-            /* Lazy PageIndex: only for projected columns. */
             prepare_output_columns(
                 setup.columnar_reader, build_input, probe_input, build_node,
                 probe_node, config.remapped_attrs, build_input.output_size());
 
-            final_result = materialize::materialize(
-                collector, build_input, probe_input, config.remapped_attrs,
+            final_result = materialize_from_buffers(
+                match_buffers, build_input, probe_input, config.remapped_attrs,
                 build_node, probe_node, build_input.output_size(),
                 setup.columnar_reader, plan);
         }
@@ -216,21 +222,19 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
             std::chrono::duration_cast<std::chrono::milliseconds>(mat_end -
                                                                   mat_start)
                 .count();
-
     } else {
+        /* Non-root join: construct intermediate ExecuteResult */
         auto inter_start = std::chrono::high_resolution_clock::now();
-        if (collector.size() > 0) {
-            /* Lazy PageIndex for non-root. */
+        if (total_matches > 0) {
             prepare_output_columns(
                 setup.columnar_reader, build_input, probe_input, build_node,
                 probe_node, config.remapped_attrs, build_input.output_size());
 
-            construct_intermediate(collector, build_input, probe_input,
-                                   config.remapped_attrs, build_node,
-                                   probe_node, build_input.output_size(),
-                                   setup.columnar_reader, setup.results);
+            construct_intermediate_from_buffers(
+                match_buffers, build_input, probe_input, config.remapped_attrs,
+                build_node, probe_node, build_input.output_size(),
+                setup.columnar_reader, setup.results);
         }
-        /* Transfer setup.results ownership; held on stack until parent done. */
         final_result = std::move(setup.results);
         auto inter_end = std::chrono::high_resolution_clock::now();
         stats.intermediate_ms +=
@@ -253,7 +257,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
 ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
                       bool show_detailed_timing) {
     // Reset arena memory from previous query
-    Contest::platform::arena_manager.reset_all();
+    Contest::platform::g_arena_manager->reset_all();
 
     auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -293,8 +297,18 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     return std::move(std::get<ColumnarTable>(result));
 }
 
-void *build_context() { return nullptr; }
+void *build_context() {
+    platform::g_worker_pool = new platform::WorkerThreadPool();
+    platform::g_arena_manager = new platform::ArenaManager();
+    return nullptr;
+}
 
-void destroy_context(void *context) { (void)context; }
+void destroy_context(void *context) {
+    (void)context;
+    delete platform::g_arena_manager;
+    platform::g_arena_manager = nullptr;
+    delete platform::g_worker_pool;
+    platform::g_worker_pool = nullptr;
+}
 
 } // namespace Contest

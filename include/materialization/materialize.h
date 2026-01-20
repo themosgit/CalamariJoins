@@ -26,16 +26,28 @@ namespace Contest::materialize {
 using Contest::ExecuteResult;
 using Contest::io::ColumnarReader;
 using Contest::join::JoinInput;
-using Contest::join::MatchCollector;
 using Contest::join::resolve_input_source;
+using Contest::join::ThreadLocalMatchBuffer;
+using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
+/** @brief Creates empty ColumnarTable with correct column types for zero-match
+ * case. */
+inline ColumnarTable create_empty_result(
+    const std::vector<std::tuple<size_t, DataType>> &remapped_attrs) {
+    ColumnarTable empty_result;
+    empty_result.num_rows = 0;
+    for (auto [_, data_type] : remapped_attrs) {
+        empty_result.columns.emplace_back(data_type);
+    }
+    return empty_result;
+}
+
 /**
- * @brief Parallel materialization of a single output column from match results.
+ * @brief Parallel materialization of a single output column from thread-local
+ * buffers.
  *
- * Divides matches across threads, each building pages from preallocated mmap'd
- * memory. Uses BuilderType (Int32PageBuilder/VarcharPageBuilder) for
- * type-specific page construction.
+ * Each thread processes its own buffer directly without merge overhead.
  *
  * @tparam BuilderType     Int32PageBuilder or VarcharPageBuilder.
  * @tparam ReaderFunc      Callable: (row_id, cursor) -> value_t.
@@ -44,16 +56,15 @@ using Contest::platform::worker_pool;
  * VARCHAR).
  */
 template <typename BuilderType, typename ReaderFunc, typename InitBuilderFunc>
-inline void
-materialize_column(Column &dest_col, const MatchCollector &collector,
-                   ReaderFunc &&read_value, InitBuilderFunc &&init_builder,
-                   bool from_build, size_t est_bytes_per_row) {
-    const size_t total_matches = collector.size();
+inline void materialize_column_from_buffers(
+    Column &dest_col, std::vector<ThreadLocalMatchBuffer> &buffers,
+    size_t total_matches, ReaderFunc &&read_value,
+    InitBuilderFunc &&init_builder, bool from_build, size_t est_bytes_per_row) {
+
     if (total_matches == 0)
         return;
 
-    const_cast<MatchCollector &>(collector).ensure_finalized();
-    constexpr int num_threads = worker_pool.thread_count();
+    const int num_threads = THREAD_COUNT;
 
     size_t matches_per_thread = (total_matches + num_threads - 1) / num_threads;
     size_t usable_per_page = PAGE_SIZE - 256;
@@ -74,11 +85,12 @@ materialize_column(Column &dest_col, const MatchCollector &collector,
         thread_columns.emplace_back(dest_col.type);
     }
 
-    worker_pool.execute([&](size_t t) {
-        size_t num_threads = worker_pool.thread_count();
-        size_t start = t * total_matches / num_threads;
-        size_t end = (t + 1) * total_matches / num_threads;
-        if (start >= end)
+    worker_pool().execute([&](size_t t) {
+        if (t >= buffers.size())
+            return;
+        auto &buf = buffers[t];
+        size_t my_count = buf.count();
+        if (my_count == 0)
             return;
 
         Column &local_col = thread_columns[t];
@@ -104,13 +116,12 @@ materialize_column(Column &dest_col, const MatchCollector &collector,
         };
 
         BuilderType builder = init_builder(page_allocator);
-        builder.prepare(end - start);
+        builder.prepare(my_count);
 
         const size_t check_interval = BuilderType::MIN_ROWS_PER_PAGE_CHECK;
         size_t rows_since_check = 0;
 
-        auto range = from_build ? collector.get_left_range(start, end - start)
-                                : collector.get_right_range(start, end - start);
+        auto range = from_build ? buf.left_range() : buf.right_range();
 
         for (uint32_t row_id : range) {
             bool flushed = builder.add(read_value(row_id, cursor));
@@ -147,18 +158,19 @@ materialize_column(Column &dest_col, const MatchCollector &collector,
 }
 
 /**
- * @brief Materializes a single output column from join matches.
+ * @brief Materializes a single output column from thread-local buffers.
  *
  * Dispatcher that determines source location (columnar/intermediate,
- * build/probe), selects page builder type, and invokes materialize_column<>.
- * VARCHAR handling requires source Column pointer for string dereferencing.
+ * build/probe), selects page builder type, and invokes
+ * materialize_column_from_buffers<>. VARCHAR handling requires source Column
+ * pointer for string dereferencing.
  */
-inline void materialize_single_column(
+inline void materialize_single_column_from_buffers(
     Column &dest_col, size_t col_idx, size_t build_size,
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input, const PlanNode &build_node,
-    const PlanNode &probe_node, ColumnarReader &columnar_reader,
-    const Plan &plan) {
+    std::vector<ThreadLocalMatchBuffer> &buffers, size_t total_matches,
+    const JoinInput &build_input, const JoinInput &probe_input,
+    const PlanNode &build_node, const PlanNode &probe_node,
+    ColumnarReader &columnar_reader, const Plan &plan) {
 
     auto [input, node, local_idx] = resolve_input_source(
         col_idx, build_size, build_input, build_node, probe_input, probe_node);
@@ -189,8 +201,8 @@ inline void materialize_single_column(
         auto init = [](std::function<Page *()> alloc) {
             return Int32PageBuilder(std::move(alloc));
         };
-        materialize_column<Int32PageBuilder>(
-            dest_col, collector,
+        materialize_column_from_buffers<Int32PageBuilder>(
+            dest_col, buffers, total_matches,
             [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
                 return reader(rid, cursor, DataType::INT32);
             },
@@ -208,8 +220,8 @@ inline void materialize_single_column(
         return VarcharPageBuilder(*str_src_ptr, std::move(alloc));
     };
 
-    materialize_column<VarcharPageBuilder>(
-        dest_col, collector,
+    materialize_column_from_buffers<VarcharPageBuilder>(
+        dest_col, buffers, total_matches,
         [&](uint32_t rid, ColumnarReader::Cursor &cursor) {
             return reader(rid, cursor, DataType::VARCHAR);
         },
@@ -217,13 +229,12 @@ inline void materialize_single_column(
 }
 
 /**
- * @brief Materializes all output columns into a new ColumnarTable.
+ * @brief Materializes all output columns from thread-local buffers into
+ * ColumnarTable.
  *
- * Dereferences VARCHAR value_t references into actual string bytes. Differs
- * from construct_intermediate: outputs ColumnarTable (8KB pages) with copied
- * strings vs ExecuteResult (16KB pages, value_t references).
+ * Dereferences VARCHAR value_t references into actual string bytes.
  *
- * @param collector        Match collection from join execution.
+ * @param buffers          Thread-local match buffers from probe.
  * @param build_input      Build side data source.
  * @param probe_input      Probe side data source.
  * @param remapped_attrs   Output projection: (col_idx, DataType) pairs.
@@ -237,18 +248,23 @@ inline void materialize_single_column(
  * @see construct_intermediate.h for creating intermediate ExecuteResult.
  * @see page_builders.h for Int32PageBuilder and VarcharPageBuilder.
  */
-inline ColumnarTable
-materialize(const MatchCollector &collector, const JoinInput &build_input,
-            const JoinInput &probe_input,
-            const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
-            const PlanNode &build_node, const PlanNode &probe_node,
-            size_t build_size, ColumnarReader &columnar_reader,
-            const Plan &plan) {
+inline ColumnarTable materialize_from_buffers(
+    std::vector<ThreadLocalMatchBuffer> &buffers, const JoinInput &build_input,
+    const JoinInput &probe_input,
+    const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
+    const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
+    ColumnarReader &columnar_reader, const Plan &plan) {
+
+    // Compute total_matches
+    size_t total_matches = 0;
+    for (const auto &buf : buffers) {
+        total_matches += buf.count();
+    }
 
     ColumnarTable result;
-    result.num_rows = collector.size();
+    result.num_rows = total_matches;
 
-    if (collector.size() == 0) {
+    if (total_matches == 0) {
         for (auto [_, dtype] : remapped_attrs) {
             result.columns.emplace_back(dtype);
         }
@@ -259,23 +275,11 @@ materialize(const MatchCollector &collector, const JoinInput &build_input,
         auto [col_idx, data_type] = remapped_attrs[out_idx];
         result.columns.emplace_back(data_type);
         Column &dest_col = result.columns.back();
-        materialize_single_column(dest_col, col_idx, build_size, collector,
-                                  build_input, probe_input, build_node,
-                                  probe_node, columnar_reader, plan);
+        materialize_single_column_from_buffers(
+            dest_col, col_idx, build_size, buffers, total_matches, build_input,
+            probe_input, build_node, probe_node, columnar_reader, plan);
     }
     return result;
-}
-
-/** @brief Creates empty ColumnarTable with correct column types for zero-match
- * case. */
-inline ColumnarTable create_empty_result(
-    const std::vector<std::tuple<size_t, DataType>> &remapped_attrs) {
-    ColumnarTable empty_result;
-    empty_result.num_rows = 0;
-    for (auto [_, data_type] : remapped_attrs) {
-        empty_result.columns.emplace_back(data_type);
-    }
-    return empty_result;
 }
 
 } // namespace Contest::materialize

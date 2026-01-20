@@ -15,15 +15,10 @@
 #include <data_model/plan.h>
 #include <join_execution/join_setup.h>
 #include <join_execution/match_collector.h>
+#include <join_execution/simd_compare.h>
 #include <materialization/construct_intermediate.h>
 #include <platform/worker_pool.h>
 #include <vector>
-
-#if defined(__x86_64__)
-#include <immintrin.h>
-#elif defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 
 /**
  * @namespace Contest::join
@@ -32,6 +27,7 @@
 namespace Contest::join {
 
 using Contest::ExecuteResult;
+using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 /**
@@ -91,22 +87,21 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
  * and register-resident comparison.
  *
  * @param mode BOTH, LEFT_ONLY, or RIGHT_ONLY.
+ * @return Thread-local match buffers for direct iteration.
  */
-inline void
+inline std::vector<ThreadLocalMatchBuffer>
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                  size_t build_attr, size_t probe_attr,
-                 MatchCollector &collector,
                  MatchCollectionMode mode = MatchCollectionMode::BOTH) {
     size_t build_rows = build_input.row_count(build_attr);
     size_t probe_rows = probe_input.row_count(probe_attr);
 
     if (build_rows == 0 || probe_rows == 0)
-        return;
+        return {};
 
-    /**
-     * MAX_BUILD_SIZE = 8 fits in 1 AVX2 register or 2 NEON registers.
-     * Register-resident comparison eliminates memory access in inner loop.
-     */
+    size_t num_threads = THREAD_COUNT;
+    std::vector<ThreadLocalMatchBuffer> buffers(num_threads);
+
     constexpr size_t MAX_BUILD_SIZE = 8;
     alignas(32) int32_t b_vals[MAX_BUILD_SIZE];
     alignas(16) uint32_t b_ids[MAX_BUILD_SIZE];
@@ -122,13 +117,9 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
 
     visit_rows(build_input, build_attr, collect_build);
 
-    // Pad unused slots with INT32_MIN (won't match real join keys)
     for (size_t i = b_count; i < MAX_BUILD_SIZE; ++i) {
         b_vals[i] = INT32_MIN;
     }
-
-    size_t num_threads = worker_pool.thread_count();
-    auto buffers = create_thread_local_buffers(num_threads, mode);
 
     const Column *probe_col = nullptr;
     std::vector<uint32_t> page_offsets;
@@ -147,68 +138,15 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
     }
     std::atomic<size_t> probe_page_counter{0};
 
-    worker_pool.execute([&](size_t t_id) {
+    worker_pool().execute([&](size_t t_id) {
+        buffers[t_id] =
+            ThreadLocalMatchBuffer(Contest::platform::get_arena(t_id), mode);
         auto &local_buffer = buffers[t_id];
 
-#if defined(__x86_64__) && defined(__AVX2__)
-        // Load build values into YMM register (register-resident)
-        __m256i build_reg =
-            _mm256_load_si256(reinterpret_cast<const __m256i *>(b_vals));
-        const int valid_mask = (1 << b_count) - 1;
-
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
-            __m256i probe_reg = _mm256_set1_epi32(p_val);
-            __m256i cmp = _mm256_cmpeq_epi32(probe_reg, build_reg);
-            int mask =
-                _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) & valid_mask;
-            while (mask) {
-                int idx = __builtin_ctz(mask);
-                local_buffer.add_match(b_ids[idx], p_id);
-                mask &= mask - 1;
-            }
+            simd::eq_scan_build(p_id, p_val, b_vals, b_ids, b_count,
+                                local_buffer);
         };
-
-#elif defined(__aarch64__)
-        // Load build values into 2 NEON registers (4 + 4 = 8 values)
-        int32x4_t build_lo = vld1q_s32(b_vals);
-        int32x4_t build_hi = vld1q_s32(b_vals + 4);
-        const uint32_t valid_mask = (1u << b_count) - 1;
-
-        // Bit position masks for efficient movemask emulation
-        static constexpr uint32_t mask_bits_lo[4] = {1, 2, 4, 8};
-        static constexpr uint32_t mask_bits_hi[4] = {16, 32, 64, 128};
-        const uint32x4_t bit_mask_lo = vld1q_u32(mask_bits_lo);
-        const uint32x4_t bit_mask_hi = vld1q_u32(mask_bits_hi);
-
-        auto process_value = [&](uint32_t p_id, int32_t p_val) {
-            int32x4_t probe_reg = vdupq_n_s32(p_val);
-
-            // Compare: result is 0xFFFFFFFF or 0x00000000 per lane
-            uint32x4_t cmp_lo = vceqq_s32(probe_reg, build_lo);
-            uint32x4_t cmp_hi = vceqq_s32(probe_reg, build_hi);
-
-            // AND with bit positions, then horizontal add to get mask
-            uint32_t mask = vaddvq_u32(vandq_u32(cmp_lo, bit_mask_lo)) |
-                            vaddvq_u32(vandq_u32(cmp_hi, bit_mask_hi));
-            mask &= valid_mask;
-
-            while (mask) {
-                int idx = __builtin_ctz(mask);
-                local_buffer.add_match(b_ids[idx], p_id);
-                mask &= mask - 1;
-            }
-        };
-
-#else
-        // Scalar fallback for non-SIMD architectures
-        auto process_value = [&](uint32_t p_id, int32_t p_val) {
-            for (size_t k = 0; k < b_count; ++k) {
-                if (b_vals[k] == p_val) {
-                    local_buffer.add_match(b_ids[k], p_id);
-                }
-            }
-        };
-#endif
 
         if (probe_input.is_columnar()) {
             size_t num_pages = probe_col->pages.size();
@@ -226,7 +164,13 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                 uint32_t row_id = page_offsets[i];
 
                 if (num_rows == num_values) {
-                    for (uint16_t j = 0; j < num_rows; j++) {
+                    // SIMD batch: process multiple probe values at a time
+                    uint16_t j =
+                        simd::eq_batch_columnar(data, num_rows, row_id, b_vals,
+                                                b_ids, b_count, local_buffer);
+                    row_id += j;
+                    // Handle remaining elements with scalar
+                    for (; j < num_rows; j++) {
                         process_value(row_id++, data[j]);
                     }
                 } else {
@@ -245,19 +189,48 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
             const auto &res = std::get<ExecuteResult>(probe_input.data);
             const mema::column_t &col = res[probe_attr];
             size_t count = col.row_count();
-            size_t start = (t_id * count) / worker_pool.thread_count();
-            size_t end = ((t_id + 1) * count) / worker_pool.thread_count();
+            size_t start = (t_id * count) / THREAD_COUNT;
+            size_t end = ((t_id + 1) * count) / THREAD_COUNT;
 
-            for (size_t i = start; i < end; i++) {
+            constexpr size_t BATCH_SIZE = simd::INTERMEDIATE_BATCH_SIZE;
+            size_t i = start;
+
+            if constexpr (BATCH_SIZE > 0) {
+                // SIMD batch processing
+                for (; i + BATCH_SIZE <= end; i += BATCH_SIZE) {
+                    size_t page_idx = i >> 12;
+                    size_t offset = i & 0xFFF;
+
+                    // Only use SIMD if all values are on same page
+                    if (offset + BATCH_SIZE <= mema::CAP_PER_PAGE) {
+                        const int32_t *vals = reinterpret_cast<const int32_t *>(
+                            &col.pages[page_idx]->data[offset]);
+                        simd::eq_batch_intermediate(vals, i, b_vals, b_ids,
+                                                    b_count, local_buffer);
+                    } else {
+                        // Cross-page boundary: fall back to scalar
+                        for (size_t j = i; j < i + BATCH_SIZE; j++) {
+                            const mema::value_t &val = col[j];
+                            if (!val.is_null()) {
+                                process_value(static_cast<uint32_t>(j),
+                                              val.value);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle remaining elements (or all elements if no SIMD)
+            for (; i < end; i++) {
                 const mema::value_t &val = col[i];
                 if (!val.is_null()) {
-                    process_value((uint32_t)i, val.value);
+                    process_value(static_cast<uint32_t>(i), val.value);
                 }
             }
         }
     });
-    for (auto &buf : buffers) {
-        collector.merge_thread_buffer(buf);
-    }
+
+    return buffers;
 }
+
 } // namespace Contest::join

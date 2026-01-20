@@ -24,6 +24,7 @@
 namespace Contest::join {
 
 using Contest::ExecuteResult;
+using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 /**
@@ -62,29 +63,28 @@ inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
 }
 
 /**
- * @brief Probe hash table with intermediate input using work-stealing.
+ * @brief Probe hash table with intermediate input, returning thread-local
+ * buffers.
  *
- * Pages distributed via atomic counter. Thread-local match buffers merged
- * after processing. Skips NULL keys via is_null() check.
- *
- * @param mode BOTH (inner), LEFT_ONLY, or RIGHT_ONLY.
+ * Each thread keeps its buffer for direct iteration without merge overhead.
  */
-inline void
+inline std::vector<ThreadLocalMatchBuffer>
 probe_intermediate(const UnchainedHashtable &hash_table,
                    const mema::column_t &probe_column,
-                   MatchCollector &collector,
                    MatchCollectionMode mode = MatchCollectionMode::BOTH) {
     const auto *keys = hash_table.keys();
     const auto *row_ids = hash_table.row_ids();
 
-    size_t pool_size = worker_pool.thread_count();
-    auto local_buffers = create_thread_local_buffers(pool_size, mode);
+    size_t pool_size = THREAD_COUNT;
+    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
 
     const size_t num_pages = probe_column.pages.size();
     const size_t probe_count = probe_column.row_count();
     std::atomic<size_t> page_counter(0);
 
-    worker_pool.execute([&](size_t thread_id) {
+    worker_pool().execute([&](size_t thread_id) {
+        local_buffers[thread_id] = ThreadLocalMatchBuffer(
+            Contest::platform::get_arena(thread_id), mode);
         auto &local_buf = local_buffers[thread_id];
 
         while (true) {
@@ -115,8 +115,8 @@ probe_intermediate(const UnchainedHashtable &hash_table,
 
                     for (uint64_t i = start_idx; i < end_idx; ++i) {
                         if (keys[i] == key_val) {
-                            // Optimized add
-                            local_buf.add_match(row_ids[i], idx);
+                            local_buf.add_match(row_ids[i],
+                                                static_cast<uint32_t>(idx));
                         }
                     }
                 }
@@ -124,21 +124,18 @@ probe_intermediate(const UnchainedHashtable &hash_table,
         }
     });
 
-    merge_local_collectors(local_buffers, collector);
+    return local_buffers;
 }
 
 /**
- * @brief Probe hash table with ColumnarTable input using work-stealing.
+ * @brief Probe hash table with ColumnarTable input, returning thread-local
+ * buffers.
  *
- * Handles dense (no NULLs) and sparse (bitmap) pages. Page offsets precomputed
- * for global row ID translation.
- *
- * @param mode BOTH (inner), LEFT_ONLY, or RIGHT_ONLY.
+ * Each thread keeps its buffer for direct iteration without merge overhead.
  */
-inline void
+inline std::vector<ThreadLocalMatchBuffer>
 probe_columnar(const UnchainedHashtable &hash_table,
                const JoinInput &probe_input, size_t probe_attr,
-               MatchCollector &collector,
                MatchCollectionMode mode = MatchCollectionMode::BOTH) {
 
     const auto *keys = hash_table.keys();
@@ -159,11 +156,13 @@ probe_columnar(const UnchainedHashtable &hash_table,
         running_offset += num_rows;
     }
 
-    size_t pool_size = worker_pool.thread_count();
-    auto local_buffers = create_thread_local_buffers(pool_size, mode);
+    size_t pool_size = THREAD_COUNT;
+    std::vector<ThreadLocalMatchBuffer> local_buffers(pool_size);
 
     std::atomic<size_t> page_counter(0);
-    worker_pool.execute([&](size_t thread_id) {
+    worker_pool().execute([&](size_t thread_id) {
+        local_buffers[thread_id] = ThreadLocalMatchBuffer(
+            Contest::platform::get_arena(thread_id), mode);
         auto &local_buf = local_buffers[thread_id];
 
         while (true) {
@@ -201,8 +200,8 @@ probe_columnar(const UnchainedHashtable &hash_table,
                 for (uint16_t i = 0; i < num_rows; ++i) {
                     bool is_valid = bitmap[i / 8] & (1u << (i % 8));
                     if (is_valid) {
-                            hash_table.prefetch_slot(
-                                data_begin[data_idx + PREFETCH_DIST]);
+                        hash_table.prefetch_slot(
+                            data_begin[data_idx + PREFETCH_DIST]);
 
                         int32_t key_val = data_begin[data_idx++];
                         auto [start_idx, end_idx] =
@@ -220,6 +219,7 @@ probe_columnar(const UnchainedHashtable &hash_table,
         }
     });
 
-    merge_local_collectors(local_buffers, collector);
+    return local_buffers;
 }
+
 } // namespace Contest::join

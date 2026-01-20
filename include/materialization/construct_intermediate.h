@@ -25,32 +25,8 @@ namespace Contest::materialize {
 using Contest::ExecuteResult;
 using Contest::io::ColumnarReader;
 using Contest::join::JoinInput;
-using Contest::join::MatchCollector;
+using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
-
-/**
- * @brief Preallocates arena memory for all output columns.
- *
- * Distributes page allocations across all thread arenas to balance memory
- * usage.
- *
- * @param results       Output columns to allocate (modified in-place).
- * @param total_matches Number of rows (match count from MatchCollector).
- *
- * @see column_t::pre_allocate_from_arena() for arena partitioning.
- */
-inline void batch_allocate_for_results(ExecuteResult &results,
-                                       size_t total_matches) {
-    size_t num_threads = worker_pool.thread_count();
-    size_t col_idx = 0;
-    for (auto &col : results) {
-        // Round-robin allocation across threads to distribute memory pressure
-        size_t thread_id = col_idx % num_threads;
-        col.pre_allocate_from_arena(Contest::platform::get_arena(thread_id),
-                                    total_matches);
-        col_idx++;
-    }
-}
 
 /**
  * @brief Precomputed metadata for resolving an output column's source.
@@ -113,13 +89,13 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
 }
 
 /**
- * @brief Populates ExecuteResult columns from join matches in parallel.
+ * @brief Constructs intermediate results directly from thread-local buffers.
  *
- * Core materialization for non-root joins. Transforms match row ID pairs into
- * column_t with value_t encoding. Uses intermediate format (4-byte references)
- * for cache efficiency; only root node converts to ColumnarTable.
+ * Each thread iterates its own buffer, avoiding the merge step. Total matches
+ * computed by summing buffer counts. Each thread writes its contiguous portion
+ * of output pages.
  *
- * @param collector        MatchCollector with finalized match row IDs.
+ * @param buffers          Vector of ThreadLocalMatchBuffer from probe.
  * @param build_input      Build side data (ColumnarTable* or ExecuteResult).
  * @param probe_input      Probe side data (ColumnarTable* or ExecuteResult).
  * @param remapped_attrs   Output column specifications (global indexing).
@@ -128,60 +104,109 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
  * @param build_size       Number of output columns from build side.
  * @param columnar_reader  ColumnarReader with Cursor caching for page access.
  * @param results          Pre-initialized ExecuteResult, populated in-place.
- *
- * @note For root joins, use materialize() instead.
- * @see intermediate.h for column_t format and value_t encoding.
- * @see prepare_sources() for source metadata precomputation.
- * @see batch_allocate_for_results() for single mmap allocation.
  */
-inline void construct_intermediate(
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input,
+inline void construct_intermediate_from_buffers(
+    std::vector<Contest::join::ThreadLocalMatchBuffer> &buffers,
+    const JoinInput &build_input, const JoinInput &probe_input,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, ExecuteResult &results) {
-    const_cast<MatchCollector &>(collector).ensure_finalized();
-    const size_t total_matches = collector.size();
+
+    // Compute total matches and per-buffer start offsets
+    size_t total_matches = 0;
+    std::vector<size_t> buffer_starts(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        buffer_starts[i] = total_matches;
+        total_matches += buffers[i].count();
+    }
+
     if (total_matches == 0)
         return;
 
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
-    batch_allocate_for_results(results, total_matches);
 
-    worker_pool.execute([&](size_t t) {
-        Contest::ColumnarReader::Cursor cursor;
-        size_t num_threads = worker_pool.thread_count();
-        size_t start = t * total_matches / num_threads;
-        size_t end = (t + 1) * total_matches / num_threads;
-        if (start >= end)
+    const size_t num_threads = THREAD_COUNT;
+    const size_t num_cols = sources.size();
+
+    // Pre-size page vectors for each column
+    using Page = mema::column_t::Page;
+    size_t total_pages_needed =
+        (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
+
+    for (size_t c = 0; c < num_cols; ++c) {
+        auto &col = results[c];
+        col.pages.resize(total_pages_needed);
+        col.set_row_count(total_matches);
+    }
+
+    // Parallel page allocation - each thread allocates its own pages
+    worker_pool().execute([&](size_t t) {
+        for (size_t c = 0; c < num_cols; ++c) {
+            auto &col = results[c];
+            for (size_t p = t; p < total_pages_needed; p += num_threads) {
+                void *ptr =
+                    Contest::platform::get_arena(t)
+                        .alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
+                col.pages[p] = reinterpret_cast<Page *>(ptr);
+            }
+        }
+    });
+
+    // Parallel: each thread processes its own buffer
+    worker_pool().execute([&](size_t t) {
+        if (t >= buffers.size())
+            return;
+        auto &buf = buffers[t];
+        size_t my_count = buf.count();
+        if (my_count == 0)
             return;
 
-        for (size_t i = 0; i < sources.size(); ++i) {
-            const auto &src = sources[i];
-            auto &dest_col = results[i];
+        size_t start = buffer_starts[t];
+        Contest::ColumnarReader::Cursor cursor;
 
-            auto range = src.from_build
-                             ? collector.get_left_range(start, end - start)
-                             : collector.get_right_range(start, end - start);
+        for (size_t c = 0; c < num_cols; ++c) {
+            const auto &src = sources[c];
+            auto &dest_col = results[c];
+
+            auto left_range = buf.left_range();
+            auto right_range = buf.right_range();
 
             if (src.is_columnar) {
                 const auto &col = *src.columnar_col;
-                size_t k = start;
-                for (uint32_t rid : range) {
-                    dest_col.write_at(k++,
-                                      columnar_reader.read_value(
-                                          col, src.remapped_col_idx, rid,
-                                          col.type, cursor, src.from_build));
+                if (src.from_build) {
+                    size_t k = start;
+                    for (uint32_t rid : left_range) {
+                        dest_col.write_at(k++,
+                                          columnar_reader.read_value(
+                                              col, src.remapped_col_idx, rid,
+                                              col.type, cursor, true));
+                    }
+                } else {
+                    size_t k = start;
+                    for (uint32_t rid : right_range) {
+                        dest_col.write_at(k++,
+                                          columnar_reader.read_value(
+                                              col, src.remapped_col_idx, rid,
+                                              col.type, cursor, false));
+                    }
                 }
             } else {
                 const auto &vec = *src.intermediate_col;
-                size_t k = start;
-                for (uint32_t rid : range) {
-                    dest_col.write_at(k++, vec[rid]);
+                if (src.from_build) {
+                    size_t k = start;
+                    for (uint32_t rid : left_range) {
+                        dest_col.write_at(k++, vec[rid]);
+                    }
+                } else {
+                    size_t k = start;
+                    for (uint32_t rid : right_range) {
+                        dest_col.write_at(k++, vec[rid]);
+                    }
                 }
             }
         }
     });
 }
+
 } // namespace Contest::materialize

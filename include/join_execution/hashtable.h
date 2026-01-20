@@ -44,7 +44,6 @@ static constexpr size_t L2_CACHE = SPC__LEVEL2_CACHE_SIZE;
 static constexpr size_t CACHE_LINE = SPC__LEVEL1_DCACHE_LINESIZE;
 
 using Contest::join::BLOOM_TAGS;
-using Contest::platform::worker_pool;
 
 /**
  * @brief High-performance unchained hash table for parallel equi-joins.
@@ -164,7 +163,8 @@ class UnchainedHashtable {
      * Targets 50% of per-core LLC. Power-of-2 for fast modulo via bit shift.
      */
     size_t compute_num_partitions(size_t tuple_count, int num_threads) const {
-        size_t per_core_cache = LAST_LEVEL_CACHE / worker_pool.thread_count();
+        size_t per_core_cache =
+            LAST_LEVEL_CACHE / Contest::platform::worker_pool().thread_count();
         size_t target_bytes = per_core_cache / 2;
         size_t bytes_per_tuple = sizeof(Tuple);
         size_t tuples_per_partition = target_bytes / bytes_per_tuple;
@@ -316,7 +316,7 @@ class UnchainedHashtable {
          * @brief Below 10K rows, single-threaded build is faster.
          */
         static constexpr size_t PARALLEL_BUILD_THRESHOLD = 10000;
-        num_threads = worker_pool.thread_count();
+        num_threads = Contest::platform::worker_pool().thread_count();
         if (row_count < PARALLEL_BUILD_THRESHOLD)
             num_threads = 1;
 
@@ -336,7 +336,7 @@ class UnchainedHashtable {
 
         // Partition data by hash
         size_t batch = (row_count + num_threads - 1) / num_threads;
-        worker_pool.execute([&, partition_bits](size_t t) {
+        Contest::platform::worker_pool().execute([&, partition_bits](size_t t) {
             size_t start = t * batch;
             size_t end = std::min(start + batch, row_count);
             if (start >= end)
@@ -368,7 +368,7 @@ class UnchainedHashtable {
 
         // Build partitions in parallel
         const int nt = num_threads;
-        worker_pool.execute([&, nt](size_t t) {
+        Contest::platform::worker_pool().execute([&, nt](size_t t) {
             for (size_t p = t; p < num_partitions; p += nt) {
                 build_partition(thread_parts, p, slots_per_partition,
                                 global_offsets[p],
@@ -401,7 +401,8 @@ class UnchainedHashtable {
         if (total_rows == 0)
             return;
 
-        num_threads = std::clamp(num_threads, 1, worker_pool.thread_count());
+        num_threads = std::clamp(
+            num_threads, 1, Contest::platform::worker_pool().thread_count());
         if (column.pages.size() < 16)
             num_threads = 1;
 
@@ -420,7 +421,7 @@ class UnchainedHashtable {
             tp.resize(num_partitions);
 
         size_t batch = (num_pages + num_threads - 1) / num_threads;
-        worker_pool.execute([&, partition_bits](size_t t) {
+        Contest::platform::worker_pool().execute([&, partition_bits](size_t t) {
             size_t pg_start = t * batch;
             size_t pg_end = std::min(pg_start + batch, num_pages);
             if (pg_start >= pg_end)
@@ -476,7 +477,7 @@ class UnchainedHashtable {
         row_ids_.resize(total);
 
         const int nt = num_threads;
-        worker_pool.execute([&, nt](size_t t) {
+        Contest::platform::worker_pool().execute([&, nt](size_t t) {
             for (size_t p = t; p < num_partitions; p += nt) {
                 build_partition(thread_parts, p, slots_per_partition,
                                 global_offsets[p],
