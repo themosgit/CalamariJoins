@@ -145,7 +145,7 @@ class UnchainedHashtable {
         return BLOOM_TAGS[(h >> 32) & 0x7FF];
     }
 
-    size_t slot_for(uint64_t h) const noexcept { return h >> (64 - shift); }
+    inline size_t slot_for(uint64_t h) const noexcept { return h >> (64 - shift); }
 
     /**
      * @brief Computes partition count to fit each in per-core LLC share.
@@ -252,6 +252,18 @@ class UnchainedHashtable {
 
     /** @brief Direct access to row_id array for probe. */
     const uint32_t *row_ids() const noexcept { return row_ids_.data(); }
+
+    /**
+     * @brief Prefetch directory slot for a key to hide memory latency.
+     *
+     * Call N iterations ahead in probe loop to overlap directory fetch
+     * with current iteration's work. Typical PREFETCH_DIST: 8-16.
+     */
+    void prefetch_slot(int32_t key) const noexcept {
+        uint64_t h = hash_key(key);
+        size_t slot = slot_for(h);
+        __builtin_prefetch(&directory[slot], 0, 2);
+    }
 
     /**
      * @brief Find index range for keys matching probe key.

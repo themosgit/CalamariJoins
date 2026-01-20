@@ -96,7 +96,16 @@ probe_intermediate(const UnchainedHashtable &hash_table,
             size_t page_end =
                 std::min(base_row + mema::CAP_PER_PAGE, probe_count);
 
+            constexpr size_t PREFETCH_DIST = 8;
             for (size_t idx = base_row; idx < page_end; ++idx) {
+                if (idx + PREFETCH_DIST < page_end) {
+                    const mema::value_t &future_key =
+                        probe_column[idx + PREFETCH_DIST];
+                    if (!future_key.is_null()) {
+                        hash_table.prefetch_slot(future_key.value);
+                    }
+                }
+
                 const mema::value_t &key = probe_column[idx];
 
                 if (!key.is_null()) {
@@ -169,7 +178,10 @@ probe_columnar(const UnchainedHashtable &hash_table,
             uint32_t probe_row_id = page_offsets[page_idx];
 
             if (num_rows == num_values) {
+                constexpr int PREFETCH_DIST = 32;
                 for (uint16_t i = 0; i < num_rows; ++i) {
+                    hash_table.prefetch_slot(data_begin[i + PREFETCH_DIST]);
+
                     int32_t key_val = data_begin[i];
                     auto [start_idx, end_idx] =
                         hash_table.find_indices(key_val);
@@ -184,10 +196,14 @@ probe_columnar(const UnchainedHashtable &hash_table,
             } else {
                 auto *bitmap = reinterpret_cast<const uint8_t *>(
                     page + PAGE_SIZE - (num_rows + 7) / 8);
+                constexpr int PREFETCH_DIST = 32;
                 uint16_t data_idx = 0;
                 for (uint16_t i = 0; i < num_rows; ++i) {
                     bool is_valid = bitmap[i / 8] & (1u << (i % 8));
                     if (is_valid) {
+                            hash_table.prefetch_slot(
+                                data_begin[data_idx + PREFETCH_DIST]);
+
                         int32_t key_val = data_begin[data_idx++];
                         auto [start_idx, end_idx] =
                             hash_table.find_indices(key_val);
