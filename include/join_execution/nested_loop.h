@@ -19,6 +19,12 @@
 #include <platform/worker_pool.h>
 #include <vector>
 
+#if defined(__x86_64__)
+#include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 /**
  * @namespace Contest::join
  * @brief visit_rows() iterator, nested_loop_join() for tiny build tables.
@@ -78,10 +84,11 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
 }
 
 /**
- * @brief Nested loop join for small build tables (<=64 rows).
+ * @brief Nested loop join for small build tables (<=8 rows).
  *
- * Build keys/IDs in stack arrays (512 bytes, L1-resident). Parallel probe
- * via work-stealing. Beats hash join for <8 rows due to no hash overhead.
+ * Build keys/IDs in SIMD registers (AVX2/NEON). Parallel probe via
+ * work-stealing. Beats hash join for <8 rows due to no hash overhead
+ * and register-resident comparison.
  *
  * @param mode BOTH, LEFT_ONLY, or RIGHT_ONLY.
  */
@@ -97,11 +104,12 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
         return;
 
     /**
-     * MAX_BUILD_SIZE = 64 fits in L1 (512 bytes).
+     * MAX_BUILD_SIZE = 8 fits in 1 AVX2 register or 2 NEON registers.
+     * Register-resident comparison eliminates memory access in inner loop.
      */
-    constexpr size_t MAX_BUILD_SIZE = 64;
-    int32_t b_vals[MAX_BUILD_SIZE];
-    uint32_t b_ids[MAX_BUILD_SIZE];
+    constexpr size_t MAX_BUILD_SIZE = 8;
+    alignas(32) int32_t b_vals[MAX_BUILD_SIZE];
+    alignas(16) uint32_t b_ids[MAX_BUILD_SIZE];
     size_t b_count = 0;
 
     auto collect_build = [&](uint32_t id, int32_t val) {
@@ -113,6 +121,11 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
     };
 
     visit_rows(build_input, build_attr, collect_build);
+
+    // Pad unused slots with INT32_MIN (won't match real join keys)
+    for (size_t i = b_count; i < MAX_BUILD_SIZE; ++i) {
+        b_vals[i] = INT32_MIN;
+    }
 
     size_t num_threads = worker_pool.thread_count();
     auto buffers = create_thread_local_buffers(num_threads, mode);
@@ -137,6 +150,57 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
     worker_pool.execute([&](size_t t_id) {
         auto &local_buffer = buffers[t_id];
 
+#if defined(__x86_64__) && defined(__AVX2__)
+        // Load build values into YMM register (register-resident)
+        __m256i build_reg =
+            _mm256_load_si256(reinterpret_cast<const __m256i *>(b_vals));
+        const int valid_mask = (1 << b_count) - 1;
+
+        auto process_value = [&](uint32_t p_id, int32_t p_val) {
+            __m256i probe_reg = _mm256_set1_epi32(p_val);
+            __m256i cmp = _mm256_cmpeq_epi32(probe_reg, build_reg);
+            int mask =
+                _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) & valid_mask;
+            while (mask) {
+                int idx = __builtin_ctz(mask);
+                local_buffer.add_match(b_ids[idx], p_id);
+                mask &= mask - 1;
+            }
+        };
+
+#elif defined(__aarch64__)
+        // Load build values into 2 NEON registers (4 + 4 = 8 values)
+        int32x4_t build_lo = vld1q_s32(b_vals);
+        int32x4_t build_hi = vld1q_s32(b_vals + 4);
+        const uint32_t valid_mask = (1u << b_count) - 1;
+
+        // Bit position masks for efficient movemask emulation
+        static constexpr uint32_t mask_bits_lo[4] = {1, 2, 4, 8};
+        static constexpr uint32_t mask_bits_hi[4] = {16, 32, 64, 128};
+        const uint32x4_t bit_mask_lo = vld1q_u32(mask_bits_lo);
+        const uint32x4_t bit_mask_hi = vld1q_u32(mask_bits_hi);
+
+        auto process_value = [&](uint32_t p_id, int32_t p_val) {
+            int32x4_t probe_reg = vdupq_n_s32(p_val);
+
+            // Compare: result is 0xFFFFFFFF or 0x00000000 per lane
+            uint32x4_t cmp_lo = vceqq_s32(probe_reg, build_lo);
+            uint32x4_t cmp_hi = vceqq_s32(probe_reg, build_hi);
+
+            // AND with bit positions, then horizontal add to get mask
+            uint32_t mask = vaddvq_u32(vandq_u32(cmp_lo, bit_mask_lo)) |
+                            vaddvq_u32(vandq_u32(cmp_hi, bit_mask_hi));
+            mask &= valid_mask;
+
+            while (mask) {
+                int idx = __builtin_ctz(mask);
+                local_buffer.add_match(b_ids[idx], p_id);
+                mask &= mask - 1;
+            }
+        };
+
+#else
+        // Scalar fallback for non-SIMD architectures
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
             for (size_t k = 0; k < b_count; ++k) {
                 if (b_vals[k] == p_val) {
@@ -144,6 +208,7 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                 }
             }
         };
+#endif
 
         if (probe_input.is_columnar()) {
             size_t num_pages = probe_col->pages.size();
