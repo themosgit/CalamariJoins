@@ -24,6 +24,7 @@
             llvmPackages.libcxxClang
             llvmPackages.libllvm
             doxygen
+            perf
             gef
             curl
             git
