@@ -24,12 +24,13 @@
             llvmPackages.libcxxClang
             llvmPackages.libllvm
             doxygen
-            perf
-            gef
             curl
             git
             cmake
             typst
+          ] ++ lib.optionals (system == "x86_64-linux") [
+            linuxPackages.perf
+            gef
           ];
           shellHook = ''
             CLANGD_FILE=".clangd"
