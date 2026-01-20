@@ -13,8 +13,8 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <platform/arena.h>
 #include <platform/worker_pool.h>
-#include <sys/mman.h>
 #include <vector>
 
 /** @namespace Contest::join @brief Parallel hash join implementation. */
@@ -30,8 +30,8 @@ enum class MatchCollectionMode : uint8_t {
     RIGHT_ONLY = 2 /**< Only right (probe) side IDs needed. */
 };
 
-/** @brief Capacity per IndexChunk; sized for L2 cache efficiency. */
-static constexpr size_t MATCH_CHUNK_CAP = 8192;
+/** @brief Capacity per IndexChunk; sized to fit in INDEX_CHUNK arena region. */
+static constexpr size_t MATCH_CHUNK_CAP = 8184;
 
 /** @brief Fixed-size chunk of row IDs forming a singly-linked list. */
 struct IndexChunk {
@@ -40,14 +40,18 @@ struct IndexChunk {
     IndexChunk *next = nullptr; /**< Next chunk in chain (nullptr if tail). */
 };
 
+static_assert(sizeof(IndexChunk) <=
+                  Contest::platform::ChunkSize<
+                      Contest::platform::ChunkType::INDEX_CHUNK>::value,
+              "IndexChunk too large for INDEX_CHUNK region");
+
 class MatchCollector;
 
 /**
  * @brief Per-thread buffer for collecting join matches without contention.
  *
  * Maintains separate left/right chunk chains. After probe, chains transfer to
- * MatchCollector via O(1) pointer linking. Destructor frees unrelinquished
- * chunks.
+ * MatchCollector via O(1) pointer linking. Uses arena allocation for chunks.
  */
 class ThreadLocalMatchBuffer {
     friend void merge_local_collectors(std::vector<ThreadLocalMatchBuffer> &,
@@ -59,48 +63,50 @@ class ThreadLocalMatchBuffer {
     IndexChunk *right_head = nullptr;
     IndexChunk *right_tail = nullptr;
     MatchCollectionMode mode = MatchCollectionMode::BOTH;
+    Contest::platform::ThreadArena *arena_ = nullptr;
+
+    /** @brief Allocate IndexChunk from arena. */
+    IndexChunk *alloc_chunk() {
+        void *ptr =
+            arena_->alloc_chunk<Contest::platform::ChunkType::INDEX_CHUNK>();
+        IndexChunk *c = static_cast<IndexChunk *>(ptr);
+        c->count = 0;
+        c->next = nullptr;
+        return c;
+    }
 
   public:
     size_t total_count = 0;
 
-    ThreadLocalMatchBuffer(MatchCollectionMode mode = MatchCollectionMode::BOTH)
-        : mode(mode) {
+    ThreadLocalMatchBuffer(Contest::platform::ThreadArena &arena,
+                           MatchCollectionMode m = MatchCollectionMode::BOTH)
+        : mode(m), arena_(&arena) {
         if (mode != MatchCollectionMode::RIGHT_ONLY) {
-            left_tail = left_head = new IndexChunk();
+            left_tail = left_head = alloc_chunk();
         }
         if (mode != MatchCollectionMode::LEFT_ONLY) {
-            right_tail = right_head = new IndexChunk();
+            right_tail = right_head = alloc_chunk();
         }
     }
 
     ThreadLocalMatchBuffer(ThreadLocalMatchBuffer &&other) noexcept
         : left_head(other.left_head), left_tail(other.left_tail),
           right_head(other.right_head), right_tail(other.right_tail),
-          mode(other.mode), total_count(other.total_count) {
+          mode(other.mode), arena_(other.arena_),
+          total_count(other.total_count) {
         other.left_head = other.left_tail = nullptr;
         other.right_head = other.right_tail = nullptr;
         other.total_count = 0;
     }
 
-    ~ThreadLocalMatchBuffer() {
-        while (left_head) {
-            IndexChunk *temp = left_head;
-            left_head = left_head->next;
-            delete temp;
-        }
-        while (right_head) {
-            IndexChunk *temp = right_head;
-            right_head = right_head->next;
-            delete temp;
-        }
-    }
+    // No destructor needed - arena manages memory
 
     /** @brief Records a match. Allocates new chunks in pairs for BOTH mode. */
     inline void add_match(uint32_t left, uint32_t right) {
         if (mode == MatchCollectionMode::BOTH) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
-                IndexChunk *new_left = new IndexChunk();
-                IndexChunk *new_right = new IndexChunk();
+                IndexChunk *new_left = alloc_chunk();
+                IndexChunk *new_right = alloc_chunk();
                 left_tail->next = new_left;
                 right_tail->next = new_right;
                 left_tail = new_left;
@@ -112,7 +118,7 @@ class ThreadLocalMatchBuffer {
             right_tail->count++;
         } else if (mode == MatchCollectionMode::LEFT_ONLY) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
-                IndexChunk *new_left = new IndexChunk();
+                IndexChunk *new_left = alloc_chunk();
                 left_tail->next = new_left;
                 left_tail = new_left;
             }
@@ -120,7 +126,7 @@ class ThreadLocalMatchBuffer {
             left_tail->count++;
         } else { // RIGHT_ONLY
             if (right_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {
-                IndexChunk *new_right = new IndexChunk();
+                IndexChunk *new_right = alloc_chunk();
                 right_tail->next = new_right;
                 right_tail = new_right;
             }
@@ -229,23 +235,8 @@ class MatchCollector {
     explicit MatchCollector(
         MatchCollectionMode mode = MatchCollectionMode::BOTH)
         : collection_mode(mode) {}
-    ~MatchCollector() {
-        if (!is_finalized) {
-            while (left_chain_head) {
-                IndexChunk *temp = left_chain_head;
-                left_chain_head = left_chain_head->next;
-                delete temp;
-            }
-            while (right_chain_head) {
-                IndexChunk *temp = right_chain_head;
-                right_chain_head = right_chain_head->next;
-                delete temp;
-            }
-        } else {
-            for (auto *chunk : all_chunks)
-                delete chunk;
-        }
-    }
+
+    // No destructor needed - arena manages memory
 
     void reserve(size_t) {}
 
@@ -349,7 +340,7 @@ create_thread_local_buffers(size_t thread_count, MatchCollectionMode mode) {
     std::vector<ThreadLocalMatchBuffer> buffers;
     buffers.reserve(thread_count);
     for (size_t i = 0; i < thread_count; ++i) {
-        buffers.emplace_back(mode);
+        buffers.emplace_back(Contest::platform::get_arena(i), mode);
     }
     return buffers;
 }

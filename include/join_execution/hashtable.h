@@ -14,8 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <data_model/intermediate.h>
-#include <deque>
 #include <join_execution/bloom_tags.h>
+#include <platform/arena.h>
 #include <platform/worker_pool.h>
 #include <vector>
 
@@ -76,14 +76,23 @@ class UnchainedHashtable {
         Tuple data[TUPLES_PER_CHUNK]; /**< Tuple storage. */
     };
 
-    /** @brief Thread-local chunk allocator for lock-free partition building. */
+    /** @brief Thread-local chunk allocator using global arena. */
     class ChunkAllocator {
-        std::deque<Chunk> storage;
+        Contest::platform::ThreadArena *arena_ = nullptr;
 
       public:
+        ChunkAllocator() = default;
+        explicit ChunkAllocator(Contest::platform::ThreadArena &arena)
+            : arena_(&arena) {}
+
+        void set_arena(Contest::platform::ThreadArena &arena) {
+            arena_ = &arena;
+        }
+
         Chunk *alloc() {
-            storage.emplace_back();
-            Chunk *c = &storage.back();
+            void *ptr =
+                arena_->alloc_chunk<Contest::platform::ChunkType::HASH_CHUNK>();
+            Chunk *c = static_cast<Chunk *>(ptr);
             c->next = nullptr;
             c->count = 0;
             return c;
@@ -145,7 +154,9 @@ class UnchainedHashtable {
         return BLOOM_TAGS[(h >> 32) & 0x7FF];
     }
 
-    inline size_t slot_for(uint64_t h) const noexcept { return h >> (64 - shift); }
+    inline size_t slot_for(uint64_t h) const noexcept {
+        return h >> (64 - shift);
+    }
 
     /**
      * @brief Computes partition count to fit each in per-core LLC share.
@@ -317,6 +328,8 @@ class UnchainedHashtable {
 
         // Thread-local partitions for lock-free parallel partitioning
         std::vector<ChunkAllocator> allocators(num_threads);
+        for (int t = 0; t < num_threads; ++t)
+            allocators[t].set_arena(Contest::platform::get_arena(t));
         std::vector<std::vector<Partition>> thread_parts(num_threads);
         for (auto &tp : thread_parts)
             tp.resize(num_partitions);
@@ -400,6 +413,8 @@ class UnchainedHashtable {
         const size_t slots_per_partition = num_slots / num_partitions;
 
         std::vector<ChunkAllocator> allocators(num_threads);
+        for (int t = 0; t < num_threads; ++t)
+            allocators[t].set_arena(Contest::platform::get_arena(t));
         std::vector<std::vector<Partition>> thread_parts(num_threads);
         for (auto &tp : thread_parts)
             tp.resize(num_partitions);

@@ -1,8 +1,10 @@
 /**
  * @file intermediate.h
- * @brief Intermediate join format: VARCHAR as page/offset refs (no string copy).
+ * @brief Intermediate join format: VARCHAR as page/offset refs (no string
+ * copy).
  *
- * Base tables must outlive execution. @see plan.h ColumnarTable, construct_intermediate.h
+ * Base tables must outlive execution. @see plan.h ColumnarTable,
+ * construct_intermediate.h
  */
 #pragma once
 
@@ -11,6 +13,7 @@
 #include <data_model/plan.h>
 #include <foundation/common.h>
 #include <memory>
+#include <platform/arena.h>
 #include <vector>
 
 /**
@@ -23,8 +26,9 @@
 namespace mema {
 
 /**
- * @brief 4-byte value: INT32 direct, VARCHAR packed (19-bit page + 13-bit offset),
- * NULL = INT32_MIN, long string offset = 0x1FFF. Refs valid only while source exists.
+ * @brief 4-byte value: INT32 direct, VARCHAR packed (19-bit page + 13-bit
+ * offset), NULL = INT32_MIN, long string offset = 0x1FFF. Refs valid only while
+ * source exists.
  */
 struct alignas(4) value_t {
     int32_t value;
@@ -161,7 +165,8 @@ struct column_t {
         num_values = count;
     }
 
-    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. No bounds check. */
+    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. No bounds
+     * check. */
     inline const value_t &operator[](size_t idx) const {
         return pages[idx >> 12]->data[idx & 0xFFF];
     }
@@ -169,7 +174,8 @@ struct column_t {
     /** @brief Total value count. */
     size_t row_count() const { return num_values; }
 
-    /** @brief Pre-allocate from mmap block. owns_pages=false. @see BatchAllocator. */
+    /** @brief Pre-allocate from mmap block. owns_pages=false. @see
+     * BatchAllocator. */
     inline void pre_allocate_from_block(void *block, size_t &offset,
                                         size_t count,
                                         std::shared_ptr<void> memory_keeper) {
@@ -183,6 +189,24 @@ struct column_t {
         num_values = count;
         owns_pages = false;
         external_memory = memory_keeper;
+    }
+
+    /** @brief Pre-allocate pages from arena. owns_pages=false. */
+    inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
+                                        size_t count) {
+        static_assert(sizeof(Page) ==
+                          Contest::platform::ChunkSize<
+                              Contest::platform::ChunkType::IR_PAGE>::value,
+                      "Page size mismatch with IR_PAGE chunk size");
+        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            void *ptr =
+                arena.alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
+            pages.push_back(reinterpret_cast<Page *>(ptr));
+        }
+        num_values = count;
+        owns_pages = false;
     }
 
     /** @brief Thread-safe write at idx (requires pre-allocation). */

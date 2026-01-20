@@ -11,8 +11,8 @@
 #include <data_model/plan.h>
 #include <join_execution/join_setup.h>
 #include <join_execution/match_collector.h>
+#include <platform/arena.h>
 #include <platform/worker_pool.h>
-#include <sys/mman.h>
 #include <vector>
 /**
  * @namespace Contest::materialize
@@ -29,41 +29,28 @@ using Contest::join::MatchCollector;
 using Contest::platform::worker_pool;
 
 /**
- * @brief Batch memory allocator using single mmap for all intermediate pages.
+ * @brief Preallocates arena memory for all output columns.
  *
- * Single mmap vs per-page allocation: reduces syscalls, improves memory
- * locality, simplifies cleanup. Columns hold shared_ptr to prevent premature
- * munmap.
+ * Distributes page allocations across all thread arenas to balance memory
+ * usage.
  *
- * @note Move-only type (no copy to prevent double-free).
- * @see batch_allocate_for_results() for allocation orchestration.
- * @see column_t::pre_allocate_from_block() for arena partitioning.
+ * @param results       Output columns to allocate (modified in-place).
+ * @param total_matches Number of rows (match count from MatchCollector).
+ *
+ * @see column_t::pre_allocate_from_arena() for arena partitioning.
  */
-class BatchAllocator {
-  private:
-    void *memory_block = nullptr;
-    size_t total_size = 0;
-
-  public:
-    BatchAllocator() = default;
-    void allocate(size_t total_pages) {
-        total_size = total_pages * mema::IR_PAGE_SIZE;
-        memory_block = mmap(nullptr, total_size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (memory_block == MAP_FAILED) {
-            memory_block = nullptr;
-            throw std::bad_alloc();
-        }
+inline void batch_allocate_for_results(ExecuteResult &results,
+                                       size_t total_matches) {
+    size_t num_threads = worker_pool.thread_count();
+    size_t col_idx = 0;
+    for (auto &col : results) {
+        // Round-robin allocation across threads to distribute memory pressure
+        size_t thread_id = col_idx % num_threads;
+        col.pre_allocate_from_arena(Contest::platform::get_arena(thread_id),
+                                    total_matches);
+        col_idx++;
     }
-    void *get_block() const { return memory_block; }
-    ~BatchAllocator() {
-        if (memory_block) {
-            munmap(memory_block, total_size);
-        }
-    }
-    BatchAllocator(const BatchAllocator &) = delete;
-    BatchAllocator &operator=(const BatchAllocator &) = delete;
-};
+}
 
 /**
  * @brief Precomputed metadata for resolving an output column's source.
@@ -81,39 +68,6 @@ struct alignas(8) SourceInfo {
     bool is_columnar = false;    /**< True if source is columnar table. */
     bool from_build = false; /**< True if from build side, false if probe. */
 };
-
-/**
- * @brief Preallocates mmap'd memory for all output columns (arena allocation).
- *
- * @param results       Output columns to allocate (modified in-place).
- * @param total_matches Number of rows (match count from MatchCollector).
- * @return Shared ownership of BatchAllocator.
- *
- * @see BatchAllocator for single mmap rationale.
- * @see column_t::pre_allocate_from_block() for arena partitioning.
- */
-inline std::shared_ptr<BatchAllocator>
-batch_allocate_for_results(ExecuteResult &results, size_t total_matches) {
-
-    size_t total_chunks = 0;
-    for (auto &col : results) {
-        total_chunks +=
-            (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
-    }
-
-    size_t total_bytes =
-        total_chunks * mema::CAP_PER_PAGE * sizeof(mema::value_t);
-    size_t system_pages =
-        (total_bytes + mema::IR_PAGE_SIZE - 1) / mema::IR_PAGE_SIZE;
-    auto allocator = std::make_shared<BatchAllocator>();
-    allocator->allocate(system_pages);
-    void *block = allocator->get_block();
-    size_t offset = 0;
-    for (auto &col : results) {
-        col.pre_allocate_from_block(block, offset, total_matches, allocator);
-    }
-    return allocator;
-}
 
 /**
  * @brief Builds SourceInfo for each output column for fast hot-loop lookup.
@@ -193,7 +147,7 @@ inline void construct_intermediate(
 
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
-    auto allocator = batch_allocate_for_results(results, total_matches);
+    batch_allocate_for_results(results, total_matches);
 
     worker_pool.execute([&](size_t t) {
         Contest::ColumnarReader::Cursor cursor;

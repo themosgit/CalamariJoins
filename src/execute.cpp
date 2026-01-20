@@ -35,6 +35,7 @@
 #include <join_execution/nested_loop.h>
 #include <materialization/construct_intermediate.h>
 #include <materialization/materialize.h>
+#include <platform/arena.h>
 #include <variant>
 
 namespace Contest {
@@ -117,7 +118,8 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     JoinInput left_input = resolve_join_input(plan, join.left, stats);
     JoinInput right_input = resolve_join_input(plan, join.right, stats);
 
-    /* Build/probe selection: smaller input = build side; remaps output_attrs. */
+    /* Build/probe selection: smaller input = build side; remaps output_attrs.
+     */
     auto setup_start = std::chrono::high_resolution_clock::now();
     auto config =
         select_build_probe_side(join, left_input, right_input, output_attrs);
@@ -250,6 +252,9 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
  */
 ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
                       bool show_detailed_timing) {
+    // Reset arena memory from previous query
+    Contest::platform::arena_manager.reset_all();
+
     auto total_start = std::chrono::high_resolution_clock::now();
 
     TimingStats stats;
