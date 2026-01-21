@@ -16,3 +16,6 @@ compile_commands.json
 /env/
 script.py
 *.md
+/build_deferred
+/build_debug
+/build_eager

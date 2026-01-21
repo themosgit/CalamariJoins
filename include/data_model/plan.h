@@ -33,7 +33,8 @@
 #endif
 
 /**
- * @brief RAII mmap wrapper with refcount. munmap on last ref release. Move-only.
+ * @brief RAII mmap wrapper with refcount. munmap on last ref release.
+ * Move-only.
  */
 class MappedMemory {
   public:
@@ -127,8 +128,8 @@ constexpr size_t PAGE_SIZE = 8192;
  * @brief 8-byte aligned page (8KB) for columnar data.
  *
  * INT32: [num_rows:u16][num_values:u16][values...][bitmap at end]
- * VARCHAR: [num_rows:u16][num_offsets:u16][offsets:u16...][string bytes][bitmap]
- * Long string markers: 0xFFFF (first), 0xFFFE (continuation).
+ * VARCHAR: [num_rows:u16][num_offsets:u16][offsets:u16...][string
+ * bytes][bitmap] Long string markers: 0xFFFF (first), 0xFFFE (continuation).
  * Dense page (no NULLs): num_rows == num_values → fast path.
  */
 struct alignas(8) Page {
@@ -219,7 +220,8 @@ struct Plan {
     size_t root;                       /**< Index of root node in nodes. */
 
     /**
-     * @brief Create JoinNode. @return node index. Execution may override build_left.
+     * @brief Create JoinNode. @return node index. Execution may override
+     * build_left.
      */
     size_t
     new_join_node(bool build_left, size_t left, size_t right, size_t left_attr,
@@ -282,7 +284,8 @@ template <class T> struct ColumnInserter {
         bitmap.resize(PAGE_SIZE);
     }
 
-    /** @brief Get current page, allocating if needed. Does not advance index. */
+    /** @brief Get current page, allocating if needed. Does not advance index.
+     */
     std::byte *get_page() {
         if (last_page_idx == column.pages.size()) [[unlikely]] {
             column.new_page();
@@ -369,7 +372,8 @@ template <> struct ColumnInserter<std::string> {
         bitmap.resize(PAGE_SIZE);
     }
 
-    /** @brief Get current page, allocating if needed. Does not advance index. */
+    /** @brief Get current page, allocating if needed. Does not advance index.
+     */
     std::byte *get_page() {
         if (last_page_idx == column.pages.size()) [[unlikely]] {
             column.new_page();
@@ -378,7 +382,8 @@ template <> struct ColumnInserter<std::string> {
         return page->data;
     }
 
-    /** @brief Write long string (>PAGE_SIZE-7) across pages. 0xFFFF/0xFFFE markers. */
+    /** @brief Write long string (>PAGE_SIZE-7) across pages. 0xFFFF/0xFFFE
+     * markers. */
     void save_long_string(std::string_view value) {
         size_t offset = 0;
         auto first_page = true;
@@ -484,6 +489,8 @@ struct TimingStats {
     int64_t setup_ms = 0;            /**< JoinSetup + build/probe selection. */
     int64_t total_execution_ms = 0;  /**< Wall-clock total for execute(). */
     int64_t intermediate_ms = 0; /**< construct_intermediate for non-root. */
+    int64_t analyze_plan_ms = 0; /**< Deferred: plan analysis time. */
+    int64_t deferred_resolve_ms = 0; /**< Deferred: column resolution time. */
 };
 
 /** @brief Allocate execution context (worker pool, shared state). */

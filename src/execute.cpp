@@ -40,6 +40,13 @@
 #include <platform/worker_pool.h>
 #include <variant>
 
+#ifdef USE_DEFERRED_MATERIALIZATION
+#include <data_model/deferred_intermediate.h>
+#include <data_model/deferred_plan.h>
+#include <materialization/construct_deferred.h>
+#include <materialization/materialize_deferred.h>
+#endif
+
 namespace Contest {
 
 using namespace join;
@@ -291,6 +298,349 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     return ExtendedResult{};
 }
 
+#ifdef USE_DEFERRED_MATERIALIZATION
+// ============================================================================
+// DEFERRED MATERIALIZATION PATH
+// ============================================================================
+
+using DeferredJoinResult = std::variant<DeferredResult, ColumnarTable>;
+
+using materialize::construct_deferred_from_buffers;
+using materialize::create_empty_deferred_result;
+using materialize::materialize_deferred_from_buffers;
+
+// Forward declaration
+DeferredJoinResult execute_deferred_impl(const DeferredPlan &deferred_plan,
+                                         size_t node_idx, bool is_root,
+                                         TimingStats &stats);
+
+/**
+ * @brief Resolve deferred plan node to DeferredInput.
+ */
+DeferredInput resolve_deferred_input(const DeferredPlan &deferred_plan,
+                                     size_t node_idx, TimingStats &stats) {
+    DeferredInput input;
+    const auto &dnode = deferred_plan[node_idx];
+    const auto &pnode = deferred_plan.original_plan->nodes[node_idx];
+    input.node = &pnode;
+    input.deferred_node = &dnode;
+
+    if (const auto *dscan = std::get_if<DeferredScanNode>(&dnode)) {
+        input.data = &deferred_plan.original_plan->inputs[dscan->base_table_id];
+        input.table_id = dscan->base_table_id;
+    } else {
+        auto result =
+            execute_deferred_impl(deferred_plan, node_idx, false, stats);
+        input.data = std::get<DeferredResult>(std::move(result));
+        input.table_id = 0;
+    }
+    return input;
+}
+
+/**
+ * @brief Select build/probe sides for deferred input.
+ */
+BuildProbeConfig select_deferred_build_probe_side(
+    const JoinNode &join, const DeferredInput &left_input,
+    const DeferredInput &right_input,
+    const std::vector<std::tuple<size_t, DataType>> &output_attrs) {
+    BuildProbeConfig config;
+
+    size_t left_rows = left_input.row_count(join.left_attr);
+    size_t right_rows = right_input.row_count(join.right_attr);
+    config.build_left = left_rows <= right_rows;
+
+    config.build_attr = config.build_left ? join.left_attr : join.right_attr;
+    config.probe_attr = config.build_left ? join.right_attr : join.left_attr;
+
+    config.remapped_attrs = output_attrs;
+    size_t left_size = left_input.output_size();
+    size_t build_size =
+        config.build_left ? left_size : right_input.output_size();
+
+    if (!config.build_left) {
+        for (auto &[col_idx, dtype] : config.remapped_attrs) {
+            if (col_idx < left_size) {
+                col_idx = build_size + col_idx;
+            } else {
+                col_idx = col_idx - left_size;
+            }
+        }
+    }
+    return config;
+}
+
+/**
+ * @brief Unified probe + materialize for deferred path.
+ */
+template <MatchCollectionMode Mode>
+DeferredJoinResult execute_deferred_join_with_mode(
+    bool use_nested_loop, bool probe_is_columnar, bool is_root,
+    const UnchainedHashtable *hash_table, const DeferredInput &build_input,
+    const DeferredInput &probe_input, const BuildProbeConfig &config,
+    const DeferredJoinNode &join_node, io::ColumnarReader &columnar_reader,
+    const DeferredPlan &deferred_plan,
+    const std::vector<uint8_t> &merged_table_ids, TimingStats &stats) {
+
+    std::vector<ThreadLocalMatchBuffer<Mode>> match_buffers;
+
+    // Probe phase - need to convert DeferredInput to JoinInput for probing
+    // For now, handle columnar probe directly
+    if (use_nested_loop) {
+        auto nested_loop_start = std::chrono::high_resolution_clock::now();
+        // Nested loop requires JoinInput - create adapter
+        JoinInput build_ji, probe_ji;
+        build_ji.node = build_input.node;
+        probe_ji.node = probe_input.node;
+
+        if (build_input.is_columnar()) {
+            build_ji.data = std::get<const ColumnarTable *>(build_input.data);
+            build_ji.table_id = build_input.table_id;
+        } else {
+            // Convert DeferredResult to ExtendedResult for compatibility
+            // This is a limitation - nested loop path falls back to eager
+            const auto &dr = std::get<DeferredResult>(build_input.data);
+            ExtendedResult er;
+            er.columns = std::move(
+                const_cast<std::vector<mema::column_t> &>(dr.materialized));
+            er.row_ids = std::move(
+                const_cast<std::vector<mema::rowid_column_t> &>(dr.row_ids));
+            er.table_ids = dr.table_ids;
+            build_ji.data = std::move(er);
+            build_ji.table_id = 0;
+        }
+
+        if (probe_input.is_columnar()) {
+            probe_ji.data = std::get<const ColumnarTable *>(probe_input.data);
+            probe_ji.table_id = probe_input.table_id;
+        } else {
+            const auto &dr = std::get<DeferredResult>(probe_input.data);
+            ExtendedResult er;
+            er.columns = std::move(
+                const_cast<std::vector<mema::column_t> &>(dr.materialized));
+            er.row_ids = std::move(
+                const_cast<std::vector<mema::rowid_column_t> &>(dr.row_ids));
+            er.table_ids = dr.table_ids;
+            probe_ji.data = std::move(er);
+            probe_ji.table_id = 0;
+        }
+
+        match_buffers = nested_loop_join<Mode>(
+            build_ji, probe_ji, config.build_attr, config.probe_attr);
+        auto nested_loop_end = std::chrono::high_resolution_clock::now();
+        stats.nested_loop_join_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                nested_loop_end - nested_loop_start)
+                .count();
+    } else {
+        auto probe_start = std::chrono::high_resolution_clock::now();
+        if (probe_is_columnar) {
+            // Create JoinInput for columnar probe
+            JoinInput probe_ji;
+            probe_ji.node = probe_input.node;
+            probe_ji.data = std::get<const ColumnarTable *>(probe_input.data);
+            probe_ji.table_id = probe_input.table_id;
+            match_buffers =
+                probe_columnar<Mode>(*hash_table, probe_ji, config.probe_attr);
+        } else {
+            const auto &probe_result =
+                std::get<DeferredResult>(probe_input.data);
+            // Probe using materialized column (should be the join key)
+            const auto *mat_col =
+                probe_result.get_materialized(config.probe_attr);
+            if (!mat_col) {
+                std::fprintf(
+                    stderr,
+                    "ERROR: probe join key not materialized! probe_attr=%zu "
+                    "mat_map_size=%zu num_rows=%zu\n",
+                    config.probe_attr, probe_result.materialized_map.size(),
+                    probe_result.num_rows);
+                std::abort();
+            }
+            match_buffers = probe_intermediate<Mode>(*hash_table, *mat_col);
+        }
+        auto probe_end = std::chrono::high_resolution_clock::now();
+        stats.hash_join_probe_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(probe_end -
+                                                                  probe_start)
+                .count();
+    }
+
+    size_t total_matches = 0;
+    for (const auto &buf : match_buffers) {
+        total_matches += buf.count();
+    }
+
+    if (is_root) {
+        auto mat_start = std::chrono::high_resolution_clock::now();
+        DeferredJoinResult final_result;
+        if (total_matches == 0) {
+            final_result =
+                materialize::create_empty_deferred_final(config.remapped_attrs);
+        } else {
+            // Prepare page indices for final materialization
+            materialize::prepare_final_deferred_columns(
+                columnar_reader, build_input, probe_input, join_node,
+                config.remapped_attrs, build_input.output_size(),
+                config.build_left);
+
+            final_result = materialize_deferred_from_buffers<Mode>(
+                match_buffers, build_input, probe_input, join_node,
+                config.remapped_attrs, build_input.output_size(),
+                config.build_left, columnar_reader, deferred_plan);
+        }
+        auto mat_end = std::chrono::high_resolution_clock::now();
+        stats.materialize_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(mat_end -
+                                                                  mat_start)
+                .count();
+        return final_result;
+    } else {
+        auto inter_start = std::chrono::high_resolution_clock::now();
+        DeferredResult result;
+        if (total_matches > 0) {
+            // Prepare page indices for intermediate construction
+            materialize::prepare_deferred_columns(
+                columnar_reader, build_input, probe_input, join_node,
+                config.remapped_attrs, build_input.output_size(),
+                config.build_left);
+
+            construct_deferred_from_buffers<Mode>(
+                match_buffers, build_input, probe_input, join_node,
+                config.remapped_attrs, build_input.output_size(),
+                config.build_left, columnar_reader, result, merged_table_ids,
+                deferred_plan);
+        } else {
+            result = create_empty_deferred_result(join_node);
+        }
+        auto inter_end = std::chrono::high_resolution_clock::now();
+        stats.intermediate_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(inter_end -
+                                                                  inter_start)
+                .count();
+        return std::move(result);
+    }
+}
+
+/**
+ * @brief Recursive deferred join execution.
+ */
+DeferredJoinResult execute_deferred_impl(const DeferredPlan &deferred_plan,
+                                         size_t node_idx, bool is_root,
+                                         TimingStats &stats) {
+    const auto &dnode = deferred_plan[node_idx];
+
+    if (std::holds_alternative<DeferredScanNode>(dnode)) {
+        return DeferredResult{};
+    }
+
+    const auto &djoin = std::get<DeferredJoinNode>(dnode);
+    const auto &plan = *deferred_plan.original_plan;
+    const auto &pnode = plan.nodes[node_idx];
+    const auto &join = std::get<JoinNode>(pnode.data);
+
+    // Resolve inputs
+    DeferredInput left_input =
+        resolve_deferred_input(deferred_plan, djoin.left_child_idx, stats);
+    DeferredInput right_input =
+        resolve_deferred_input(deferred_plan, djoin.right_child_idx, stats);
+
+    // Build/probe selection
+    auto setup_start = std::chrono::high_resolution_clock::now();
+    auto config = select_deferred_build_probe_side(
+        join, left_input, right_input, djoin.output_attrs);
+    const DeferredInput &build_input =
+        config.build_left ? left_input : right_input;
+    const DeferredInput &probe_input =
+        config.build_left ? right_input : left_input;
+
+    bool build_is_columnar = build_input.is_columnar();
+    bool probe_is_columnar = probe_input.is_columnar();
+
+    const size_t HASH_TABLE_THRESHOLD = 8;
+    size_t build_rows = build_input.row_count(config.build_attr);
+    // Nested loop doesn't work with DeferredResult because it only has join
+    // keys materialized. Force hash join when either side is DeferredResult.
+    bool use_nested_loop = (build_rows < HASH_TABLE_THRESHOLD) &&
+                           build_is_columnar && probe_is_columnar;
+
+    // Merge table IDs
+    auto build_tables = build_input.tracked_tables();
+    auto probe_tables = probe_input.tracked_tables();
+    auto merged_table_ids = merge_tracked_tables(build_tables, probe_tables);
+
+    io::ColumnarReader columnar_reader;
+    auto setup_end = std::chrono::high_resolution_clock::now();
+    stats.setup_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+                          setup_end - setup_start)
+                          .count();
+
+    // For deferred materialization, we always need BOTH row indices because
+    // we track provenance from both sides for deferred column resolution.
+    // The optimization to collect only one side's indices is not safe here.
+    MatchCollectionMode mode = MatchCollectionMode::BOTH;
+
+    // Build hash table if needed
+    std::optional<UnchainedHashtable> hash_table;
+    if (!use_nested_loop) {
+        auto build_start = std::chrono::high_resolution_clock::now();
+        if (build_is_columnar) {
+            JoinInput build_ji;
+            build_ji.node = build_input.node;
+            build_ji.data = std::get<const ColumnarTable *>(build_input.data);
+            build_ji.table_id = build_input.table_id;
+            hash_table = build_from_columnar(build_ji, config.build_attr);
+        } else {
+            const auto &dr = std::get<DeferredResult>(build_input.data);
+            const auto *mat_col = dr.get_materialized(config.build_attr);
+            if (!mat_col) {
+                std::fprintf(
+                    stderr,
+                    "ERROR: build join key not materialized! build_attr=%zu "
+                    "mat_map_size=%zu num_rows=%zu\n",
+                    config.build_attr, dr.materialized_map.size(), dr.num_rows);
+                // Fatal - this should never happen
+                std::abort();
+            }
+            hash_table.emplace(mat_col->row_count());
+            hash_table->build_intermediate(*mat_col);
+        }
+        auto build_end = std::chrono::high_resolution_clock::now();
+        stats.hashtable_build_ms +=
+            std::chrono::duration_cast<std::chrono::milliseconds>(build_end -
+                                                                  build_start)
+                .count();
+    }
+
+    // Dispatch based on collection mode
+    switch (mode) {
+    case MatchCollectionMode::BOTH:
+        return execute_deferred_join_with_mode<MatchCollectionMode::BOTH>(
+            use_nested_loop, probe_is_columnar, is_root,
+            use_nested_loop ? nullptr : &(*hash_table), build_input,
+            probe_input, config, djoin, columnar_reader, deferred_plan,
+            merged_table_ids, stats);
+
+    case MatchCollectionMode::LEFT_ONLY:
+        return execute_deferred_join_with_mode<MatchCollectionMode::LEFT_ONLY>(
+            use_nested_loop, probe_is_columnar, is_root,
+            use_nested_loop ? nullptr : &(*hash_table), build_input,
+            probe_input, config, djoin, columnar_reader, deferred_plan,
+            merged_table_ids, stats);
+
+    case MatchCollectionMode::RIGHT_ONLY:
+        return execute_deferred_join_with_mode<MatchCollectionMode::RIGHT_ONLY>(
+            use_nested_loop, probe_is_columnar, is_root,
+            use_nested_loop ? nullptr : &(*hash_table), build_input,
+            probe_input, config, djoin, columnar_reader, deferred_plan,
+            merged_table_ids, stats);
+    }
+
+    return DeferredResult{};
+}
+
+#endif // USE_DEFERRED_MATERIALIZATION
+
 /**
  * @brief Public entry point: execute plan from root, return ColumnarTable.
  * @param plan Query plan with nodes and base tables.
@@ -307,7 +657,27 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     auto total_start = std::chrono::high_resolution_clock::now();
 
     TimingStats stats;
+
+#ifdef USE_DEFERRED_MATERIALIZATION
+    // Deferred materialization path: analyze plan, then execute with deferred
+    // intermediate construction
+    auto analyze_start = std::chrono::high_resolution_clock::now();
+    DeferredPlan deferred_plan = analyze_plan(plan);
+    auto analyze_end = std::chrono::high_resolution_clock::now();
+    stats.analyze_plan_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(analyze_end -
+                                                              analyze_start)
+            .count();
+
+    auto deferred_result =
+        execute_deferred_impl(deferred_plan, plan.root, true, stats);
+    ColumnarTable final_result =
+        std::get<ColumnarTable>(std::move(deferred_result));
+#else
+    // Eager materialization path (original)
     auto result = execute_impl(plan, plan.root, true, stats);
+    ColumnarTable final_result = std::get<ColumnarTable>(std::move(result));
+#endif
 
     auto total_end = std::chrono::high_resolution_clock::now();
     auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -315,11 +685,19 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     stats.total_execution_ms = total_elapsed.count();
 
     if (show_detailed_timing) {
-        int64_t accounted =
-            stats.hashtable_build_ms + stats.hash_join_probe_ms +
-            stats.nested_loop_join_ms + stats.materialize_ms + stats.setup_ms;
+        int64_t accounted = stats.hashtable_build_ms +
+                            stats.hash_join_probe_ms +
+                            stats.nested_loop_join_ms + stats.materialize_ms +
+                            stats.setup_ms + stats.intermediate_ms;
+#ifdef USE_DEFERRED_MATERIALIZATION
+        accounted += stats.analyze_plan_ms;
+#endif
         int64_t other = stats.total_execution_ms - accounted;
 
+#ifdef USE_DEFERRED_MATERIALIZATION
+        std::cout << "[DEFERRED] Plan Analysis Time: " << stats.analyze_plan_ms
+                  << " ms\n";
+#endif
         std::cout << "Hashtable Build Time: " << stats.hashtable_build_ms
                   << " ms\n";
         std::cout << "Hash Join Probe Time: " << stats.hash_join_probe_ms
@@ -339,7 +717,7 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
         *stats_out = stats;
     }
 
-    return std::move(std::get<ColumnarTable>(result));
+    return std::move(final_result);
 }
 
 void *build_context() { return nullptr; }

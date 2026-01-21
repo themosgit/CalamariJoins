@@ -275,10 +275,15 @@ class ColumnarReader {
 
         /* Dense INT32 fast path: O(1) arithmetic lookup, bypasses cursor */
         if (data_type == DataType::INT32) {
-            const PageIndex &page_index = IsBuild ? build_page_indices[col_idx]
+            size_t pidx_size =
+                IsBuild ? build_page_indices.size() : probe_page_indices.size();
+            if (SPC_LIKELY(col_idx < pidx_size)) {
+                const PageIndex &page_index = IsBuild
+                                                  ? build_page_indices[col_idx]
                                                   : probe_page_indices[col_idx];
-            if (SPC_LIKELY(page_index.is_dense_int32)) {
-                return mema::value_t{read_dense_int32(page_index, row_id)};
+                if (SPC_LIKELY(page_index.is_dense_int32)) {
+                    return mema::value_t{read_dense_int32(page_index, row_id)};
+                }
             }
         }
 
@@ -291,10 +296,10 @@ class ColumnarReader {
                 global_probe_version.load(std::memory_order_relaxed);
         }
 
-        if (SPC_LIKELY(cursor.version == current_version &&
-                       col_idx == cursor.cached_col &&
-                       row_id >= cursor.cached_start &&
-                       row_id < cursor.cached_end)) {
+        bool cache_hit =
+            cursor.version == current_version && col_idx == cursor.cached_col &&
+            row_id >= cursor.cached_start && row_id < cursor.cached_end;
+        if (SPC_LIKELY(cache_hit)) {
             uint32_t local_row = row_id - cursor.cached_start;
             if (SPC_LIKELY(cursor.is_dense)) {
                 if (data_type == DataType::INT32) {
@@ -313,9 +318,11 @@ class ColumnarReader {
         }
 
         /* sequential access optimization: skip binary search for next page */
+        size_t pidx_count =
+            IsBuild ? build_page_indices.size() : probe_page_indices.size();
         if (SPC_LIKELY(cursor.version == current_version &&
                        col_idx == cursor.cached_col &&
-                       row_id == cursor.cached_end)) {
+                       row_id == cursor.cached_end && col_idx < pidx_count)) {
             const PageIndex &page_index = IsBuild ? build_page_indices[col_idx]
                                                   : probe_page_indices[col_idx];
             size_t next_page = cursor.cached_page + 1;
@@ -384,6 +391,12 @@ class ColumnarReader {
                                          Cursor &cursor,
                                          uint64_t current_version) const {
 
+        size_t pidx_size =
+            IsBuild ? build_page_indices.size() : probe_page_indices.size();
+        if (SPC_UNLIKELY(col_idx >= pidx_size)) {
+            // No page index prepared - use direct page read
+            return read_value_direct(column, row_id, data_type);
+        }
         const PageIndex &page_index =
             IsBuild ? build_page_indices[col_idx] : probe_page_indices[col_idx];
         size_t page_num = page_index.find_page(row_id);
@@ -407,6 +420,18 @@ class ColumnarReader {
         }
     }
 
+    /**
+     * @brief Direct value read bypassing page index cache.
+     *
+     * Used for deferred column resolution when reading from base tables
+     * that don't have prepared page indices. O(n) page scan per read.
+     */
+    inline mema::value_t read_value_direct_public(const Column &column,
+                                                  uint32_t row_id,
+                                                  DataType data_type) const {
+        return read_value_direct(column, row_id, data_type);
+    }
+
     inline const PageIndex &get_build_page_index(size_t col_idx) const {
         return build_page_indices[col_idx];
     }
@@ -426,6 +451,89 @@ class ColumnarReader {
 
         auto *page_data = (*page_index.pages_ptr)[page_num]->data;
         return reinterpret_cast<const int32_t *>(page_data + 4)[local_row];
+    }
+
+    /**
+     * @brief Direct value read without prepared page index.
+     *
+     * Used when page indices aren't available (e.g., reading base tables
+     * during deferred resolution). O(n) page scan - slower than cached path.
+     */
+    inline mema::value_t read_value_direct(const Column &column,
+                                           uint32_t row_id,
+                                           DataType data_type) const {
+        // Linear scan to find page containing row_id
+        uint32_t cumulative = 0;
+        for (size_t page_num = 0; page_num < column.pages.size(); ++page_num) {
+            auto *page_data = column.pages[page_num]->data;
+            auto num_rows = *reinterpret_cast<const uint16_t *>(page_data);
+            auto num_values =
+                *reinterpret_cast<const uint16_t *>(page_data + 2);
+
+            // Handle special pages
+            if (num_rows == 0xffff) {
+                // Long string page - single row
+                if (row_id == cumulative) {
+                    return mema::value_t::encode_string(
+                        static_cast<int32_t>(page_num),
+                        mema::value_t::LONG_STRING_OFFSET);
+                }
+                cumulative += 1;
+                continue;
+            }
+            if (num_rows == 0xfffe) {
+                // Skip special marker pages
+                continue;
+            }
+
+            if (row_id < cumulative + num_rows) {
+                // Found the page
+                uint32_t local_row = row_id - cumulative;
+                bool is_dense = (num_rows == num_values);
+                const auto *data_ptr =
+                    reinterpret_cast<const int32_t *>(page_data + 4);
+
+                if (is_dense) {
+                    if (data_type == DataType::INT32) {
+                        return mema::value_t{data_ptr[local_row]};
+                    } else {
+                        return mema::value_t::encode_string(
+                            static_cast<int32_t>(page_num),
+                            static_cast<int32_t>(local_row));
+                    }
+                } else {
+                    // Sparse page - check bitmap
+                    size_t bitmap_size = (num_rows + 7) / 8;
+                    const auto *bitmap_ptr = reinterpret_cast<const uint8_t *>(
+                        page_data + PAGE_SIZE - bitmap_size);
+
+                    bool is_valid =
+                        bitmap_ptr[local_row >> 3] & (1u << (local_row & 7));
+                    if (!is_valid) {
+                        return mema::value_t{mema::value_t::NULL_VALUE};
+                    }
+
+                    // Compute data index via popcount
+                    uint32_t data_idx = 0;
+                    for (uint32_t i = 0; i < local_row; ++i) {
+                        if (bitmap_ptr[i >> 3] & (1u << (i & 7))) {
+                            data_idx++;
+                        }
+                    }
+
+                    if (data_type == DataType::INT32) {
+                        return mema::value_t{data_ptr[data_idx]};
+                    } else {
+                        return mema::value_t::encode_string(
+                            static_cast<int32_t>(page_num),
+                            static_cast<int32_t>(data_idx));
+                    }
+                }
+            }
+            cumulative += num_rows;
+        }
+        // Row not found - return NULL
+        return mema::value_t{mema::value_t::NULL_VALUE};
     }
 
     /** @brief Reads from sparse pages using bitmap and popcount. */
