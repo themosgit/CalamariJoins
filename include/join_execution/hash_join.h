@@ -28,6 +28,7 @@
 namespace Contest::join {
 
 using Contest::ExecuteResult;
+using Contest::ExtendedResult;
 using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
@@ -56,8 +57,8 @@ inline UnchainedHashtable build_from_columnar(const JoinInput &input,
  */
 inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
                                                   size_t attr_idx) {
-    const auto &result = std::get<ExecuteResult>(input.data);
-    const auto &column = result[attr_idx];
+    const auto &result = std::get<ExtendedResult>(input.data);
+    const auto &column = result.columns[attr_idx];
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);

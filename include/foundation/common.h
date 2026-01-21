@@ -125,7 +125,8 @@ class File {
     }
 };
 
-/** @brief Read entire file into string. @throws std::runtime_error on failure. */
+/** @brief Read entire file into string. @throws std::runtime_error on failure.
+ */
 inline std::string read_file(const std::filesystem::path &path) {
     File f(path, "rb");
     ::fseek(f, 0, SEEK_END);
@@ -154,7 +155,8 @@ struct DSU {
     void unite(size_t x, size_t y) { pa[find(x)] = find(y); }
 };
 
-/** @brief Mark unreachable code path for compiler optimization (UB if reached). */
+/** @brief Mark unreachable code path for compiler optimization (UB if reached).
+ */
 [[noreturn]] inline void unreachable() {
     // Uses compiler specific extensions if possible.
     // Even if no extension is used, undefined behavior is still raised by
@@ -165,3 +167,40 @@ struct DSU {
     __builtin_unreachable();
 #endif
 }
+
+namespace Contest {
+
+/**
+ * @brief Encoded global row ID: 5-bit table_id + 27-bit row_id.
+ *
+ * Supports up to 32 tables and 134M rows per table.
+ * Used to track original scan table rows through recursive joins.
+ *
+ * Encoding: [table_id (5 bits)][row_id (27 bits)]
+ *   - table_id: bits 27-31
+ *   - row_id: bits 0-26
+ */
+struct GlobalRowId {
+    static constexpr uint32_t TABLE_BITS = 5;
+    static constexpr uint32_t ROW_BITS = 27;
+    static constexpr uint32_t TABLE_SHIFT = ROW_BITS;
+    static constexpr uint32_t ROW_MASK = (1u << ROW_BITS) - 1;
+    static constexpr uint32_t MAX_TABLES = 1u << TABLE_BITS; // 32
+    static constexpr uint32_t MAX_ROWS = 1u << ROW_BITS;     // 134,217,728
+
+    /** @brief Encode table_id and row_id into a single uint32_t. */
+    static inline uint32_t encode(uint8_t table_id, uint32_t row_id) {
+        return (static_cast<uint32_t>(table_id) << TABLE_SHIFT) |
+               (row_id & ROW_MASK);
+    }
+
+    /** @brief Extract table_id from encoded global row ID. */
+    static inline uint8_t table(uint32_t encoded) {
+        return static_cast<uint8_t>(encoded >> TABLE_SHIFT);
+    }
+
+    /** @brief Extract row_id from encoded global row ID. */
+    static inline uint32_t row(uint32_t encoded) { return encoded & ROW_MASK; }
+};
+
+} // namespace Contest

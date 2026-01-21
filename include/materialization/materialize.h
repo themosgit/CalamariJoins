@@ -25,6 +25,7 @@
 namespace Contest::materialize {
 
 using Contest::ExecuteResult;
+using Contest::ExtendedResult;
 using Contest::io::ColumnarReader;
 using Contest::join::JoinInput;
 using Contest::join::MatchCollectionMode;
@@ -191,8 +192,8 @@ inline void materialize_single_column_from_buffers(
         auto [actual_idx, _] = node.output_attrs[local_idx];
         col_source = &table->columns[actual_idx];
     } else {
-        const auto &res = std::get<ExecuteResult>(input.data);
-        inter_source = &res[local_idx];
+        const auto &res = std::get<ExtendedResult>(input.data);
+        inter_source = &res.columns[local_idx];
     }
 
     auto reader = [&](uint32_t rid, ColumnarReader::Cursor &cursor,

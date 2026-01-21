@@ -22,16 +22,17 @@
 namespace Contest::join {
 
 using Contest::ExecuteResult;
+using Contest::ExtendedResult;
 using Contest::io::ColumnarReader;
 
 /**
  * @brief Unified abstraction over columnar tables and intermediate results.
  *
- * Stores ColumnarTable* (base scans) or ExecuteResult (child joins). Node
+ * Stores ColumnarTable* (base scans) or ExtendedResult (child joins). Node
  * provides output_attrs mapping for column resolution.
  */
 struct JoinInput {
-    std::variant<ExecuteResult, const ColumnarTable *> data;
+    std::variant<ExtendedResult, const ColumnarTable *> data;
     const PlanNode *node; /**< Provides output_attrs for column mapping. */
     uint8_t table_id;     /**< Source table ID for provenance tracking. */
 
@@ -50,12 +51,35 @@ struct JoinInput {
             auto [actual_col_idx, _] = node->output_attrs[col_idx];
             return table->num_rows;
         } else {
-            return std::get<ExecuteResult>(data)[col_idx].row_count();
+            return std::get<ExtendedResult>(data).columns[col_idx].row_count();
         }
     }
 
     /** @brief Number of output columns. */
     size_t output_size() const { return node->output_attrs.size(); }
+
+    /**
+     * @brief Get list of tables whose row IDs are tracked in this input.
+     *
+     * For columnar input: returns {table_id}.
+     * For intermediate: returns the tracked table_ids from ExtendedResult.
+     */
+    std::vector<uint8_t> tracked_tables() const {
+        if (is_columnar()) {
+            return {table_id};
+        }
+        return std::get<ExtendedResult>(data).table_ids;
+    }
+
+    /**
+     * @brief Get row ID column for a specific table.
+     * @return nullptr for columnar inputs (row IDs encoded on-the-fly).
+     */
+    const mema::rowid_column_t *get_rowid_column(uint8_t tid) const {
+        if (is_columnar())
+            return nullptr;
+        return std::get<ExtendedResult>(data).get_rowid_column(tid);
+    }
 };
 
 /**
@@ -159,13 +183,13 @@ inline MatchCollectionMode determine_collection_mode(
 /**
  * @brief Creates output columns with provenance metadata from inputs.
  */
-inline ExecuteResult initialize_output_columns(
+inline ExtendedResult initialize_output_columns(
     const std::vector<std::tuple<size_t, DataType>> &output_attrs,
     const PlanNode &left_node, const PlanNode &right_node,
     const JoinInput &left_input, const JoinInput &right_input,
     size_t estimated_rows) {
-    ExecuteResult results;
-    results.reserve(output_attrs.size());
+    ExtendedResult results;
+    results.columns.reserve(output_attrs.size());
     size_t left_size = left_input.output_size();
 
     auto set_column_metadata = [](mema::column_t &col, const JoinInput &input,
@@ -175,9 +199,9 @@ inline ExecuteResult initialize_output_columns(
             col.source_table = input.table_id;
             col.source_column = actual_col_idx;
         } else {
-            const auto &result = std::get<ExecuteResult>(input.data);
-            col.source_table = result[col_idx].source_table;
-            col.source_column = result[col_idx].source_column;
+            const auto &result = std::get<ExtendedResult>(input.data);
+            col.source_table = result.columns[col_idx].source_table;
+            col.source_column = result.columns[col_idx].source_column;
         }
     };
 
@@ -188,7 +212,7 @@ inline ExecuteResult initialize_output_columns(
 
         mema::column_t col;
         set_column_metadata(col, input, node, local_idx);
-        results.push_back(std::move(col));
+        results.columns.push_back(std::move(col));
     }
 
     return results;
@@ -200,9 +224,10 @@ inline ExecuteResult initialize_output_columns(
  * prepared flag implements lazy PageIndex construction.
  */
 struct JoinSetup {
-    ExecuteResult results; /**< Output columns being populated. */
+    ExtendedResult results; /**< Output columns + row ID columns. */
     ColumnarReader
         columnar_reader; /**< Page cursor caching for columnar access. */
+    std::vector<uint8_t> merged_table_ids; /**< Tables tracked in output. */
     /**
      * True after prepare_output_columns called.
      */
@@ -212,9 +237,40 @@ struct JoinSetup {
 };
 
 /**
+ * @brief Merge tracked table IDs from build and probe (sorted, unique).
+ *
+ * Both input vectors must be sorted. Output is sorted and deduplicated.
+ */
+inline std::vector<uint8_t>
+merge_tracked_tables(const std::vector<uint8_t> &build_tables,
+                     const std::vector<uint8_t> &probe_tables) {
+    std::vector<uint8_t> merged;
+    merged.reserve(build_tables.size() + probe_tables.size());
+
+    size_t i = 0, j = 0;
+    while (i < build_tables.size() && j < probe_tables.size()) {
+        if (build_tables[i] < probe_tables[j]) {
+            merged.push_back(build_tables[i++]);
+        } else if (probe_tables[j] < build_tables[i]) {
+            merged.push_back(probe_tables[j++]);
+        } else {
+            merged.push_back(build_tables[i++]);
+            j++; // Skip duplicate
+        }
+    }
+    while (i < build_tables.size())
+        merged.push_back(build_tables[i++]);
+    while (j < probe_tables.size())
+        merged.push_back(probe_tables[j++]);
+
+    return merged;
+}
+
+/**
  * @brief Initializes JoinSetup with output columns; call before join execution.
  *
  * PageIndex construction deferred to prepare_output_columns().
+ * Computes merged table IDs from build and probe inputs.
  */
 inline JoinSetup
 setup_join(const JoinInput &build_input, const JoinInput &probe_input,
@@ -228,6 +284,11 @@ setup_join(const JoinInput &build_input, const JoinInput &probe_input,
     setup.results =
         initialize_output_columns(output_attrs, left_node, right_node,
                                   left_input, right_input, estimated_rows);
+
+    // Compute merged table IDs from build and probe sides
+    auto build_tables = build_input.tracked_tables();
+    auto probe_tables = probe_input.tracked_tables();
+    setup.merged_table_ids = merge_tracked_tables(build_tables, probe_tables);
 
     setup.prepared = false;
 

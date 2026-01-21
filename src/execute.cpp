@@ -49,10 +49,10 @@ using materialize::create_empty_result;
 using materialize::materialize_from_buffers;
 
 /**
- * @brief Result variant: ExecuteResult (intermediate, value_t columns) or
+ * @brief Result variant: ExtendedResult (intermediate, with row ID tracking) or
  * ColumnarTable (final output per contest API).
  */
-using JoinResult = std::variant<ExecuteResult, ColumnarTable>;
+using JoinResult = std::variant<ExtendedResult, ColumnarTable>;
 
 /**
  * @brief Recursive join execution with timing.
@@ -69,7 +69,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
  * @brief Resolve plan node to JoinInput.
  *
  * ScanNode -> non-owning ColumnarTable*; JoinNode -> recursive execution
- * returning owned ExecuteResult. Implements depth-first traversal.
+ * returning owned ExtendedResult. Implements depth-first traversal.
  *
  * @param plan Query plan.
  * @param node_idx Node index to resolve.
@@ -87,7 +87,7 @@ JoinInput resolve_join_input(const Plan &plan, size_t node_idx,
         input.table_id = scan->base_table_id;
     } else {
         auto result = execute_impl(plan, node_idx, false, stats);
-        input.data = std::get<ExecuteResult>(std::move(result));
+        input.data = std::get<ExtendedResult>(std::move(result));
         input.table_id = 0;
     }
     return input;
@@ -128,9 +128,9 @@ JoinResult execute_join_with_mode(
                                                  config.probe_attr);
         } else {
             const auto &probe_result =
-                std::get<ExecuteResult>(probe_input.data);
+                std::get<ExtendedResult>(probe_input.data);
             match_buffers = probe_intermediate<Mode>(
-                *hash_table, probe_result[config.probe_attr]);
+                *hash_table, probe_result.columns[config.probe_attr]);
         }
         auto probe_end = std::chrono::high_resolution_clock::now();
         stats.hash_join_probe_ms +=
@@ -175,7 +175,7 @@ JoinResult execute_join_with_mode(
             construct_intermediate_from_buffers<Mode>(
                 match_buffers, build_input, probe_input, config.remapped_attrs,
                 build_node, probe_node, build_input.output_size(),
-                columnar_reader, setup.results);
+                columnar_reader, setup.results, setup.merged_table_ids);
         }
         auto inter_end = std::chrono::high_resolution_clock::now();
         stats.intermediate_ms +=
@@ -203,7 +203,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     auto &node = plan.nodes[node_idx];
 
     if (!std::holds_alternative<JoinNode>(node.data)) {
-        return ExecuteResult{};
+        return ExtendedResult{};
     }
 
     const auto &join = std::get<JoinNode>(node.data);
@@ -288,7 +288,7 @@ JoinResult execute_impl(const Plan &plan, size_t node_idx, bool is_root,
     }
 
     // Should never reach here, but satisfy compiler
-    return ExecuteResult{};
+    return ExtendedResult{};
 }
 
 /**

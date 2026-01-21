@@ -153,6 +153,84 @@ struct column_t {
 using Columnar = std::vector<column_t>;
 
 /**
+ * @brief Row ID column storing encoded global row IDs.
+ *
+ * Parallel structure to column_t but stores uint32_t (encoded table_id +
+ * row_id). One column per base table participating in joins up to this point.
+ * Uses same page size and arena allocation as column_t.
+ *
+ * @see GlobalRowId for encoding scheme, ExtendedResult for usage.
+ */
+struct rowid_column_t {
+    /** @brief Page for row ID storage: fixed array of uint32_t entries. */
+    struct alignas(IR_PAGE_SIZE) Page {
+        uint32_t data[CAP_PER_PAGE];
+    };
+
+    std::vector<Page *> pages; ///< Pointers to arena-allocated pages.
+    size_t num_values = 0;     ///< Total row ID count across all pages.
+    uint8_t table_id = 0;      ///< Which base table this column tracks.
+
+    rowid_column_t() = default;
+
+    rowid_column_t(rowid_column_t &&other) noexcept
+        : pages(std::move(other.pages)), num_values(other.num_values),
+          table_id(other.table_id) {
+        other.pages.clear();
+        other.num_values = 0;
+    }
+
+    rowid_column_t &operator=(rowid_column_t &&other) noexcept {
+        if (this != &other) {
+            pages = std::move(other.pages);
+            num_values = other.num_values;
+            table_id = other.table_id;
+            other.pages.clear();
+            other.num_values = 0;
+        }
+        return *this;
+    }
+
+    rowid_column_t(const rowid_column_t &) = delete;
+    rowid_column_t &operator=(const rowid_column_t &) = delete;
+
+    ~rowid_column_t() = default;
+
+    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. */
+    inline uint32_t operator[](size_t idx) const {
+        return pages[idx >> 12]->data[idx & 0xFFF];
+    }
+
+    /** @brief Thread-safe write at idx (requires pages to be set up first). */
+    inline void write_at(size_t idx, uint32_t val) {
+        pages[idx >> 12]->data[idx & 0xFFF] = val;
+    }
+
+    /** @brief Total row ID count. */
+    size_t row_count() const { return num_values; }
+
+    /** @brief Set row count without allocation (for assembly pattern). */
+    inline void set_row_count(size_t count) { num_values = count; }
+
+    /** @brief Pre-allocate pages from arena. */
+    inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
+                                        size_t count) {
+        static_assert(sizeof(Page) ==
+                          Contest::platform::ChunkSize<
+                              Contest::platform::ChunkType::IR_PAGE>::value,
+                      "Page size mismatch with IR_PAGE chunk size");
+        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            void *ptr =
+                arena.alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
+            pages.push_back(reinterpret_cast<Page *>(ptr));
+        }
+        num_values = count;
+    }
+};
+
+/**
  * @brief Convert column_t vector to ColumnarTable. Dereferences VARCHAR refs.
  * @see materialize.h
  */
@@ -163,4 +241,56 @@ ColumnarTable to_columnar(const Columnar &table, const Plan &plan);
 namespace Contest {
 /** @brief Result type for non-root joins (intermediate format). */
 using ExecuteResult = std::vector<mema::column_t>;
+
+/**
+ * @brief Extended intermediate result with row ID tracking.
+ *
+ * Wraps ExecuteResult with parallel row ID columns that track
+ * which original scan rows contributed to each intermediate row.
+ * One rowid_column_t per base table participating in the join tree.
+ *
+ * @see GlobalRowId for encoding, construct_intermediate.h for population.
+ */
+struct ExtendedResult {
+    ExecuteResult columns;                     ///< Data columns (value_t).
+    std::vector<mema::rowid_column_t> row_ids; ///< One per participating table.
+    std::vector<uint8_t> table_ids; ///< Which tables are tracked (sorted).
+
+    ExtendedResult() = default;
+
+    ExtendedResult(ExtendedResult &&) = default;
+    ExtendedResult &operator=(ExtendedResult &&) = default;
+
+    ExtendedResult(const ExtendedResult &) = delete;
+    ExtendedResult &operator=(const ExtendedResult &) = delete;
+
+    /** @brief Total row count (from first data column). */
+    size_t row_count() const {
+        return columns.empty() ? 0 : columns[0].row_count();
+    }
+
+    /** @brief Find row ID column index for a specific table, or -1 if not
+     * found. */
+    int find_rowid_index(uint8_t tid) const {
+        for (size_t i = 0; i < table_ids.size(); ++i) {
+            if (table_ids[i] == tid)
+                return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    /** @brief Get row ID column for a specific table, or nullptr if not found.
+     */
+    const mema::rowid_column_t *get_rowid_column(uint8_t tid) const {
+        int idx = find_rowid_index(tid);
+        return (idx >= 0) ? &row_ids[idx] : nullptr;
+    }
+
+    /** @brief Get mutable row ID column for a specific table, or nullptr. */
+    mema::rowid_column_t *get_rowid_column_mut(uint8_t tid) {
+        int idx = find_rowid_index(tid);
+        return (idx >= 0) ? &row_ids[idx] : nullptr;
+    }
+};
+
 } /* namespace Contest */

@@ -28,6 +28,8 @@
  */
 namespace Contest::join {
 
+using Contest::ExtendedResult;
+
 using Contest::ExecuteResult;
 using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
@@ -69,8 +71,8 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
             }
         }
     } else {
-        const auto &res = std::get<ExecuteResult>(input.data);
-        const mema::column_t &col = res[attr_idx];
+        const auto &res = std::get<ExtendedResult>(input.data);
+        const mema::column_t &col = res.columns[attr_idx];
         size_t count = col.row_count();
         for (size_t i = 0; i < count; i++) {
             const mema::value_t &val = col[i];
@@ -190,8 +192,8 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                 }
             }
         } else {
-            const auto &res = std::get<ExecuteResult>(probe_input.data);
-            const mema::column_t &col = res[probe_attr];
+            const auto &res = std::get<ExtendedResult>(probe_input.data);
+            const mema::column_t &col = res.columns[probe_attr];
             size_t count = col.row_count();
             size_t start = (t_id * count) / THREAD_COUNT;
             size_t end = ((t_id + 1) * count) / THREAD_COUNT;
