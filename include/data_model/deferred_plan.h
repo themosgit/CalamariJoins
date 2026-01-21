@@ -76,7 +76,7 @@ struct DeferredScanNode {
  * - Which columns to materialize eagerly (join keys for parent)
  * - Column provenance for deferred resolution
  * - Pre-computed match collection mode
- * - Table IDs tracked through this node
+ * - Number of deferred columns for allocation
  */
 struct DeferredJoinNode {
     size_t node_idx; ///< Index in original Plan::nodes.
@@ -95,8 +95,8 @@ struct DeferredJoinNode {
     /// Pre-computed collection mode (assumes build=left; flip if build=right).
     join::MatchCollectionMode base_collection_mode;
 
-    /// Sorted table IDs tracked through this node (union of children).
-    std::vector<uint8_t> tracked_table_ids;
+    /// Number of deferred columns (for pre-allocation).
+    size_t num_deferred_columns = 0;
 
     /// Column index that parent needs as join key (nullopt if root).
     std::optional<size_t> parent_join_key_idx;

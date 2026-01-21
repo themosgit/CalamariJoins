@@ -41,12 +41,13 @@ static constexpr size_t PAGE_2MB = 2 * 1024 * 1024;
  * @brief Chunk type enumeration for arena regions.
  */
 enum class ChunkType : uint8_t {
-    HASH_CHUNK = 0,  ///< 4KB  - hash table partition chunks
-    IR_PAGE = 1,     ///< 16KB - intermediate result pages
-    INDEX_CHUNK = 2, ///< 32KB - match collector index chunks
-    GENERAL = 3,     ///< Variable - misc allocations
+    HASH_CHUNK = 0,    ///< 4KB  - hash table partition chunks
+    IR_PAGE = 1,       ///< 16KB - intermediate result pages (32-bit values)
+    INDEX_CHUNK = 2,   ///< 32KB - match collector index chunks
+    DEFERRED_PAGE = 3, ///< 32KB - deferred provenance pages (64-bit values)
+    GENERAL = 4,       ///< Variable - misc allocations
 
-    NUM_TYPES = 4
+    NUM_TYPES = 5
 };
 
 // ============================================================================
@@ -67,12 +68,15 @@ template <> struct ChunkSize<ChunkType::IR_PAGE> {
 template <> struct ChunkSize<ChunkType::INDEX_CHUNK> {
     static constexpr size_t value = 32768;
 };
+template <> struct ChunkSize<ChunkType::DEFERRED_PAGE> {
+    static constexpr size_t value = 32768;
+};
 template <> struct ChunkSize<ChunkType::GENERAL> {
     static constexpr size_t value = 0;
 };
 
 /// Runtime chunk size array indexed by ChunkType.
-inline constexpr size_t CHUNK_SIZES[] = {4096, 16384, 32768, 0};
+inline constexpr size_t CHUNK_SIZES[] = {4096, 16384, 32768, 32768, 0};
 
 // ============================================================================
 // Page Policies
@@ -92,6 +96,7 @@ inline constexpr PagePolicy REGION_PAGE_POLICY[] = {
     PagePolicy::SMALL_PAGES, // HASH_CHUNK
     PagePolicy::HUGE_PAGES,  // IR_PAGE
     PagePolicy::HUGE_PAGES,  // INDEX_CHUNK
+    PagePolicy::HUGE_PAGES,  // DEFERRED_PAGE
     PagePolicy::HUGE_PAGES,  // GENERAL
 };
 
@@ -102,7 +107,7 @@ inline constexpr PagePolicy REGION_PAGE_POLICY[] = {
 /**
  * @brief Region size configuration based on available DRAM.
  *
- * Uses 75% of SPC__NUMA_NODE_DRAM_MB, divided equally (25%) among 4 regions.
+ * Uses 75% of SPC__NUMA_NODE_DRAM_MB, divided equally (20%) among 5 regions.
  */
 struct RegionConfig {
     size_t total_arena_bytes;
@@ -113,8 +118,8 @@ struct RegionConfig {
                             1024ULL * 1024ULL * 3ULL / 4ULL;
     }
 
-    /// Get total size for a region (25% each).
-    size_t get(ChunkType /*ct*/) const { return total_arena_bytes / 4; }
+    /// Get total size for a region (20% each).
+    size_t get(ChunkType /*ct*/) const { return total_arena_bytes / 5; }
 
     /// Get total arena size.
     size_t total() const { return total_arena_bytes; }
@@ -450,7 +455,8 @@ class ArenaManager {
 // Global Instance and Helper
 // ============================================================================
 
-/// Global arena manager instance (inline global, constructed at program startup).
+/// Global arena manager instance (inline global, constructed at program
+/// startup).
 inline ArenaManager g_arena_manager{};
 
 /// Get thread arena by thread ID.

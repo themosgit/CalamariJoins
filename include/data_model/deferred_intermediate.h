@@ -2,9 +2,10 @@
  * @file deferred_intermediate.h
  * @brief Lightweight intermediate result for deferred materialization.
  *
- * DeferredResult stores only materialized columns (join keys) plus row ID
- * provenance columns. Deferred columns are resolved at final materialization
- * by following row IDs back to base tables.
+ * DeferredResult stores only materialized columns (join keys) plus
+ * per-deferred-column provenance using 64-bit encoding (table_id, column_idx,
+ * row_id). Deferred columns are resolved at final materialization by decoding
+ * the provenance and reading directly from base tables.
  *
  * @see deferred_plan.h for DeferredJoinNode with column decisions.
  * @see construct_deferred.h for building DeferredResult.
@@ -27,14 +28,15 @@ namespace Contest {
  *
  * Unlike ExtendedResult which stores all projected columns, DeferredResult
  * stores only columns marked MATERIALIZE (typically just the parent's join
- * key). All other columns are resolved at final materialization using row ID
- * provenance.
+ * key). All other columns are resolved at final materialization using
+ * per-column 64-bit provenance (table_id, column_idx, row_id).
  *
  * Memory savings: For a join projecting N columns where only 1 is a join key,
  * DeferredResult uses ~1/N the memory of ExtendedResult for data columns.
+ * Additionally, we only track provenance for deferred columns (not all tables).
  *
  * @see DeferredColumnInfo for materialization decisions.
- * @see DeferredJoinNode for column provenance tracking.
+ * @see DeferredProvenance for 64-bit encoding scheme.
  */
 struct DeferredResult {
     /// Only columns marked MATERIALIZE (typically 1 join key).
@@ -44,11 +46,13 @@ struct DeferredResult {
     /// deferred).
     std::vector<std::optional<size_t>> materialized_map;
 
-    /// Row ID tracking for provenance (same as ExtendedResult).
-    std::vector<mema::rowid_column_t> row_ids;
+    /// Per-deferred-column provenance (64-bit encoded table_id+column_idx+row).
+    /// One deferred_column_t per DEFER column, stores full provenance per row.
+    std::vector<mema::deferred_column_t> deferred_columns;
 
-    /// Which base tables are tracked (sorted).
-    std::vector<uint8_t> table_ids;
+    /// Map: original column index → index in deferred_columns (nullopt if
+    /// materialized).
+    std::vector<std::optional<size_t>> deferred_map;
 
     /// Reference to node info for column provenance resolution.
     const DeferredJoinNode *node_info = nullptr;
@@ -71,6 +75,12 @@ struct DeferredResult {
                materialized_map[orig_idx].has_value();
     }
 
+    /** @brief Check if column is deferred. */
+    bool is_deferred(size_t orig_idx) const {
+        return orig_idx < deferred_map.size() &&
+               deferred_map[orig_idx].has_value();
+    }
+
     /** @brief Get materialized column, or nullptr if deferred. */
     const mema::column_t *get_materialized(size_t orig_idx) const {
         if (!is_materialized(orig_idx))
@@ -78,26 +88,22 @@ struct DeferredResult {
         return &materialized[*materialized_map[orig_idx]];
     }
 
-    /** @brief Find row ID column index for a table, or -1 if not found. */
-    int find_rowid_index(uint8_t tid) const {
-        for (size_t i = 0; i < table_ids.size(); ++i) {
-            if (table_ids[i] == tid)
-                return static_cast<int>(i);
-        }
-        return -1;
+    /** @brief Get deferred column provenance, or nullptr if materialized. */
+    const mema::deferred_column_t *get_deferred(size_t orig_idx) const {
+        if (!is_deferred(orig_idx))
+            return nullptr;
+        return &deferred_columns[*deferred_map[orig_idx]];
     }
 
-    /** @brief Get row ID column for a table, or nullptr if not found. */
-    const mema::rowid_column_t *get_rowid_column(uint8_t tid) const {
-        int idx = find_rowid_index(tid);
-        return (idx >= 0) ? &row_ids[idx] : nullptr;
+    /** @brief Get mutable deferred column provenance, or nullptr. */
+    mema::deferred_column_t *get_deferred_mut(size_t orig_idx) {
+        if (!is_deferred(orig_idx))
+            return nullptr;
+        return &deferred_columns[*deferred_map[orig_idx]];
     }
 
-    /** @brief Get mutable row ID column for a table, or nullptr. */
-    mema::rowid_column_t *get_rowid_column_mut(uint8_t tid) {
-        int idx = find_rowid_index(tid);
-        return (idx >= 0) ? &row_ids[idx] : nullptr;
-    }
+    /** @brief Number of deferred columns. */
+    size_t num_deferred() const { return deferred_columns.size(); }
 };
 
 /**
@@ -150,19 +156,16 @@ struct DeferredInput {
         return 0;
     }
 
-    /** @brief Get list of tracked table IDs. */
-    std::vector<uint8_t> tracked_tables() const {
-        if (is_columnar()) {
-            return {table_id};
-        }
-        return std::get<DeferredResult>(data).table_ids;
-    }
-
-    /** @brief Get row ID column for a table. */
-    const mema::rowid_column_t *get_rowid_column(uint8_t tid) const {
+    /**
+     * @brief Get deferred column provenance for a column index.
+     *
+     * For columnar inputs, returns nullptr (caller must encode fresh).
+     * For DeferredResult inputs, returns existing provenance column.
+     */
+    const mema::deferred_column_t *get_deferred_column(size_t col_idx) const {
         if (is_columnar())
             return nullptr;
-        return std::get<DeferredResult>(data).get_rowid_column(tid);
+        return std::get<DeferredResult>(data).get_deferred(col_idx);
     }
 };
 

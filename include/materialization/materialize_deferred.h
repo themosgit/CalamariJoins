@@ -3,7 +3,8 @@
  * @brief Final materialization for deferred execution path.
  *
  * Materializes all output columns at the root join, resolving deferred
- * columns by following row ID provenance back to base tables.
+ * columns by decoding 64-bit provenance (table_id, column_idx, row_id) back
+ * to base tables.
  *
  * @see construct_deferred.h for building DeferredResult intermediates.
  * @see materialize.h for the eager materialization equivalent.
@@ -136,7 +137,7 @@ inline ColumnarTable create_empty_deferred_final(
  * Handles three cases:
  * 1. COLUMNAR_DIRECT: Input is columnar, read directly via row index
  * 2. MATERIALIZED: Column was materialized in DeferredResult
- * 3. DEFERRED: Resolve via row ID lookup to base table
+ * 3. DEFERRED: Resolve via 64-bit provenance to base table
  *
  * @tparam Mode Collection mode for compile-time specialization.
  * @tparam BuilderType Int32PageBuilder or VarcharPageBuilder.
@@ -249,7 +250,8 @@ inline void materialize_deferred_column(
 /**
  * @brief Materialize single output column handling deferred resolution.
  *
- * For deferred columns, resolves via row ID tracking back to base table.
+ * For deferred columns, resolves via 64-bit provenance encoding back to
+ * base table.
  *
  * @tparam Mode Collection mode for compile-time specialization.
  */
@@ -276,20 +278,13 @@ inline void materialize_single_deferred_column(
     }
 
     // Determine if this column comes from build or probe side at runtime
-    // col_info->from_left refers to original left child
-    // build_is_left tells us if build side is the left child
-    // If from_left && build_is_left => from build
-    // If from_left && !build_is_left => from probe (left became probe)
-    // If !from_left && build_is_left => from probe (right is probe)
-    // If !from_left && !build_is_left => from build (right became build)
     bool from_build = (col_info->from_left == build_is_left);
     const DeferredInput &src_input = from_build ? build_input : probe_input;
 
     // Determine how to read the value
     const Column *columnar_source = nullptr;
     const mema::column_t *materialized_source = nullptr;
-    const mema::rowid_column_t *rowid_source = nullptr;
-    const Column *base_table_column = nullptr;
+    const mema::deferred_column_t *deferred_source = nullptr;
 
     if (src_input.is_columnar()) {
         // Direct columnar read
@@ -303,16 +298,9 @@ inline void materialize_single_deferred_column(
             // Read from materialized column
             materialized_source =
                 ir.get_materialized(col_info->child_output_idx);
-        } else {
-            // Deferred - need to resolve via row ID
-            rowid_source =
-                ir.get_rowid_column(col_info->provenance.base_table_id);
-            if (deferred_plan.original_plan) {
-                base_table_column =
-                    &deferred_plan.original_plan
-                         ->inputs[col_info->provenance.base_table_id]
-                         .columns[col_info->provenance.base_column_idx];
-            }
+        } else if (ir.is_deferred(col_info->child_output_idx)) {
+            // Deferred - need to resolve via 64-bit provenance
+            deferred_source = ir.get_deferred(col_info->child_output_idx);
         }
     }
 
@@ -325,13 +313,17 @@ inline void materialize_single_deferred_column(
                 col_info->type, cursor, from_build);
         } else if (materialized_source) {
             return (*materialized_source)[local_row_id];
-        } else if (rowid_source && base_table_column) {
-            // Deferred resolution: get base table row from encoded row ID
-            uint32_t encoded = (*rowid_source)[local_row_id];
-            uint32_t base_row = GlobalRowId::row(encoded);
+        } else if (deferred_source && deferred_plan.original_plan) {
+            // Deferred resolution: decode 64-bit provenance
+            uint64_t prov = (*deferred_source)[local_row_id];
+            uint8_t base_tid = DeferredProvenance::table(prov);
+            uint8_t base_col = DeferredProvenance::column(prov);
+            uint64_t base_row = DeferredProvenance::row(prov);
+            const auto &base_table =
+                deferred_plan.original_plan->inputs[base_tid];
             return columnar_reader.read_value(
-                *base_table_column, col_info->provenance.base_column_idx,
-                base_row, col_info->type, cursor, true);
+                base_table.columns[base_col], base_col,
+                static_cast<uint32_t>(base_row), col_info->type, cursor, true);
         }
         return mema::value_t{mema::value_t::NULL_VALUE};
     };
@@ -357,8 +349,12 @@ inline void materialize_single_deferred_column(
             str_src_ptr = &deferred_plan.original_plan
                                ->inputs[materialized_source->source_table]
                                .columns[materialized_source->source_column];
-        } else if (base_table_column) {
-            str_src_ptr = base_table_column;
+        } else if (deferred_source && deferred_plan.original_plan) {
+            // For deferred VARCHAR, get source from provenance of first row
+            // All rows in a deferred column share the same base table/column
+            str_src_ptr = &deferred_plan.original_plan
+                               ->inputs[col_info->provenance.base_table_id]
+                               .columns[col_info->provenance.base_column_idx];
         }
     }
 
@@ -383,7 +379,7 @@ inline void materialize_single_deferred_column(
  * @brief Materialize all output columns from deferred intermediate.
  *
  * For root join in deferred execution path. Resolves all deferred columns
- * by following row ID provenance to base tables.
+ * by decoding 64-bit provenance to base tables.
  *
  * @tparam Mode Collection mode for compile-time specialization.
  * @param buffers Thread-local match buffers from probe.

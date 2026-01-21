@@ -160,6 +160,60 @@ class ThreadLocalMatchBuffer {
         ChainIterator end() const { return ChainIterator(nullptr, 0); }
     };
 
+    /**
+     * @brief Batch reader for efficient SIMD access to chunk chains.
+     *
+     * Unlike ChainIterator which reads one element at a time, this reader
+     * provides direct pointer access to contiguous batches within chunks.
+     * Essential for SIMD provenance encoding in deferred materialization.
+     */
+    class ChunkBatchReader {
+        IndexChunk *current_chunk;
+        uint32_t offset;
+        size_t remaining;
+
+      public:
+        ChunkBatchReader(IndexChunk *chunk, size_t count)
+            : current_chunk(chunk), offset(0), remaining(count) {}
+
+        /** @brief Returns true if more data is available. */
+        inline bool has_more() const { return remaining > 0 && current_chunk; }
+
+        /**
+         * @brief Get pointer to contiguous batch of row IDs.
+         *
+         * Returns pointer to up to max_batch contiguous elements within
+         * current chunk. Actual count may be less if chunk boundary reached.
+         *
+         * @param max_batch Maximum elements to return.
+         * @param actual_count Output: actual number of elements available.
+         * @return Pointer to contiguous row IDs, or nullptr if exhausted.
+         */
+        inline const uint32_t *get_batch(size_t max_batch,
+                                         size_t &actual_count) {
+            if (!current_chunk || remaining == 0) {
+                actual_count = 0;
+                return nullptr;
+            }
+
+            size_t available = current_chunk->count - offset;
+            actual_count = std::min({max_batch, remaining, available});
+            const uint32_t *ptr = &current_chunk->ids[offset];
+
+            offset += static_cast<uint32_t>(actual_count);
+            remaining -= actual_count;
+
+            if (offset >= current_chunk->count && current_chunk->next) {
+                current_chunk = current_chunk->next;
+                offset = 0;
+            }
+            return ptr;
+        }
+
+        /** @brief Remaining element count. */
+        inline size_t count() const { return remaining; }
+    };
+
     /** @brief Returns range for iterating left (build) row IDs. */
     inline ChainRange left_range() const {
         return ChainRange(left_head, total_count);
@@ -168,6 +222,16 @@ class ThreadLocalMatchBuffer {
     /** @brief Returns range for iterating right (probe) row IDs. */
     inline ChainRange right_range() const {
         return ChainRange(right_head, total_count);
+    }
+
+    /** @brief Returns batch reader for left (build) row IDs. */
+    inline ChunkBatchReader left_batch_reader() const {
+        return ChunkBatchReader(left_head, total_count);
+    }
+
+    /** @brief Returns batch reader for right (probe) row IDs. */
+    inline ChunkBatchReader right_batch_reader() const {
+        return ChunkBatchReader(right_head, total_count);
     }
 
     /** @brief Returns match count in this buffer. */

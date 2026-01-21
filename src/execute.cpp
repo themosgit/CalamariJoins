@@ -379,54 +379,14 @@ DeferredJoinResult execute_deferred_join_with_mode(
     const UnchainedHashtable *hash_table, const DeferredInput &build_input,
     const DeferredInput &probe_input, const BuildProbeConfig &config,
     const DeferredJoinNode &join_node, io::ColumnarReader &columnar_reader,
-    const DeferredPlan &deferred_plan,
-    const std::vector<uint8_t> &merged_table_ids, TimingStats &stats) {
+    const DeferredPlan &deferred_plan, TimingStats &stats) {
 
     std::vector<ThreadLocalMatchBuffer<Mode>> match_buffers;
 
-    // Probe phase - need to convert DeferredInput to JoinInput for probing
-    // For now, handle columnar probe directly
     if (use_nested_loop) {
         auto nested_loop_start = std::chrono::high_resolution_clock::now();
-        // Nested loop requires JoinInput - create adapter
-        JoinInput build_ji, probe_ji;
-        build_ji.node = build_input.node;
-        probe_ji.node = probe_input.node;
-
-        if (build_input.is_columnar()) {
-            build_ji.data = std::get<const ColumnarTable *>(build_input.data);
-            build_ji.table_id = build_input.table_id;
-        } else {
-            // Convert DeferredResult to ExtendedResult for compatibility
-            // This is a limitation - nested loop path falls back to eager
-            const auto &dr = std::get<DeferredResult>(build_input.data);
-            ExtendedResult er;
-            er.columns = std::move(
-                const_cast<std::vector<mema::column_t> &>(dr.materialized));
-            er.row_ids = std::move(
-                const_cast<std::vector<mema::rowid_column_t> &>(dr.row_ids));
-            er.table_ids = dr.table_ids;
-            build_ji.data = std::move(er);
-            build_ji.table_id = 0;
-        }
-
-        if (probe_input.is_columnar()) {
-            probe_ji.data = std::get<const ColumnarTable *>(probe_input.data);
-            probe_ji.table_id = probe_input.table_id;
-        } else {
-            const auto &dr = std::get<DeferredResult>(probe_input.data);
-            ExtendedResult er;
-            er.columns = std::move(
-                const_cast<std::vector<mema::column_t> &>(dr.materialized));
-            er.row_ids = std::move(
-                const_cast<std::vector<mema::rowid_column_t> &>(dr.row_ids));
-            er.table_ids = dr.table_ids;
-            probe_ji.data = std::move(er);
-            probe_ji.table_id = 0;
-        }
-
-        match_buffers = nested_loop_join<Mode>(
-            build_ji, probe_ji, config.build_attr, config.probe_attr);
+        match_buffers = nested_loop_join_deferred<Mode>(
+            build_input, probe_input, config.build_attr, config.probe_attr);
         auto nested_loop_end = std::chrono::high_resolution_clock::now();
         stats.nested_loop_join_ms +=
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -508,8 +468,7 @@ DeferredJoinResult execute_deferred_join_with_mode(
             construct_deferred_from_buffers<Mode>(
                 match_buffers, build_input, probe_input, join_node,
                 config.remapped_attrs, build_input.output_size(),
-                config.build_left, columnar_reader, result, merged_table_ids,
-                deferred_plan);
+                config.build_left, columnar_reader, result, deferred_plan);
         } else {
             result = create_empty_deferred_result(join_node);
         }
@@ -559,15 +518,9 @@ DeferredJoinResult execute_deferred_impl(const DeferredPlan &deferred_plan,
 
     const size_t HASH_TABLE_THRESHOLD = 8;
     size_t build_rows = build_input.row_count(config.build_attr);
-    // Nested loop doesn't work with DeferredResult because it only has join
-    // keys materialized. Force hash join when either side is DeferredResult.
-    bool use_nested_loop = (build_rows < HASH_TABLE_THRESHOLD) &&
-                           build_is_columnar && probe_is_columnar;
-
-    // Merge table IDs
-    auto build_tables = build_input.tracked_tables();
-    auto probe_tables = probe_input.tracked_tables();
-    auto merged_table_ids = merge_tracked_tables(build_tables, probe_tables);
+    // Use nested loop for small build tables - works with both columnar and
+    // DeferredResult inputs (join keys are always materialized).
+    bool use_nested_loop = (build_rows < HASH_TABLE_THRESHOLD);
 
     io::ColumnarReader columnar_reader;
     auto setup_end = std::chrono::high_resolution_clock::now();
@@ -575,10 +528,15 @@ DeferredJoinResult execute_deferred_impl(const DeferredPlan &deferred_plan,
                           setup_end - setup_start)
                           .count();
 
-    // For deferred materialization, we always need BOTH row indices because
-    // we track provenance from both sides for deferred column resolution.
-    // The optimization to collect only one side's indices is not safe here.
-    MatchCollectionMode mode = MatchCollectionMode::BOTH;
+    // Use pre-computed collection mode from plan analysis.
+    // base_collection_mode assumes build=left; flip if build=right at runtime.
+    MatchCollectionMode mode = djoin.base_collection_mode;
+    if (!config.build_left) {
+        if (mode == MatchCollectionMode::LEFT_ONLY)
+            mode = MatchCollectionMode::RIGHT_ONLY;
+        else if (mode == MatchCollectionMode::RIGHT_ONLY)
+            mode = MatchCollectionMode::LEFT_ONLY;
+    }
 
     // Build hash table if needed
     std::optional<UnchainedHashtable> hash_table;
@@ -618,22 +576,19 @@ DeferredJoinResult execute_deferred_impl(const DeferredPlan &deferred_plan,
         return execute_deferred_join_with_mode<MatchCollectionMode::BOTH>(
             use_nested_loop, probe_is_columnar, is_root,
             use_nested_loop ? nullptr : &(*hash_table), build_input,
-            probe_input, config, djoin, columnar_reader, deferred_plan,
-            merged_table_ids, stats);
+            probe_input, config, djoin, columnar_reader, deferred_plan, stats);
 
     case MatchCollectionMode::LEFT_ONLY:
         return execute_deferred_join_with_mode<MatchCollectionMode::LEFT_ONLY>(
             use_nested_loop, probe_is_columnar, is_root,
             use_nested_loop ? nullptr : &(*hash_table), build_input,
-            probe_input, config, djoin, columnar_reader, deferred_plan,
-            merged_table_ids, stats);
+            probe_input, config, djoin, columnar_reader, deferred_plan, stats);
 
     case MatchCollectionMode::RIGHT_ONLY:
         return execute_deferred_join_with_mode<MatchCollectionMode::RIGHT_ONLY>(
             use_nested_loop, probe_is_columnar, is_root,
             use_nested_loop ? nullptr : &(*hash_table), build_input,
-            probe_input, config, djoin, columnar_reader, deferred_plan,
-            merged_table_ids, stats);
+            probe_input, config, djoin, columnar_reader, deferred_plan, stats);
     }
 
     return DeferredResult{};

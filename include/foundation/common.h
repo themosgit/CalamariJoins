@@ -203,4 +203,53 @@ struct GlobalRowId {
     static inline uint32_t row(uint32_t encoded) { return encoded & ROW_MASK; }
 };
 
+/**
+ * @brief 64-bit encoding for deferred column provenance.
+ *
+ * Encodes table_id, column_idx, and row_id into a single 64-bit value
+ * for efficient storage and resolution of deferred columns.
+ *
+ * Encoding: [table_id (8 bits)][column_idx (8 bits)][row_id (48 bits)]
+ *   - table_id: bits 56-63
+ *   - column_idx: bits 48-55
+ *   - row_id: bits 0-47
+ *
+ * Supports up to 256 tables, 256 columns per table, and 281 trillion rows.
+ */
+struct DeferredProvenance {
+    static constexpr uint64_t ROW_BITS = 48;
+    static constexpr uint64_t COLUMN_BITS = 8;
+    static constexpr uint64_t TABLE_BITS = 8;
+
+    static constexpr uint64_t ROW_MASK = (1ULL << ROW_BITS) - 1;
+    static constexpr uint64_t COLUMN_MASK = (1ULL << COLUMN_BITS) - 1;
+    static constexpr uint64_t COLUMN_SHIFT = ROW_BITS;
+    static constexpr uint64_t TABLE_SHIFT = ROW_BITS + COLUMN_BITS;
+
+    static constexpr uint64_t MAX_TABLES = 1ULL << TABLE_BITS;   // 256
+    static constexpr uint64_t MAX_COLUMNS = 1ULL << COLUMN_BITS; // 256
+    static constexpr uint64_t MAX_ROWS = 1ULL << ROW_BITS;       // 281 trillion
+
+    /** @brief Encode table_id, column_idx, row_id into single uint64_t. */
+    static inline uint64_t encode(uint8_t table_id, uint8_t column_idx,
+                                  uint64_t row_id) {
+        return (static_cast<uint64_t>(table_id) << TABLE_SHIFT) |
+               (static_cast<uint64_t>(column_idx) << COLUMN_SHIFT) |
+               (row_id & ROW_MASK);
+    }
+
+    /** @brief Extract table_id from encoded provenance. */
+    static inline uint8_t table(uint64_t encoded) {
+        return static_cast<uint8_t>(encoded >> TABLE_SHIFT);
+    }
+
+    /** @brief Extract column_idx from encoded provenance. */
+    static inline uint8_t column(uint64_t encoded) {
+        return static_cast<uint8_t>((encoded >> COLUMN_SHIFT) & COLUMN_MASK);
+    }
+
+    /** @brief Extract row_id from encoded provenance. */
+    static inline uint64_t row(uint64_t encoded) { return encoded & ROW_MASK; }
+};
+
 } // namespace Contest

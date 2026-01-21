@@ -135,34 +135,6 @@ compute_base_collection_mode(const std::vector<DeferredColumnInfo> &columns,
     return join::MatchCollectionMode::BOTH;
 }
 
-/**
- * @brief Collect tracked table IDs from a DeferredNode.
- */
-std::vector<uint8_t> get_tracked_tables(const DeferredNode &node) {
-    if (const auto *scan = std::get_if<DeferredScanNode>(&node)) {
-        return {scan->base_table_id};
-    }
-    return std::get<DeferredJoinNode>(node).tracked_table_ids;
-}
-
-/**
- * @brief Merge tracked table IDs from two children (sorted, unique).
- */
-std::vector<uint8_t> merge_table_ids(const DeferredNode &left,
-                                     const DeferredNode &right) {
-    auto left_ids = get_tracked_tables(left);
-    auto right_ids = get_tracked_tables(right);
-
-    std::vector<uint8_t> result;
-    result.reserve(left_ids.size() + right_ids.size());
-
-    std::merge(left_ids.begin(), left_ids.end(), right_ids.begin(),
-               right_ids.end(), std::back_inserter(result));
-
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    return result;
-}
-
 } // anonymous namespace
 
 DeferredPlan analyze_plan(const Plan &plan) {
@@ -264,11 +236,17 @@ DeferredPlan analyze_plan(const Plan &plan) {
                 djoin.columns.push_back(std::move(info));
             }
 
-            // Compute collection mode and tracked tables
+            // Compute collection mode and count deferred columns
             djoin.base_collection_mode =
                 compute_base_collection_mode(djoin.columns, left_size);
-            djoin.tracked_table_ids = merge_table_ids(
-                deferred.nodes[join.left], deferred.nodes[join.right]);
+
+            // Count deferred columns for pre-allocation
+            djoin.num_deferred_columns = 0;
+            for (const auto &col : djoin.columns) {
+                if (col.resolution == ColumnResolution::DEFER) {
+                    ++djoin.num_deferred_columns;
+                }
+            }
 
             deferred.nodes[node_idx] = std::move(djoin);
         }
@@ -301,6 +279,20 @@ DeferredPlan analyze_plan(const Plan &plan) {
             if (col.child_output_idx < child_djoin->columns.size()) {
                 child_djoin->columns[col.child_output_idx].resolution =
                     ColumnResolution::MATERIALIZE;
+            }
+        }
+    }
+
+    // PASS 3: Recount num_deferred_columns after propagation
+    for (size_t node_idx : post_order) {
+        auto *djoin = std::get_if<DeferredJoinNode>(&deferred.nodes[node_idx]);
+        if (!djoin)
+            continue;
+
+        djoin->num_deferred_columns = 0;
+        for (const auto &col : djoin->columns) {
+            if (col.resolution == ColumnResolution::DEFER) {
+                ++djoin->num_deferred_columns;
             }
         }
     }

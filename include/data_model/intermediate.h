@@ -231,6 +231,88 @@ struct rowid_column_t {
 };
 
 /**
+ * @brief 64-bit provenance column for deferred materialization.
+ *
+ * Stores encoded (table_id, column_idx, row_id) for each row using
+ * DeferredProvenance encoding. Uses 32KB pages with 4096 entries each.
+ *
+ * @see DeferredProvenance for encoding scheme.
+ * @see deferred_intermediate.h for DeferredResult usage.
+ */
+struct deferred_column_t {
+    static constexpr size_t PAGE_SIZE = 1 << 15; // 32KB
+    static constexpr size_t ENTRIES_PER_PAGE =
+        PAGE_SIZE / sizeof(uint64_t);         // 4096
+    static constexpr size_t ENTRY_SHIFT = 12; // log2(4096)
+    static constexpr size_t ENTRY_MASK = ENTRIES_PER_PAGE - 1;
+
+    struct alignas(PAGE_SIZE) Page {
+        uint64_t data[ENTRIES_PER_PAGE];
+    };
+
+    std::vector<Page *> pages;
+    size_t num_values = 0;
+
+    deferred_column_t() = default;
+
+    deferred_column_t(deferred_column_t &&other) noexcept
+        : pages(std::move(other.pages)), num_values(other.num_values) {
+        other.pages.clear();
+        other.num_values = 0;
+    }
+
+    deferred_column_t &operator=(deferred_column_t &&other) noexcept {
+        if (this != &other) {
+            pages = std::move(other.pages);
+            num_values = other.num_values;
+            other.pages.clear();
+            other.num_values = 0;
+        }
+        return *this;
+    }
+
+    deferred_column_t(const deferred_column_t &) = delete;
+    deferred_column_t &operator=(const deferred_column_t &) = delete;
+
+    ~deferred_column_t() = default;
+
+    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. */
+    inline uint64_t operator[](size_t idx) const {
+        return pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK];
+    }
+
+    /** @brief Thread-safe write at idx (requires pages to be set up first). */
+    inline void write_at(size_t idx, uint64_t val) {
+        pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK] = val;
+    }
+
+    /** @brief Total value count. */
+    size_t row_count() const { return num_values; }
+
+    /** @brief Set row count without allocation (for assembly pattern). */
+    inline void set_row_count(size_t count) { num_values = count; }
+
+    /** @brief Pre-allocate pages from arena. */
+    inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
+                                        size_t count) {
+        static_assert(
+            sizeof(Page) ==
+                Contest::platform::ChunkSize<
+                    Contest::platform::ChunkType::DEFERRED_PAGE>::value,
+            "Page size mismatch with DEFERRED_PAGE chunk size");
+        size_t pages_needed = (count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            void *ptr =
+                arena
+                    .alloc_chunk<Contest::platform::ChunkType::DEFERRED_PAGE>();
+            pages.push_back(reinterpret_cast<Page *>(ptr));
+        }
+        num_values = count;
+    }
+};
+
+/**
  * @brief Convert column_t vector to ColumnarTable. Dereferences VARCHAR refs.
  * @see materialize.h
  */
