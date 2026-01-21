@@ -5,6 +5,8 @@
  * Fallback when build fits in L1 cache. Parallel work-stealing probe.
  * Outperforms hash join for tiny tables due to cache locality.
  *
+ * Templated on MatchCollectionMode for zero-overhead mode selection.
+ *
  * @see execute.cpp HASH_TABLE_THRESHOLD = 8
  */
 #pragma once
@@ -15,7 +17,8 @@
 #include <data_model/plan.h>
 #include <join_execution/join_setup.h>
 #include <join_execution/match_collector.h>
-#include <materialization/construct_intermediate.h>
+#include <join_execution/simd_compare.h>
+#include <platform/arena_vector.h>
 #include <platform/worker_pool.h>
 #include <vector>
 
@@ -26,6 +29,7 @@
 namespace Contest::join {
 
 using Contest::ExecuteResult;
+using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 /**
@@ -78,30 +82,32 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
 }
 
 /**
- * @brief Nested loop join for small build tables (<=64 rows).
+ * @brief Nested loop join for small build tables (<=8 rows).
  *
- * Build keys/IDs in stack arrays (512 bytes, L1-resident). Parallel probe
- * via work-stealing. Beats hash join for <8 rows due to no hash overhead.
+ * Build keys/IDs in SIMD registers (AVX2/NEON). Parallel probe via
+ * work-stealing. Beats hash join for <8 rows due to no hash overhead
+ * and register-resident comparison.
  *
- * @param mode BOTH, LEFT_ONLY, or RIGHT_ONLY.
+ * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
+ *              specialization of match buffer operations.
+ * @return Thread-local match buffers for direct iteration.
  */
-inline void
+template <MatchCollectionMode Mode>
+inline std::vector<ThreadLocalMatchBuffer<Mode>>
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
-                 size_t build_attr, size_t probe_attr,
-                 MatchCollector &collector,
-                 MatchCollectionMode mode = MatchCollectionMode::BOTH) {
+                 size_t build_attr, size_t probe_attr) {
     size_t build_rows = build_input.row_count(build_attr);
     size_t probe_rows = probe_input.row_count(probe_attr);
 
     if (build_rows == 0 || probe_rows == 0)
-        return;
+        return {};
 
-    /**
-     * MAX_BUILD_SIZE = 64 fits in L1 (512 bytes).
-     */
-    constexpr size_t MAX_BUILD_SIZE = 64;
-    int32_t b_vals[MAX_BUILD_SIZE];
-    uint32_t b_ids[MAX_BUILD_SIZE];
+    size_t num_threads = THREAD_COUNT;
+    std::vector<ThreadLocalMatchBuffer<Mode>> buffers(num_threads);
+
+    constexpr size_t MAX_BUILD_SIZE = 8;
+    alignas(32) int32_t b_vals[MAX_BUILD_SIZE];
+    alignas(16) uint32_t b_ids[MAX_BUILD_SIZE];
     size_t b_count = 0;
 
     auto collect_build = [&](uint32_t id, int32_t val) {
@@ -114,11 +120,13 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
 
     visit_rows(build_input, build_attr, collect_build);
 
-    size_t num_threads = worker_pool.thread_count();
-    auto buffers = create_thread_local_buffers(num_threads, mode);
+    for (size_t i = b_count; i < MAX_BUILD_SIZE; ++i) {
+        b_vals[i] = INT32_MIN;
+    }
 
     const Column *probe_col = nullptr;
-    std::vector<uint32_t> page_offsets;
+    platform::ArenaVector<uint32_t> page_offsets(
+        Contest::platform::get_arena(0));
     if (probe_input.is_columnar()) {
         auto *table = std::get<const ColumnarTable *>(probe_input.data);
         auto [col_idx, _] = probe_input.node->output_attrs[probe_attr];
@@ -134,15 +142,14 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
     }
     std::atomic<size_t> probe_page_counter{0};
 
-    worker_pool.execute([&](size_t t_id) {
+    worker_pool().execute([&](size_t t_id) {
+        buffers[t_id] =
+            ThreadLocalMatchBuffer<Mode>(Contest::platform::get_arena(t_id));
         auto &local_buffer = buffers[t_id];
 
         auto process_value = [&](uint32_t p_id, int32_t p_val) {
-            for (size_t k = 0; k < b_count; ++k) {
-                if (b_vals[k] == p_val) {
-                    local_buffer.add_match(b_ids[k], p_id);
-                }
-            }
+            simd::eq_scan_build<Mode>(p_id, p_val, b_vals, b_ids, b_count,
+                                      local_buffer);
         };
 
         if (probe_input.is_columnar()) {
@@ -161,7 +168,13 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                 uint32_t row_id = page_offsets[i];
 
                 if (num_rows == num_values) {
-                    for (uint16_t j = 0; j < num_rows; j++) {
+                    // SIMD batch: process multiple probe values at a time
+                    uint16_t j = simd::eq_batch_columnar<Mode>(
+                        data, num_rows, row_id, b_vals, b_ids, b_count,
+                        local_buffer);
+                    row_id += j;
+                    // Handle remaining elements with scalar
+                    for (; j < num_rows; j++) {
                         process_value(row_id++, data[j]);
                     }
                 } else {
@@ -180,19 +193,48 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
             const auto &res = std::get<ExecuteResult>(probe_input.data);
             const mema::column_t &col = res[probe_attr];
             size_t count = col.row_count();
-            size_t start = (t_id * count) / worker_pool.thread_count();
-            size_t end = ((t_id + 1) * count) / worker_pool.thread_count();
+            size_t start = (t_id * count) / THREAD_COUNT;
+            size_t end = ((t_id + 1) * count) / THREAD_COUNT;
 
-            for (size_t i = start; i < end; i++) {
+            constexpr size_t BATCH_SIZE = simd::INTERMEDIATE_BATCH_SIZE;
+            size_t i = start;
+
+            if constexpr (BATCH_SIZE > 0) {
+                // SIMD batch processing
+                for (; i + BATCH_SIZE <= end; i += BATCH_SIZE) {
+                    size_t page_idx = i >> 12;
+                    size_t offset = i & 0xFFF;
+
+                    // Only use SIMD if all values are on same page
+                    if (offset + BATCH_SIZE <= mema::CAP_PER_PAGE) {
+                        const int32_t *vals = reinterpret_cast<const int32_t *>(
+                            &col.pages[page_idx]->data[offset]);
+                        simd::eq_batch_intermediate<Mode>(
+                            vals, i, b_vals, b_ids, b_count, local_buffer);
+                    } else {
+                        // Cross-page boundary: fall back to scalar
+                        for (size_t j = i; j < i + BATCH_SIZE; j++) {
+                            const mema::value_t &val = col[j];
+                            if (!val.is_null()) {
+                                process_value(static_cast<uint32_t>(j),
+                                              val.value);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle remaining elements (or all elements if no SIMD)
+            for (; i < end; i++) {
                 const mema::value_t &val = col[i];
                 if (!val.is_null()) {
-                    process_value((uint32_t)i, val.value);
+                    process_value(static_cast<uint32_t>(i), val.value);
                 }
             }
         }
     });
-    for (auto &buf : buffers) {
-        collector.merge_thread_buffer(buf);
-    }
+
+    return buffers;
 }
+
 } // namespace Contest::join

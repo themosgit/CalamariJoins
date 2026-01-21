@@ -3,6 +3,7 @@
  * @brief Constructs intermediate results for multi-way joins.
  *
  * Allocates and populates ExecuteResult (column_t) from match collectors.
+ * Templated on MatchCollectionMode for zero-overhead mode selection.
  */
 #pragma once
 
@@ -11,8 +12,8 @@
 #include <data_model/plan.h>
 #include <join_execution/join_setup.h>
 #include <join_execution/match_collector.h>
+#include <platform/arena.h>
 #include <platform/worker_pool.h>
-#include <sys/mman.h>
 #include <vector>
 /**
  * @namespace Contest::materialize
@@ -25,45 +26,10 @@ namespace Contest::materialize {
 using Contest::ExecuteResult;
 using Contest::io::ColumnarReader;
 using Contest::join::JoinInput;
-using Contest::join::MatchCollector;
+using Contest::join::MatchCollectionMode;
+using Contest::join::ThreadLocalMatchBuffer;
+using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
-
-/**
- * @brief Batch memory allocator using single mmap for all intermediate pages.
- *
- * Single mmap vs per-page allocation: reduces syscalls, improves memory
- * locality, simplifies cleanup. Columns hold shared_ptr to prevent premature
- * munmap.
- *
- * @note Move-only type (no copy to prevent double-free).
- * @see batch_allocate_for_results() for allocation orchestration.
- * @see column_t::pre_allocate_from_block() for arena partitioning.
- */
-class BatchAllocator {
-  private:
-    void *memory_block = nullptr;
-    size_t total_size = 0;
-
-  public:
-    BatchAllocator() = default;
-    void allocate(size_t total_pages) {
-        total_size = total_pages * mema::IR_PAGE_SIZE;
-        memory_block = mmap(nullptr, total_size, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (memory_block == MAP_FAILED) {
-            memory_block = nullptr;
-            throw std::bad_alloc();
-        }
-    }
-    void *get_block() const { return memory_block; }
-    ~BatchAllocator() {
-        if (memory_block) {
-            munmap(memory_block, total_size);
-        }
-    }
-    BatchAllocator(const BatchAllocator &) = delete;
-    BatchAllocator &operator=(const BatchAllocator &) = delete;
-};
 
 /**
  * @brief Precomputed metadata for resolving an output column's source.
@@ -81,39 +47,6 @@ struct alignas(8) SourceInfo {
     bool is_columnar = false;    /**< True if source is columnar table. */
     bool from_build = false; /**< True if from build side, false if probe. */
 };
-
-/**
- * @brief Preallocates mmap'd memory for all output columns (arena allocation).
- *
- * @param results       Output columns to allocate (modified in-place).
- * @param total_matches Number of rows (match count from MatchCollector).
- * @return Shared ownership of BatchAllocator.
- *
- * @see BatchAllocator for single mmap rationale.
- * @see column_t::pre_allocate_from_block() for arena partitioning.
- */
-inline std::shared_ptr<BatchAllocator>
-batch_allocate_for_results(ExecuteResult &results, size_t total_matches) {
-
-    size_t total_chunks = 0;
-    for (auto &col : results) {
-        total_chunks +=
-            (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
-    }
-
-    size_t total_bytes =
-        total_chunks * mema::CAP_PER_PAGE * sizeof(mema::value_t);
-    size_t system_pages =
-        (total_bytes + mema::IR_PAGE_SIZE - 1) / mema::IR_PAGE_SIZE;
-    auto allocator = std::make_shared<BatchAllocator>();
-    allocator->allocate(system_pages);
-    void *block = allocator->get_block();
-    size_t offset = 0;
-    for (auto &col : results) {
-        col.pre_allocate_from_block(block, offset, total_matches, allocator);
-    }
-    return allocator;
-}
 
 /**
  * @brief Builds SourceInfo for each output column for fast hot-loop lookup.
@@ -159,13 +92,14 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
 }
 
 /**
- * @brief Populates ExecuteResult columns from join matches in parallel.
+ * @brief Constructs intermediate results directly from thread-local buffers.
  *
- * Core materialization for non-root joins. Transforms match row ID pairs into
- * column_t with value_t encoding. Uses intermediate format (4-byte references)
- * for cache efficiency; only root node converts to ColumnarTable.
+ * Each thread iterates its own buffer, avoiding the merge step. Total matches
+ * computed by summing buffer counts. Each thread writes its contiguous portion
+ * of output pages.
  *
- * @param collector        MatchCollector with finalized match row IDs.
+ * @tparam Mode            Collection mode for compile-time specialization.
+ * @param buffers          Vector of ThreadLocalMatchBuffer from probe.
  * @param build_input      Build side data (ColumnarTable* or ExecuteResult).
  * @param probe_input      Probe side data (ColumnarTable* or ExecuteResult).
  * @param remapped_attrs   Output column specifications (global indexing).
@@ -174,60 +108,110 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
  * @param build_size       Number of output columns from build side.
  * @param columnar_reader  ColumnarReader with Cursor caching for page access.
  * @param results          Pre-initialized ExecuteResult, populated in-place.
- *
- * @note For root joins, use materialize() instead.
- * @see intermediate.h for column_t format and value_t encoding.
- * @see prepare_sources() for source metadata precomputation.
- * @see batch_allocate_for_results() for single mmap allocation.
  */
-inline void construct_intermediate(
-    const MatchCollector &collector, const JoinInput &build_input,
-    const JoinInput &probe_input,
+template <MatchCollectionMode Mode>
+inline void construct_intermediate_from_buffers(
+    std::vector<ThreadLocalMatchBuffer<Mode>> &buffers,
+    const JoinInput &build_input, const JoinInput &probe_input,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, ExecuteResult &results) {
-    const_cast<MatchCollector &>(collector).ensure_finalized();
-    const size_t total_matches = collector.size();
+
+    // Compute total matches and per-buffer start offsets
+    size_t total_matches = 0;
+    std::vector<size_t> buffer_starts(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        buffer_starts[i] = total_matches;
+        total_matches += buffers[i].count();
+    }
+
     if (total_matches == 0)
         return;
 
     auto sources = prepare_sources(remapped_attrs, build_input, probe_input,
                                    build_node, probe_node, build_size);
-    auto allocator = batch_allocate_for_results(results, total_matches);
 
-    worker_pool.execute([&](size_t t) {
-        Contest::ColumnarReader::Cursor cursor;
-        size_t num_threads = worker_pool.thread_count();
-        size_t start = t * total_matches / num_threads;
-        size_t end = (t + 1) * total_matches / num_threads;
-        if (start >= end)
+    const size_t num_threads = THREAD_COUNT;
+    const size_t num_cols = sources.size();
+
+    // Pre-size page vectors for each column
+    using Page = mema::column_t::Page;
+    size_t total_pages_needed =
+        (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
+
+    for (size_t c = 0; c < num_cols; ++c) {
+        auto &col = results[c];
+        col.pages.resize(total_pages_needed);
+        col.set_row_count(total_matches);
+    }
+
+    // Parallel page allocation - each thread allocates its own pages
+    worker_pool().execute([&](size_t t) {
+        for (size_t c = 0; c < num_cols; ++c) {
+            auto &col = results[c];
+            for (size_t p = t; p < total_pages_needed; p += num_threads) {
+                void *ptr =
+                    Contest::platform::get_arena(t)
+                        .alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
+                col.pages[p] = reinterpret_cast<Page *>(ptr);
+            }
+        }
+    });
+
+    // Parallel: each thread processes its own buffer
+    worker_pool().execute([&](size_t t) {
+        if (t >= buffers.size())
+            return;
+        auto &buf = buffers[t];
+        size_t my_count = buf.count();
+        if (my_count == 0)
             return;
 
-        for (size_t i = 0; i < sources.size(); ++i) {
-            const auto &src = sources[i];
-            auto &dest_col = results[i];
+        size_t start = buffer_starts[t];
+        Contest::ColumnarReader::Cursor cursor;
 
-            auto range = src.from_build
-                             ? collector.get_left_range(start, end - start)
-                             : collector.get_right_range(start, end - start);
+        for (size_t c = 0; c < num_cols; ++c) {
+            const auto &src = sources[c];
+            auto &dest_col = results[c];
+
+            auto left_range = buf.left_range();
+            auto right_range = buf.right_range();
 
             if (src.is_columnar) {
                 const auto &col = *src.columnar_col;
-                size_t k = start;
-                for (uint32_t rid : range) {
-                    dest_col.write_at(k++,
-                                      columnar_reader.read_value(
-                                          col, src.remapped_col_idx, rid,
-                                          col.type, cursor, src.from_build));
+                if (src.from_build) {
+                    size_t k = start;
+                    for (uint32_t rid : left_range) {
+                        dest_col.write_at(k++,
+                                          columnar_reader.read_value(
+                                              col, src.remapped_col_idx, rid,
+                                              col.type, cursor, true));
+                    }
+                } else {
+                    size_t k = start;
+                    for (uint32_t rid : right_range) {
+                        dest_col.write_at(k++,
+                                          columnar_reader.read_value(
+                                              col, src.remapped_col_idx, rid,
+                                              col.type, cursor, false));
+                    }
                 }
             } else {
                 const auto &vec = *src.intermediate_col;
-                size_t k = start;
-                for (uint32_t rid : range) {
-                    dest_col.write_at(k++, vec[rid]);
+                if (src.from_build) {
+                    size_t k = start;
+                    for (uint32_t rid : left_range) {
+                        dest_col.write_at(k++, vec[rid]);
+                    }
+                } else {
+                    size_t k = start;
+                    for (uint32_t rid : right_range) {
+                        dest_col.write_at(k++, vec[rid]);
+                    }
                 }
             }
         }
     });
 }
+
 } // namespace Contest::materialize

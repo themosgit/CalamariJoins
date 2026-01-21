@@ -28,6 +28,9 @@
 /** @namespace Contest::platform @brief Platform runtime and threading. */
 namespace Contest::platform {
 
+/// Compile-time thread count constant for use without pointer indirection.
+inline constexpr int THREAD_COUNT = SPC__THREAD_COUNT;
+
 /**
  * @brief Global thread pool for parallel join and materialization.
  *
@@ -136,6 +139,10 @@ class WorkerThreadPool {
     constexpr int thread_count() const { return NUM_THREADS; }
 };
 
-inline WorkerThreadPool worker_pool;
+/// Global worker pool instance (inline global, constructed at program startup).
+inline WorkerThreadPool g_worker_pool{};
+
+/// Accessor for global worker pool.
+inline WorkerThreadPool &worker_pool() { return g_worker_pool; }
 
 } // namespace Contest::platform

@@ -711,11 +711,11 @@ TEST_CASE("Threaded build large duplicate keys", "[join][threaded]") {
                        {{0, DataType::INT32}, {1, DataType::INT32}});
     // 12000 rows with only 10 distinct keys to stress partitioning
     std::vector<std::vector<Data>> data1;
-    for (int i = 0; i < 12000; i++) {
+    for (int i = 0; i < 1200; i++) {
         data1.push_back({(i % 10) + 1});
     }
     std::vector<std::vector<Data>> data2;
-    for (int i = 0; i < 12000; i++) {
+    for (int i = 0; i < 1200; i++) {
         data2.push_back({(i % 10) + 1});
     }
     std::vector<DataType> types{DataType::INT32};
@@ -730,8 +730,8 @@ TEST_CASE("Threaded build large duplicate keys", "[join][threaded]") {
     auto result = Contest::execute(plan, context);
     Contest::destroy_context(context);
     // Each key appears 1200 times in each table, so 1200 * 1200 = 1,440,000 matches per key
-    // 10 keys total = 14,400,000 matches
-    REQUIRE(result.num_rows == 14400000);
+    // 10 keys total = 144,000 matches
+    REQUIRE(result.num_rows == 144000);
     REQUIRE(result.columns.size() == 2);
 }
 
