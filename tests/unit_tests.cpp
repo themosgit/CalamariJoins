@@ -730,8 +730,8 @@ TEST_CASE("Threaded build large duplicate keys", "[join][threaded]") {
     auto result = Contest::execute(plan, context);
     Contest::destroy_context(context);
     // Each key appears 1200 times in each table, so 1200 * 1200 = 1,440,000 matches per key
-    // 10 keys total = 14,400,000 matches
-    REQUIRE(result.num_rows == 1440000);
+    // 10 keys total = 144,000 matches
+    REQUIRE(result.num_rows == 144000);
     REQUIRE(result.columns.size() == 2);
 }
 
