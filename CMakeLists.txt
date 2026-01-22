@@ -54,15 +54,6 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(fmtlib)
 
-set(ENABLE_SANITIZER OFF)
-set(ENABLE_UBSAN OFF)
-
-# Deferred materialization: only materialize join keys, defer other columns
-option(USE_DEFERRED_MATERIALIZATION "Enable deferred column materialization" OFF)
-if(USE_DEFERRED_MATERIALIZATION)
-    message(STATUS "Deferred materialization ENABLED")
-    add_compile_definitions(USE_DEFERRED_MATERIALIZATION)
-endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     message("Disabling jemalloc extension of DuckDB on Power.")
     set(SKIP_EXTENSIONS jemalloc)

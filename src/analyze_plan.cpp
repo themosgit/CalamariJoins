@@ -6,9 +6,8 @@
  * materialized eagerly (join keys needed by parent) vs deferred until final
  * output. Traces column provenance back to base tables for deferred resolution.
  *
- * @see deferred_plan.h for DeferredPlan structure.
+ * @see deferred_plan.h for AnalyzedPlan structure.
  */
-#include <algorithm>
 #include <functional>
 #include <unordered_map>
 
@@ -112,7 +111,7 @@ find_parent_join_key(const Plan &plan, size_t node_idx,
  * LEFT_ONLY/RIGHT_ONLY.
  */
 join::MatchCollectionMode
-compute_base_collection_mode(const std::vector<DeferredColumnInfo> &columns,
+compute_base_collection_mode(const std::vector<AnalyzedColumnInfo> &columns,
                              size_t left_output_size) {
     bool needs_left = false;
     bool needs_right = false;
@@ -137,11 +136,11 @@ compute_base_collection_mode(const std::vector<DeferredColumnInfo> &columns,
 
 } // anonymous namespace
 
-DeferredPlan analyze_plan(const Plan &plan) {
-    DeferredPlan deferred;
-    deferred.original_plan = &plan;
-    deferred.nodes.resize(plan.nodes.size());
-    deferred.root = plan.root;
+AnalyzedPlan analyze_plan(const Plan &plan) {
+    AnalyzedPlan analyzed;
+    analyzed.original_plan = &plan;
+    analyzed.nodes.resize(plan.nodes.size());
+    analyzed.root = plan.root;
 
     auto parent_map = build_parent_map(plan);
 
@@ -170,26 +169,26 @@ DeferredPlan analyze_plan(const Plan &plan) {
 
         if (const auto *scan = std::get_if<ScanNode>(&node.data)) {
             // Scan node: simple wrapper
-            DeferredScanNode dscan;
-            dscan.node_idx = node_idx;
-            dscan.base_table_id = scan->base_table_id;
-            dscan.output_attrs = node.output_attrs;
-            deferred.nodes[node_idx] = std::move(dscan);
+            AnalyzedScanNode ascan;
+            ascan.node_idx = node_idx;
+            ascan.base_table_id = scan->base_table_id;
+            ascan.output_attrs = node.output_attrs;
+            analyzed.nodes[node_idx] = std::move(ascan);
 
         } else {
             // Join node: compute materialization decisions
             const auto &join = std::get<JoinNode>(node.data);
-            DeferredJoinNode djoin;
-            djoin.node_idx = node_idx;
-            djoin.left_child_idx = join.left;
-            djoin.right_child_idx = join.right;
-            djoin.left_join_attr = join.left_attr;
-            djoin.right_join_attr = join.right_attr;
-            djoin.output_attrs = node.output_attrs;
-            djoin.is_root = (node_idx == plan.root);
+            AnalyzedJoinNode ajoin;
+            ajoin.node_idx = node_idx;
+            ajoin.left_child_idx = join.left;
+            ajoin.right_child_idx = join.right;
+            ajoin.left_join_attr = join.left_attr;
+            ajoin.right_join_attr = join.right_attr;
+            ajoin.output_attrs = node.output_attrs;
+            ajoin.is_root = (node_idx == plan.root);
 
             // Find which column parent needs as join key
-            djoin.parent_join_key_idx =
+            ajoin.parent_join_key_idx =
                 find_parent_join_key(plan, node_idx, parent_map);
 
             // Get child sizes for determining column source
@@ -200,7 +199,7 @@ DeferredPlan analyze_plan(const Plan &plan) {
             for (size_t i = 0; i < node.output_attrs.size(); ++i) {
                 auto [col_idx, col_type] = node.output_attrs[i];
 
-                DeferredColumnInfo info;
+                AnalyzedColumnInfo info;
                 info.original_idx = i;
                 info.type = col_type;
 
@@ -220,11 +219,11 @@ DeferredPlan analyze_plan(const Plan &plan) {
                 // Materialization decision:
                 // - At root: ALL columns must be materialized (final output)
                 // - At intermediate: only parent's join key is materialized
-                if (djoin.is_root) {
+                if (ajoin.is_root) {
                     // Root node: materialize everything
                     info.resolution = ColumnResolution::MATERIALIZE;
-                } else if (djoin.parent_join_key_idx.has_value() &&
-                           i == *djoin.parent_join_key_idx) {
+                } else if (ajoin.parent_join_key_idx.has_value() &&
+                           i == *ajoin.parent_join_key_idx) {
                     info.resolution = ColumnResolution::MATERIALIZE;
                 } else {
                     info.resolution = ColumnResolution::DEFER;
@@ -233,22 +232,22 @@ DeferredPlan analyze_plan(const Plan &plan) {
                 // Trace provenance to base table
                 info.provenance = trace_provenance(plan, node_idx, i);
 
-                djoin.columns.push_back(std::move(info));
+                ajoin.columns.push_back(std::move(info));
             }
 
             // Compute collection mode and count deferred columns
-            djoin.base_collection_mode =
-                compute_base_collection_mode(djoin.columns, left_size);
+            ajoin.base_collection_mode =
+                compute_base_collection_mode(ajoin.columns, left_size);
 
             // Count deferred columns for pre-allocation
-            djoin.num_deferred_columns = 0;
-            for (const auto &col : djoin.columns) {
+            ajoin.num_deferred_columns = 0;
+            for (const auto &col : ajoin.columns) {
                 if (col.resolution == ColumnResolution::DEFER) {
-                    ++djoin.num_deferred_columns;
+                    ++ajoin.num_deferred_columns;
                 }
             }
 
-            deferred.nodes[node_idx] = std::move(djoin);
+            analyzed.nodes[node_idx] = std::move(ajoin);
         }
     }
 
@@ -256,28 +255,28 @@ DeferredPlan analyze_plan(const Plan &plan) {
     // Process in reverse post-order (parents before children)
     for (auto it = post_order.rbegin(); it != post_order.rend(); ++it) {
         size_t node_idx = *it;
-        auto *djoin = std::get_if<DeferredJoinNode>(&deferred.nodes[node_idx]);
-        if (!djoin)
+        auto *ajoin = std::get_if<AnalyzedJoinNode>(&analyzed.nodes[node_idx]);
+        if (!ajoin)
             continue;
 
         // For each column that must be MATERIALIZE, ensure the child also
         // materializes it
-        for (const auto &col : djoin->columns) {
+        for (const auto &col : ajoin->columns) {
             if (col.resolution != ColumnResolution::MATERIALIZE)
                 continue;
 
             // Find which child this column comes from
             size_t child_idx =
-                col.from_left ? djoin->left_child_idx : djoin->right_child_idx;
+                col.from_left ? ajoin->left_child_idx : ajoin->right_child_idx;
 
-            auto *child_djoin =
-                std::get_if<DeferredJoinNode>(&deferred.nodes[child_idx]);
-            if (!child_djoin)
+            auto *child_ajoin =
+                std::get_if<AnalyzedJoinNode>(&analyzed.nodes[child_idx]);
+            if (!child_ajoin)
                 continue; // Child is a scan - always has data
 
             // Mark child's column as MATERIALIZE
-            if (col.child_output_idx < child_djoin->columns.size()) {
-                child_djoin->columns[col.child_output_idx].resolution =
+            if (col.child_output_idx < child_ajoin->columns.size()) {
+                child_ajoin->columns[col.child_output_idx].resolution =
                     ColumnResolution::MATERIALIZE;
             }
         }
@@ -285,19 +284,19 @@ DeferredPlan analyze_plan(const Plan &plan) {
 
     // PASS 3: Recount num_deferred_columns after propagation
     for (size_t node_idx : post_order) {
-        auto *djoin = std::get_if<DeferredJoinNode>(&deferred.nodes[node_idx]);
-        if (!djoin)
+        auto *ajoin = std::get_if<AnalyzedJoinNode>(&analyzed.nodes[node_idx]);
+        if (!ajoin)
             continue;
 
-        djoin->num_deferred_columns = 0;
-        for (const auto &col : djoin->columns) {
+        ajoin->num_deferred_columns = 0;
+        for (const auto &col : ajoin->columns) {
             if (col.resolution == ColumnResolution::DEFER) {
-                ++djoin->num_deferred_columns;
+                ++ajoin->num_deferred_columns;
             }
         }
     }
 
-    return deferred;
+    return analyzed;
 }
 
 } // namespace Contest

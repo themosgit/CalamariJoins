@@ -1,14 +1,14 @@
 /**
  * @file deferred_plan.h
- * @brief Analyzed plan with materialization decisions for deferred execution.
+ * @brief Analyzed plan with materialization decisions for execution.
  *
- * DeferredPlan mirrors the original Plan structure but includes pre-computed
+ * AnalyzedPlan mirrors the original Plan structure but includes pre-computed
  * decisions about which columns to materialize eagerly (join keys) vs defer
- * until final output. Each DeferredJoinNode tracks column provenance back to
+ * until final output. Each AnalyzedJoinNode tracks column provenance back to
  * base tables for efficient deferred resolution.
  *
  * @see analyze_plan.cpp for the analysis algorithm.
- * @see deferred_intermediate.h for the runtime result format.
+ * @see intermediate.h for the runtime result format.
  */
 #pragma once
 
@@ -42,12 +42,12 @@ struct ColumnProvenance {
 };
 
 /**
- * @brief Complete metadata for an output column in a deferred join.
+ * @brief Complete metadata for an output column in a join.
  *
  * Combines materialization decision, provenance tracking, and child source
  * information for efficient intermediate construction and final resolution.
  */
-struct DeferredColumnInfo {
+struct AnalyzedColumnInfo {
     size_t original_idx; ///< Index in node's output_attrs.
     DataType type;       ///< INT32 or VARCHAR.
 
@@ -59,11 +59,11 @@ struct DeferredColumnInfo {
 };
 
 /**
- * @brief Analyzed scan node for deferred execution.
+ * @brief Analyzed scan node for execution.
  *
  * Wraps a ScanNode with output attribute information.
  */
-struct DeferredScanNode {
+struct AnalyzedScanNode {
     size_t node_idx;       ///< Index in original Plan::nodes.
     uint8_t base_table_id; ///< Index into Plan::inputs.
     std::vector<std::tuple<size_t, DataType>> output_attrs; ///< Projected cols.
@@ -72,13 +72,13 @@ struct DeferredScanNode {
 /**
  * @brief Analyzed join node with pre-computed materialization decisions.
  *
- * Contains all information needed for deferred execution:
+ * Contains all information needed for execution:
  * - Which columns to materialize eagerly (join keys for parent)
  * - Column provenance for deferred resolution
  * - Pre-computed match collection mode
  * - Number of deferred columns for allocation
  */
-struct DeferredJoinNode {
+struct AnalyzedJoinNode {
     size_t node_idx; ///< Index in original Plan::nodes.
 
     size_t left_child_idx;  ///< Left child index in Plan::nodes.
@@ -90,7 +90,7 @@ struct DeferredJoinNode {
     std::vector<std::tuple<size_t, DataType>> output_attrs;
 
     /// Per-column materialization decisions and provenance.
-    std::vector<DeferredColumnInfo> columns;
+    std::vector<AnalyzedColumnInfo> columns;
 
     /// Pre-computed collection mode (assumes build=left; flip if build=right).
     join::MatchCollectionMode base_collection_mode;
@@ -106,9 +106,9 @@ struct DeferredJoinNode {
 };
 
 /**
- * @brief Plan node variant for deferred execution.
+ * @brief Plan node variant for execution.
  */
-using DeferredNode = std::variant<DeferredScanNode, DeferredJoinNode>;
+using AnalyzedNode = std::variant<AnalyzedScanNode, AnalyzedJoinNode>;
 
 /**
  * @brief Analyzed plan with materialization decisions.
@@ -117,12 +117,12 @@ using DeferredNode = std::variant<DeferredScanNode, DeferredJoinNode>;
  * materialization. The original_plan pointer provides access to base tables
  * for value resolution.
  */
-struct DeferredPlan {
-    std::vector<DeferredNode> nodes; ///< Analyzed nodes (same indices as Plan).
+struct AnalyzedPlan {
+    std::vector<AnalyzedNode> nodes; ///< Analyzed nodes (same indices as Plan).
     size_t root;                     ///< Root node index.
     const Plan *original_plan;       ///< Non-owning reference to original plan.
 
-    const DeferredNode &operator[](size_t idx) const { return nodes[idx]; }
+    const AnalyzedNode &operator[](size_t idx) const { return nodes[idx]; }
 };
 
 /**
@@ -135,8 +135,8 @@ struct DeferredPlan {
  * 4. Pre-computed collection mode based on output columns
  *
  * @param plan Original query plan.
- * @return DeferredPlan with materialization decisions.
+ * @return AnalyzedPlan with materialization decisions.
  */
-DeferredPlan analyze_plan(const Plan &plan);
+AnalyzedPlan analyze_plan(const Plan &plan);
 
 } // namespace Contest

@@ -1,18 +1,30 @@
 /**
  * @file intermediate.h
- * @brief Intermediate join format: VARCHAR as page/offset refs (no string
- * copy).
+ * @brief Intermediate join result types and input abstraction.
  *
- * Base tables must outlive execution. @see plan.h ColumnarTable,
- * construct_intermediate.h
+ * Provides:
+ * - mema::value_t: 4-byte value encoding (INT32 direct, VARCHAR as page/offset)
+ * - mema::column_t: 16KB-paged column for materialized values
+ * - mema::deferred_column_t: 32KB-paged column for 64-bit provenance encoding
+ * - IntermediateResult: Lightweight result with selective materialization
+ * - JoinInput: Unified abstraction over columnar tables and intermediate
+ * results
+ *
+ * Base tables must outlive execution.
+ *
+ * @see plan.h for ColumnarTable, construct_intermediate.h for building results.
+ * @see deferred_plan.h for AnalyzedJoinNode with column decisions.
  */
 #pragma once
 
 #include <cstdint>
 #include <data_access/table.h>
+#include <data_model/deferred_plan.h>
 #include <data_model/plan.h>
 #include <foundation/common.h>
+#include <optional>
 #include <platform/arena.h>
+#include <variant>
 #include <vector>
 
 /**
@@ -20,13 +32,17 @@
  * @brief Compact join intermediate: value_t (4B) + column_t (16KB pages).
  *
  * value_t: INT32 direct or VARCHAR page/offset ref. column_t: arena-allocated
- * pages with write_at(). @see Contest::ExecuteResult, plan.h ColumnarTable.
+ * pages with write_at().
+ *
+ * @see Contest::IntermediateResult, plan.h ColumnarTable.
  */
 namespace mema {
 
 /**
  * @brief 4-byte value: INT32 direct, VARCHAR packed (19-bit page + 13-bit
- * offset), NULL = INT32_MIN, long string offset = 0x1FFF. Refs valid only while
+ * offset).
+ *
+ * NULL = INT32_MIN, long string offset = 0x1FFF. Refs valid only while
  * source exists.
  */
 struct alignas(4) value_t {
@@ -45,16 +61,18 @@ struct alignas(4) value_t {
         offset_idx = (static_cast<uint32_t>(encoded) >> 19) & 0x1FFF;
     }
 
-    static constexpr int32_t LONG_STRING_OFFSET =
-        0x1FFF; /**< Sentinel for long strings. */
-    static constexpr int32_t NULL_VALUE =
-        INT32_MIN; /**< NULL sentinel for both types. */
+    /** @brief Sentinel for long strings. */
+    static constexpr int32_t LONG_STRING_OFFSET = 0x1FFF;
+
+    /** @brief NULL sentinel for both types. */
+    static constexpr int32_t NULL_VALUE = INT32_MIN;
 
     /** @brief Check if this value represents NULL. */
     inline bool is_null() const { return value == NULL_VALUE; }
 };
 
-/** @brief Page size for intermediate results (16KB, larger than ColumnarTable).
+/**
+ * @brief Page size for intermediate results (16KB, larger than ColumnarTable).
  */
 constexpr size_t IR_PAGE_SIZE = 1 << 14;
 
@@ -82,9 +100,12 @@ struct column_t {
 
   public:
     std::vector<Page *> pages; /**< Pointers to arena-allocated pages. */
-    uint8_t source_table =
-        0; /**< Base table index for VARCHAR dereferencing. */
-    uint8_t source_column = 0; /**< Column index within source table. */
+
+    /** @brief Base table index for VARCHAR dereferencing. */
+    uint8_t source_table = 0;
+
+    /** @brief Column index within source table. */
+    uint8_t source_column = 0;
 
   public:
     column_t() = default;
@@ -114,8 +135,10 @@ struct column_t {
 
     ~column_t() = default;
 
-    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. No bounds
-     * check. */
+    /**
+     * @brief O(1) read: idx>>12 for page, idx&0xFFF for offset.
+     * @note No bounds check.
+     */
     inline const value_t &operator[](size_t idx) const {
         return pages[idx >> 12]->data[idx & 0xFFF];
     }
@@ -153,91 +176,13 @@ struct column_t {
 using Columnar = std::vector<column_t>;
 
 /**
- * @brief Row ID column storing encoded global row IDs.
- *
- * Parallel structure to column_t but stores uint32_t (encoded table_id +
- * row_id). One column per base table participating in joins up to this point.
- * Uses same page size and arena allocation as column_t.
- *
- * @see GlobalRowId for encoding scheme, ExtendedResult for usage.
- */
-struct rowid_column_t {
-    /** @brief Page for row ID storage: fixed array of uint32_t entries. */
-    struct alignas(IR_PAGE_SIZE) Page {
-        uint32_t data[CAP_PER_PAGE];
-    };
-
-    std::vector<Page *> pages; ///< Pointers to arena-allocated pages.
-    size_t num_values = 0;     ///< Total row ID count across all pages.
-    uint8_t table_id = 0;      ///< Which base table this column tracks.
-
-    rowid_column_t() = default;
-
-    rowid_column_t(rowid_column_t &&other) noexcept
-        : pages(std::move(other.pages)), num_values(other.num_values),
-          table_id(other.table_id) {
-        other.pages.clear();
-        other.num_values = 0;
-    }
-
-    rowid_column_t &operator=(rowid_column_t &&other) noexcept {
-        if (this != &other) {
-            pages = std::move(other.pages);
-            num_values = other.num_values;
-            table_id = other.table_id;
-            other.pages.clear();
-            other.num_values = 0;
-        }
-        return *this;
-    }
-
-    rowid_column_t(const rowid_column_t &) = delete;
-    rowid_column_t &operator=(const rowid_column_t &) = delete;
-
-    ~rowid_column_t() = default;
-
-    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. */
-    inline uint32_t operator[](size_t idx) const {
-        return pages[idx >> 12]->data[idx & 0xFFF];
-    }
-
-    /** @brief Thread-safe write at idx (requires pages to be set up first). */
-    inline void write_at(size_t idx, uint32_t val) {
-        pages[idx >> 12]->data[idx & 0xFFF] = val;
-    }
-
-    /** @brief Total row ID count. */
-    size_t row_count() const { return num_values; }
-
-    /** @brief Set row count without allocation (for assembly pattern). */
-    inline void set_row_count(size_t count) { num_values = count; }
-
-    /** @brief Pre-allocate pages from arena. */
-    inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
-                                        size_t count) {
-        static_assert(sizeof(Page) ==
-                          Contest::platform::ChunkSize<
-                              Contest::platform::ChunkType::IR_PAGE>::value,
-                      "Page size mismatch with IR_PAGE chunk size");
-        size_t pages_needed = (count + CAP_PER_PAGE - 1) / CAP_PER_PAGE;
-        pages.reserve(pages_needed);
-        for (size_t i = 0; i < pages_needed; ++i) {
-            void *ptr =
-                arena.alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
-            pages.push_back(reinterpret_cast<Page *>(ptr));
-        }
-        num_values = count;
-    }
-};
-
-/**
  * @brief 64-bit provenance column for deferred materialization.
  *
  * Stores encoded (table_id, column_idx, row_id) for each row using
  * DeferredProvenance encoding. Uses 32KB pages with 4096 entries each.
  *
  * @see DeferredProvenance for encoding scheme.
- * @see deferred_intermediate.h for DeferredResult usage.
+ * @see IntermediateResult for usage.
  */
 struct deferred_column_t {
     static constexpr size_t PAGE_SIZE = 1 << 15; // 32KB
@@ -312,67 +257,156 @@ struct deferred_column_t {
     }
 };
 
-/**
- * @brief Convert column_t vector to ColumnarTable. Dereferences VARCHAR refs.
- * @see materialize.h
- */
-ColumnarTable to_columnar(const Columnar &table, const Plan &plan);
-} /* namespace mema */
+} // namespace mema
 
-/** @namespace Contest @brief Contest API. @see Plan, execute.cpp */
 namespace Contest {
-/** @brief Result type for non-root joins (intermediate format). */
-using ExecuteResult = std::vector<mema::column_t>;
 
 /**
- * @brief Extended intermediate result with row ID tracking.
+ * @brief Lightweight intermediate result with selective materialization.
  *
- * Wraps ExecuteResult with parallel row ID columns that track
- * which original scan rows contributed to each intermediate row.
- * One rowid_column_t per base table participating in the join tree.
+ * Stores only columns marked MATERIALIZE (typically just the parent's join
+ * key). All other columns are resolved at final materialization using
+ * per-column 64-bit provenance (table_id, column_idx, row_id).
  *
- * @see GlobalRowId for encoding, construct_intermediate.h for population.
+ * Memory savings: For a join projecting N columns where only 1 is a join key,
+ * IntermediateResult uses ~1/N the memory for data columns. Additionally, we
+ * only track provenance for deferred columns (not all tables).
+ *
+ * @see AnalyzedColumnInfo for materialization decisions.
+ * @see DeferredProvenance for 64-bit encoding scheme.
  */
-struct ExtendedResult {
-    ExecuteResult columns;                     ///< Data columns (value_t).
-    std::vector<mema::rowid_column_t> row_ids; ///< One per participating table.
-    std::vector<uint8_t> table_ids; ///< Which tables are tracked (sorted).
+struct IntermediateResult {
+    /// Only columns marked MATERIALIZE (typically 1 join key).
+    std::vector<mema::column_t> materialized;
 
-    ExtendedResult() = default;
+    /// Map: original column index -> index in materialized (nullopt if
+    /// deferred).
+    std::vector<std::optional<size_t>> materialized_map;
 
-    ExtendedResult(ExtendedResult &&) = default;
-    ExtendedResult &operator=(ExtendedResult &&) = default;
+    /// Per-deferred-column provenance (64-bit encoded table_id+column_idx+row).
+    /// One deferred_column_t per DEFER column, stores full provenance per row.
+    std::vector<mema::deferred_column_t> deferred_columns;
 
-    ExtendedResult(const ExtendedResult &) = delete;
-    ExtendedResult &operator=(const ExtendedResult &) = delete;
+    /// Map: original column index -> index in deferred_columns (nullopt if
+    /// materialized).
+    std::vector<std::optional<size_t>> deferred_map;
 
-    /** @brief Total row count (from first data column). */
-    size_t row_count() const {
-        return columns.empty() ? 0 : columns[0].row_count();
+    /// Reference to node info for column provenance resolution.
+    const AnalyzedJoinNode *node_info = nullptr;
+
+    /// Total row count.
+    size_t num_rows = 0;
+
+    IntermediateResult() = default;
+    IntermediateResult(IntermediateResult &&) = default;
+    IntermediateResult &operator=(IntermediateResult &&) = default;
+    IntermediateResult(const IntermediateResult &) = delete;
+    IntermediateResult &operator=(const IntermediateResult &) = delete;
+
+    /** @brief Total row count. */
+    size_t row_count() const { return num_rows; }
+
+    /** @brief Check if column was materialized (not deferred). */
+    bool is_materialized(size_t orig_idx) const {
+        return orig_idx < materialized_map.size() &&
+               materialized_map[orig_idx].has_value();
     }
 
-    /** @brief Find row ID column index for a specific table, or -1 if not
-     * found. */
-    int find_rowid_index(uint8_t tid) const {
-        for (size_t i = 0; i < table_ids.size(); ++i) {
-            if (table_ids[i] == tid)
-                return static_cast<int>(i);
+    /** @brief Check if column is deferred. */
+    bool is_deferred(size_t orig_idx) const {
+        return orig_idx < deferred_map.size() &&
+               deferred_map[orig_idx].has_value();
+    }
+
+    /** @brief Get materialized column, or nullptr if deferred. */
+    const mema::column_t *get_materialized(size_t orig_idx) const {
+        if (!is_materialized(orig_idx))
+            return nullptr;
+        return &materialized[*materialized_map[orig_idx]];
+    }
+
+    /** @brief Get deferred column provenance, or nullptr if materialized. */
+    const mema::deferred_column_t *get_deferred(size_t orig_idx) const {
+        if (!is_deferred(orig_idx))
+            return nullptr;
+        return &deferred_columns[*deferred_map[orig_idx]];
+    }
+
+    /** @brief Get mutable deferred column provenance, or nullptr. */
+    mema::deferred_column_t *get_deferred_mut(size_t orig_idx) {
+        if (!is_deferred(orig_idx))
+            return nullptr;
+        return &deferred_columns[*deferred_map[orig_idx]];
+    }
+
+    /** @brief Number of deferred columns. */
+    size_t num_deferred() const { return deferred_columns.size(); }
+};
+
+/**
+ * @brief Unified abstraction over columnar tables and intermediate results.
+ *
+ * Stores ColumnarTable* (base scans) or IntermediateResult (child joins).
+ * Provides uniform interface for columnar (base table) and intermediate
+ * data sources.
+ *
+ * @see IntermediateResult for intermediate join results.
+ * @see ColumnarTable for base table storage.
+ */
+struct JoinInput {
+    /// Either base table pointer or owned IntermediateResult.
+    std::variant<const ColumnarTable *, IntermediateResult> data;
+
+    /// Original plan node for output_attrs mapping.
+    const PlanNode *node = nullptr;
+
+    /// Analyzed plan node for materialization decisions.
+    const AnalyzedNode *analyzed_node = nullptr;
+
+    /// Base table ID (for columnar inputs).
+    uint8_t table_id = 0;
+
+    /** @brief True if data is columnar (base table). */
+    bool is_columnar() const {
+        return std::holds_alternative<const ColumnarTable *>(data);
+    }
+
+    /** @brief Row count for join key column. */
+    size_t row_count(size_t col_idx) const {
+        if (is_columnar()) {
+            const auto *table = std::get<const ColumnarTable *>(data);
+            return table->num_rows;
         }
-        return -1;
+        return std::get<IntermediateResult>(data).row_count();
     }
 
-    /** @brief Get row ID column for a specific table, or nullptr if not found.
+    /** @brief Total row count. */
+    size_t row_count() const {
+        if (is_columnar()) {
+            const auto *table = std::get<const ColumnarTable *>(data);
+            return table->num_rows;
+        }
+        return std::get<IntermediateResult>(data).row_count();
+    }
+
+    /** @brief Number of output columns. */
+    size_t output_size() const {
+        if (node)
+            return node->output_attrs.size();
+        return 0;
+    }
+
+    /**
+     * @brief Get deferred column provenance for a column index.
+     *
+     * For columnar inputs, returns nullptr (caller must encode fresh).
+     * For IntermediateResult inputs, returns existing provenance column.
      */
-    const mema::rowid_column_t *get_rowid_column(uint8_t tid) const {
-        int idx = find_rowid_index(tid);
-        return (idx >= 0) ? &row_ids[idx] : nullptr;
-    }
-
-    /** @brief Get mutable row ID column for a specific table, or nullptr. */
-    mema::rowid_column_t *get_rowid_column_mut(uint8_t tid) {
-        int idx = find_rowid_index(tid);
-        return (idx >= 0) ? &row_ids[idx] : nullptr;
+    const mema::deferred_column_t *get_deferred_column(size_t col_idx) const {
+        if (is_columnar())
+            return nullptr;
+        return std::get<IntermediateResult>(data).get_deferred(col_idx);
     }
 };
 
-} /* namespace Contest */
+} // namespace Contest

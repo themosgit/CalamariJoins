@@ -1,12 +1,3 @@
-#pragma once
-
-#include <data_model/intermediate.h>
-#include <join_execution/hashtable.h>
-#include <join_execution/join_setup.h>
-#include <join_execution/match_collector.h>
-#include <platform/arena_vector.h>
-#include <platform/worker_pool.h>
-
 /**
  * @file hash_join.h
  * @brief Hash join build and probe operations.
@@ -19,6 +10,13 @@
  *
  * @see hashtable.h, match_collector.h
  */
+#pragma once
+
+#include <data_model/intermediate.h>
+#include <join_execution/hashtable.h>
+#include <join_execution/match_collector.h>
+#include <platform/arena_vector.h>
+#include <platform/worker_pool.h>
 
 /**
  * @namespace Contest::join
@@ -27,8 +25,6 @@
  */
 namespace Contest::join {
 
-using Contest::ExecuteResult;
-using Contest::ExtendedResult;
 using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
@@ -53,16 +49,22 @@ inline UnchainedHashtable build_from_columnar(const JoinInput &input,
 /**
  * @brief Build hash table from intermediate results (column_t).
  *
- * Uses join key column from ExecuteResult produced by prior pipeline stages.
+ * Uses join key column from IntermediateResult produced by prior pipeline
+ * stages.
  */
 inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
                                                   size_t attr_idx) {
-    const auto &result = std::get<ExtendedResult>(input.data);
-    const auto &column = result.columns[attr_idx];
+    const auto &result = std::get<IntermediateResult>(input.data);
+    // Get the materialized column for the join key
+    const auto *column = result.get_materialized(attr_idx);
+    if (!column) {
+        // This should never happen - join keys must be materialized
+        std::abort();
+    }
 
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
-    hash_table.build_intermediate(column, 8);
+    hash_table.build_intermediate(*column, 8);
 
     return hash_table;
 }
