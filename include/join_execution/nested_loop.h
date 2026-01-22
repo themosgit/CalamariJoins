@@ -34,8 +34,8 @@ using Contest::platform::worker_pool;
  * @brief Iterates over non-NULL values in a join input column.
  *
  * Abstracts columnar vs intermediate input. Handles NULL bitmaps.
- * For IntermediateResult, reads from materialized columns (join keys are
- * always materialized).
+ * For IntermediateResult, reads from join_key_tuples if available,
+ * otherwise from materialized columns (join keys are always available).
  *
  * @tparam Func void(uint32_t row_id, int32_t value).
  */
@@ -70,10 +70,25 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
         }
     } else {
         const auto &res = std::get<IntermediateResult>(input.data);
-        // Join key must be materialized
+
+        // Check if join key is stored as tuples
+        if (res.has_join_key_tuples() && res.join_key_idx.has_value() &&
+            *res.join_key_idx == attr_idx) {
+            const auto &tuples = *res.join_key_tuples;
+            size_t count = tuples.row_count();
+            for (size_t i = 0; i < count; i++) {
+                mema::KeyRowPair pair = tuples[i];
+                if (pair.key != mema::value_t::NULL_VALUE) {
+                    visitor(static_cast<uint32_t>(i), pair.key);
+                }
+            }
+            return;
+        }
+
+        // Fall back to materialized column
         const mema::column_t *col = res.get_materialized(attr_idx);
         if (!col)
-            return; // Should not happen - join keys are always materialized
+            return; // Should not happen - join keys are always available
         size_t count = col->row_count();
         for (size_t i = 0; i < count; i++) {
             const mema::value_t &val = (*col)[i];
@@ -145,13 +160,21 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
         page_offsets.push_back(current);
     }
 
-    // Setup for IntermediateResult probe
+    // Setup for IntermediateResult probe - check tuples first, then
+    // materialized
     const mema::column_t *probe_mat_col = nullptr;
+    const mema::key_row_column_t *probe_tuples = nullptr;
     if (!probe_input.is_columnar()) {
         const auto &res = std::get<IntermediateResult>(probe_input.data);
-        probe_mat_col = res.get_materialized(probe_attr);
-        if (!probe_mat_col)
-            return {}; // Join key not materialized - should not happen
+        // Check if join key is stored as tuples
+        if (res.has_join_key_tuples() && res.join_key_idx.has_value() &&
+            *res.join_key_idx == probe_attr) {
+            probe_tuples = &(*res.join_key_tuples);
+        } else {
+            probe_mat_col = res.get_materialized(probe_attr);
+            if (!probe_mat_col)
+                return {}; // Join key not available - should not happen
+        }
     }
 
     std::atomic<size_t> probe_page_counter{0};
@@ -201,6 +224,19 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                         }
                         row_id++;
                     }
+                }
+            }
+        } else if (probe_tuples) {
+            // IntermediateResult probe - use tuple column
+            const mema::key_row_column_t &tuples = *probe_tuples;
+            size_t count = tuples.row_count();
+            size_t start = (t_id * count) / THREAD_COUNT;
+            size_t end = ((t_id + 1) * count) / THREAD_COUNT;
+
+            for (size_t i = start; i < end; i++) {
+                mema::KeyRowPair pair = tuples[i];
+                if (pair.key != mema::value_t::NULL_VALUE) {
+                    process_value(static_cast<uint32_t>(i), pair.key);
                 }
             }
         } else {

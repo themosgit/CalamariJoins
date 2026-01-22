@@ -30,14 +30,127 @@
 /**
  * @namespace mema
  * @brief Compact join intermediate: value_t (4B) + column_t (16KB pages) +
- * DeferredTable (32-bit row IDs).
+ * DeferredTable (32-bit row IDs) + key_row_column_t (8B tuples).
  *
  * value_t: INT32 direct or VARCHAR page/offset ref. column_t: arena-allocated
  * pages with write_at(). DeferredTable: 32-bit row ID storage per base table.
+ * key_row_column_t: (key, row_id) tuples for join key propagation.
  *
  * @see Contest::IntermediateResult, plan.h ColumnarTable.
  */
 namespace mema {
+
+/**
+ * @brief Join key with associated row ID for tuple-based storage.
+ *
+ * For LEFT_ONLY/RIGHT_ONLY modes: row_id is base table row ID (zero
+ * indirection) For BOTH mode: row_id may be IR index (requires deferred table
+ * lookup)
+ *
+ * 8-byte aligned for efficient memory access and potential SIMD operations.
+ */
+struct alignas(8) KeyRowPair {
+    int32_t key;     ///< Join key value
+    uint32_t row_id; ///< Row ID (base table or IR index depending on mode)
+};
+
+/**
+ * @brief Column of (key, row_id) tuples for join key storage.
+ *
+ * Enables accelerated hashtable build (tuples match internal format) and
+ * zero-indirection row ID propagation through join chains. Used instead of
+ * separate column_t for join key columns.
+ *
+ * Memory layout: 16KB pages containing 2048 KeyRowPair entries each.
+ */
+struct key_row_column_t {
+    static constexpr size_t PAGE_SIZE = 1 << 14; // 16KB
+    static constexpr size_t PAIRS_PER_PAGE =
+        PAGE_SIZE / sizeof(KeyRowPair);       // 2048
+    static constexpr size_t ENTRY_SHIFT = 11; // log2(2048)
+    static constexpr size_t ENTRY_MASK = PAIRS_PER_PAGE - 1;
+
+    struct alignas(PAGE_SIZE) Page {
+        KeyRowPair data[PAIRS_PER_PAGE];
+    };
+
+    std::vector<Page *> pages;
+    size_t num_values = 0;
+
+    /// Base table ID for row_id component (valid when stores_base_row_ids=true)
+    uint8_t base_table_id = 0;
+
+    /// Source column in base table (for VARCHAR provenance)
+    uint8_t source_column = 0;
+
+    /// True if row_id contains base table row IDs, false if IR indices
+    bool stores_base_row_ids = false;
+
+    key_row_column_t() = default;
+
+    key_row_column_t(key_row_column_t &&other) noexcept
+        : pages(std::move(other.pages)), num_values(other.num_values),
+          base_table_id(other.base_table_id),
+          source_column(other.source_column),
+          stores_base_row_ids(other.stores_base_row_ids) {
+        other.pages.clear();
+        other.num_values = 0;
+    }
+
+    key_row_column_t &operator=(key_row_column_t &&other) noexcept {
+        if (this != &other) {
+            pages = std::move(other.pages);
+            num_values = other.num_values;
+            base_table_id = other.base_table_id;
+            source_column = other.source_column;
+            stores_base_row_ids = other.stores_base_row_ids;
+            other.pages.clear();
+            other.num_values = 0;
+        }
+        return *this;
+    }
+
+    key_row_column_t(const key_row_column_t &) = delete;
+    key_row_column_t &operator=(const key_row_column_t &) = delete;
+
+    ~key_row_column_t() = default;
+
+    /// O(1) read: idx >> 11 for page, idx & 0x7FF for offset
+    inline KeyRowPair operator[](size_t idx) const {
+        return pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK];
+    }
+
+    /// Thread-safe write at idx (requires pages set up first)
+    inline void write_at(size_t idx, KeyRowPair pair) {
+        pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK] = pair;
+    }
+
+    /// Read only the key at index
+    inline int32_t key_at(size_t idx) const {
+        return pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK].key;
+    }
+
+    /// Read only the row_id at index
+    inline uint32_t row_id_at(size_t idx) const {
+        return pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK].row_id;
+    }
+
+    size_t row_count() const { return num_values; }
+    void set_row_count(size_t count) { num_values = count; }
+
+    /// Pre-allocate pages from arena
+    inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
+                                        size_t count) {
+        size_t pages_needed = (count + PAIRS_PER_PAGE - 1) / PAIRS_PER_PAGE;
+        pages.reserve(pages_needed);
+        for (size_t i = 0; i < pages_needed; ++i) {
+            void *ptr =
+                arena.alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
+            pages.push_back(reinterpret_cast<Page *>(ptr));
+        }
+        num_values = count;
+    }
+};
 
 /**
  * @brief 4-byte value: INT32 direct, VARCHAR packed (19-bit page + 13-bit
@@ -274,29 +387,36 @@ struct DeferredColumnRef {
 /**
  * @brief Lightweight intermediate result with selective materialization.
  *
- * Stores only columns marked MATERIALIZE (typically just the parent's join
- * key). Deferred columns use per-table 32-bit row ID storage instead of
- * per-column 64-bit provenance, achieving up to 10x memory reduction for
- * multi-column deferred scenarios.
+ * Stores join key as (value, row_id) tuples for accelerated hashtable build
+ * and zero-indirection row ID propagation. Other columns use per-table 32-bit
+ * row ID storage for deferred resolution.
  *
- * Memory savings example: For 5 columns from same base table:
- * - Old: 5 columns × 8 bytes = 40 bytes per row
- * - New: 1 DeferredTable × 4 bytes = 4 bytes per row
+ * For LEFT_ONLY/RIGHT_ONLY modes: join_key_tuples stores base table row IDs
+ * For BOTH mode: join_key_tuples may store IR indices + DeferredTable for other
+ * side
  *
  * @see AnalyzedColumnInfo for materialization decisions.
+ * @see key_row_column_t for tuple storage.
  * @see DeferredTable for 32-bit row ID storage.
  */
 struct IntermediateResult {
-    /// Only columns marked MATERIALIZE (typically 1 join key).
+    /// Join key stored as (value, row_id) tuples for accelerated propagation.
+    /// Replaces materialized column for join key when present.
+    std::optional<mema::key_row_column_t> join_key_tuples;
+
+    /// Index of join key column in output (nullopt if root or no tuples).
+    std::optional<size_t> join_key_idx;
+
+    /// Other materialized columns (non-join-key columns marked MATERIALIZE).
     std::vector<mema::column_t> materialized;
 
     /// Map: original column index -> index in materialized (nullopt if
-    /// deferred).
+    /// deferred or is join key).
     std::vector<std::optional<size_t>> materialized_map;
 
     /// Per-base-table deferred row ID storage. One DeferredTable per unique
     /// (from_build, base_table_id) pair. All columns from same base table share
-    /// the same row ID lookup.
+    /// the same row ID lookup. Used for BOTH mode's non-tracked side.
     std::vector<mema::DeferredTable> deferred_tables;
 
     /// Map: original column index -> DeferredColumnRef (nullopt if
@@ -319,10 +439,29 @@ struct IntermediateResult {
     /** @brief Total row count. */
     size_t row_count() const { return num_rows; }
 
+    /** @brief Check if join key is stored as tuples. */
+    bool has_join_key_tuples() const { return join_key_tuples.has_value(); }
+
+    /** @brief Check if join key tuples contain base row IDs (vs IR indices). */
+    bool join_key_has_base_rows() const {
+        return join_key_tuples && join_key_tuples->stores_base_row_ids;
+    }
+
+    /** @brief Get join key tuple at index. */
+    mema::KeyRowPair get_join_key_tuple(size_t idx) const {
+        return join_key_tuples ? (*join_key_tuples)[idx]
+                               : mema::KeyRowPair{0, 0};
+    }
+
     /** @brief Check if column was materialized (not deferred). */
     bool is_materialized(size_t orig_idx) const {
         return orig_idx < materialized_map.size() &&
                materialized_map[orig_idx].has_value();
+    }
+
+    /** @brief Check if column is the join key (stored as tuples). */
+    bool is_join_key(size_t orig_idx) const {
+        return join_key_idx.has_value() && *join_key_idx == orig_idx;
     }
 
     /** @brief Check if column is deferred. */
@@ -331,7 +470,7 @@ struct IntermediateResult {
                deferred_map[orig_idx].has_value();
     }
 
-    /** @brief Get materialized column, or nullptr if deferred. */
+    /** @brief Get materialized column, or nullptr if deferred/join key. */
     const mema::column_t *get_materialized(size_t orig_idx) const {
         if (!is_materialized(orig_idx))
             return nullptr;

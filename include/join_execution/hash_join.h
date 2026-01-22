@@ -236,4 +236,74 @@ probe_columnar(const UnchainedHashtable &hash_table,
     return local_buffers;
 }
 
+/**
+ * @brief Probe hash table with tuple column, returning thread-local buffers.
+ *
+ * Uses (key, row_id) tuples from IntermediateResult. The row_id in each
+ * tuple is propagated to the match buffer, enabling zero-indirection
+ * resolution when tuples contain base table row IDs.
+ *
+ * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
+ *              specialization of match buffer operations.
+ * @param hash_table Hash table to probe against.
+ * @param probe_tuples Tuple column containing (key, row_id) pairs.
+ * @return Vector of thread-local match buffers.
+ */
+template <MatchCollectionMode Mode>
+inline std::vector<ThreadLocalMatchBuffer<Mode>>
+probe_tuples(const UnchainedHashtable &hash_table,
+             const mema::key_row_column_t &probe_tuples) {
+
+    const auto *keys = hash_table.keys();
+    const auto *row_ids = hash_table.row_ids();
+    const size_t probe_count = probe_tuples.row_count();
+    const size_t num_pages = probe_tuples.pages.size();
+
+    std::vector<ThreadLocalMatchBuffer<Mode>> local_buffers(THREAD_COUNT);
+    std::atomic<size_t> page_counter(0);
+
+    worker_pool().execute([&](size_t thread_id) {
+        local_buffers[thread_id] = ThreadLocalMatchBuffer<Mode>(
+            Contest::platform::get_arena(thread_id));
+        auto &local_buf = local_buffers[thread_id];
+
+        while (true) {
+            size_t page_idx = page_counter.fetch_add(1);
+            if (page_idx >= num_pages)
+                break;
+
+            size_t base = page_idx * mema::key_row_column_t::PAIRS_PER_PAGE;
+            size_t end = std::min(base + mema::key_row_column_t::PAIRS_PER_PAGE,
+                                  probe_count);
+
+            constexpr size_t PREFETCH_DIST = 8;
+            for (size_t idx = base; idx < end; ++idx) {
+                // Prefetch future slot
+                if (idx + PREFETCH_DIST < end) {
+                    hash_table.prefetch_slot(
+                        probe_tuples.key_at(idx + PREFETCH_DIST));
+                }
+
+                mema::KeyRowPair pair = probe_tuples[idx];
+
+                // Skip NULL keys
+                if (pair.key != mema::value_t::NULL_VALUE) {
+                    auto [start_idx, end_idx] =
+                        hash_table.find_indices(pair.key);
+
+                    for (uint64_t i = start_idx; i < end_idx; ++i) {
+                        if (keys[i] == pair.key) {
+                            // row_ids[i] = build side's row ID (base or IR)
+                            // pair.row_id = probe side's row ID (base or IR)
+                            local_buf.add_match(row_ids[i], pair.row_id);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    return local_buffers;
+}
+
 } // namespace Contest::join

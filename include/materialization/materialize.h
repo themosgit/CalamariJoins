@@ -281,6 +281,7 @@ inline void materialize_single_column(
     // Determine how to read the value
     const Column *columnar_source = nullptr;
     const mema::column_t *materialized_source = nullptr;
+    const mema::key_row_column_t *tuple_source = nullptr;
     const mema::DeferredTable *deferred_table = nullptr;
     uint8_t deferred_base_col = 0;
     uint8_t deferred_base_table = 0;
@@ -293,7 +294,10 @@ inline void materialize_single_column(
         columnar_source = &table->columns[actual_idx];
     } else {
         const auto &ir = std::get<IntermediateResult>(src_input.data);
-        if (ir.is_materialized(col_info->child_output_idx)) {
+        // Check if column is stored as join key tuples
+        if (ir.is_join_key(col_info->child_output_idx)) {
+            tuple_source = &(*ir.join_key_tuples);
+        } else if (ir.is_materialized(col_info->child_output_idx)) {
             // Read from materialized column
             materialized_source =
                 ir.get_materialized(col_info->child_output_idx);
@@ -312,23 +316,29 @@ inline void materialize_single_column(
     // Create reader lambda
     auto reader = [&](uint32_t local_row_id,
                       ColumnarReader::Cursor &cursor) -> mema::value_t {
+        mema::value_t result;
         if (columnar_source) {
-            return columnar_reader.read_value(
+            result = columnar_reader.read_value(
                 *columnar_source, col_info->child_output_idx, local_row_id,
                 col_info->type, cursor, from_build);
+        } else if (tuple_source) {
+            // Read key value from tuple column
+            result = mema::value_t{tuple_source->key_at(local_row_id)};
         } else if (materialized_source) {
-            return (*materialized_source)[local_row_id];
+            result = (*materialized_source)[local_row_id];
         } else if (deferred_table && analyzed_plan.original_plan) {
             // Deferred resolution: look up base table row ID from deferred
             // table
             uint32_t base_row = (*deferred_table)[local_row_id];
             const auto &base_table =
                 analyzed_plan.original_plan->inputs[deferred_base_table];
-            return columnar_reader.read_value(
+            result = columnar_reader.read_value(
                 base_table.columns[deferred_base_col], deferred_base_col,
                 base_row, col_info->type, cursor, true);
+        } else {
+            result = mema::value_t{mema::value_t::NULL_VALUE};
         }
-        return mema::value_t{mema::value_t::NULL_VALUE};
+        return result;
     };
 
     // Materialize based on type

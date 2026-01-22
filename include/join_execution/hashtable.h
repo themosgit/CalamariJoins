@@ -391,6 +391,87 @@ class UnchainedHashtable {
     }
 
     /**
+     * @brief Build hash table from (key, row_id) tuple column.
+     *
+     * Consumes tuples directly - row_ids are already in correct format
+     * (base table IDs or IR indices depending on how IR was constructed).
+     * More efficient than build_intermediate() as tuples match internal format.
+     *
+     * @param tuples Key-row tuple column from IntermediateResult.
+     * @param num_threads Thread count hint.
+     */
+    void build_from_tuples(const mema::key_row_column_t &tuples,
+                           int num_threads = 4) {
+        const size_t row_count = tuples.row_count();
+        if (row_count == 0)
+            return;
+
+        static constexpr size_t PARALLEL_BUILD_THRESHOLD = 10000;
+        num_threads = Contest::platform::worker_pool().thread_count();
+        if (row_count < PARALLEL_BUILD_THRESHOLD)
+            num_threads = 1;
+
+        const size_t num_slots = directory.size();
+        const size_t num_partitions =
+            compute_num_partitions(row_count, num_threads);
+        const int partition_bits = __builtin_ctzll(num_partitions);
+        const size_t slots_per_partition = num_slots / num_partitions;
+
+        std::vector<ChunkAllocator> allocators(num_threads);
+        for (int t = 0; t < num_threads; ++t)
+            allocators[t].set_arena(Contest::platform::get_arena(t));
+        std::vector<std::vector<Partition>> thread_parts(num_threads);
+        for (auto &tp : thread_parts)
+            tp.resize(num_partitions);
+
+        // Partition phase - 8-byte tuple reads, cache-friendly streaming
+        size_t batch = (row_count + num_threads - 1) / num_threads;
+        Contest::platform::worker_pool().execute([&, partition_bits](size_t t) {
+            size_t start = t * batch;
+            size_t end = std::min(start + batch, row_count);
+            if (start >= end)
+                return;
+            const int shift = 64 - partition_bits;
+            for (size_t i = start; i < end; ++i) {
+                mema::KeyRowPair pair = tuples[i];
+                uint64_t h = hash_key(pair.key);
+                size_t p = (partition_bits == 0) ? 0 : (h >> shift);
+                // Direct use of tuple - no conversion needed
+                thread_parts[t][p].append(allocators[t],
+                                          {pair.key, pair.row_id});
+            }
+        });
+
+        // Compute global offsets from per-thread counts
+        Contest::platform::ArenaVector<size_t> global_offsets(*arena_);
+        global_offsets.resize(num_partitions + 1);
+        std::memset(global_offsets.data(), 0,
+                    (num_partitions + 1) * sizeof(size_t));
+        for (size_t p = 0; p < num_partitions; ++p) {
+            for (size_t t = 0; t < num_threads; ++t) {
+                global_offsets[p + 1] += thread_parts[t][p].total_count;
+            }
+            global_offsets[p + 1] += global_offsets[p];
+        }
+
+        size_t total = global_offsets[num_partitions];
+        if (total == 0)
+            return;
+        keys_.resize(total);
+        row_ids_.resize(total);
+
+        // Build partitions in parallel
+        const int nt = num_threads;
+        Contest::platform::worker_pool().execute([&, nt](size_t t) {
+            for (size_t p = t; p < num_partitions; p += nt) {
+                build_partition(
+                    thread_parts, p, slots_per_partition, global_offsets[p],
+                    global_offsets[p + 1] - global_offsets[p], nt, t);
+            }
+        });
+    }
+
+    /**
      * @brief Build hash table from ColumnarTable Column.
      *
      * Handles dense (no NULLs) and sparse (with bitmap) pages.

@@ -46,6 +46,7 @@ namespace Contest {
 using namespace join;
 
 using materialize::construct_intermediate_from_buffers;
+using materialize::construct_intermediate_with_tuples;
 using materialize::create_empty_intermediate_result;
 using materialize::materialize_from_buffers;
 
@@ -146,19 +147,30 @@ JoinResult execute_join_with_mode(
         } else {
             const auto &probe_result =
                 std::get<IntermediateResult>(probe_input.data);
-            // Probe using materialized column (should be the join key)
-            const auto *mat_col =
-                probe_result.get_materialized(config.probe_attr);
-            if (!mat_col) {
-                std::fprintf(
-                    stderr,
-                    "ERROR: probe join key not materialized! probe_attr=%zu "
-                    "mat_map_size=%zu num_rows=%zu\n",
-                    config.probe_attr, probe_result.materialized_map.size(),
-                    probe_result.num_rows);
-                std::abort();
+
+            // Use tuple-based probe if available
+            if (probe_result.has_join_key_tuples() &&
+                probe_result.join_key_idx.has_value() &&
+                *probe_result.join_key_idx == config.probe_attr) {
+                match_buffers = probe_tuples<Mode>(
+                    *hash_table, *probe_result.join_key_tuples);
+            } else {
+                // Fall back to materialized column probe
+                const auto *mat_col =
+                    probe_result.get_materialized(config.probe_attr);
+                if (!mat_col) {
+                    std::fprintf(
+                        stderr,
+                        "ERROR: probe join key not materialized! "
+                        "probe_attr=%zu "
+                        "mat_map_size=%zu num_rows=%zu has_tuples=%d\n",
+                        config.probe_attr, probe_result.materialized_map.size(),
+                        probe_result.num_rows,
+                        probe_result.has_join_key_tuples() ? 1 : 0);
+                    std::abort();
+                }
+                match_buffers = probe_intermediate<Mode>(*hash_table, *mat_col);
             }
-            match_buffers = probe_intermediate<Mode>(*hash_table, *mat_col);
         }
         auto probe_end = std::chrono::high_resolution_clock::now();
         stats.hash_join_probe_ms +=
@@ -206,10 +218,18 @@ JoinResult execute_join_with_mode(
                 config.remapped_attrs, build_input.output_size(),
                 config.build_left);
 
-            construct_intermediate_from_buffers<Mode>(
-                match_buffers, build_input, probe_input, join_node,
-                config.remapped_attrs, build_input.output_size(),
-                config.build_left, columnar_reader, result, plan);
+            // Use tuple-based construction if parent needs a join key
+            if (join_node.parent_join_key_idx.has_value()) {
+                construct_intermediate_with_tuples<Mode>(
+                    match_buffers, build_input, probe_input, join_node, config,
+                    config.build_left, *join_node.parent_join_key_idx,
+                    columnar_reader, result, plan);
+            } else {
+                construct_intermediate_from_buffers<Mode>(
+                    match_buffers, build_input, probe_input, join_node,
+                    config.remapped_attrs, build_input.output_size(),
+                    config.build_left, columnar_reader, result, plan);
+            }
         } else {
             result = create_empty_intermediate_result(join_node);
         }
@@ -280,17 +300,28 @@ JoinResult execute_impl(const AnalyzedPlan &plan, size_t node_idx, bool is_root,
             hash_table = build_from_columnar(build_input, config.build_attr);
         } else {
             const auto &ir = std::get<IntermediateResult>(build_input.data);
-            const auto *mat_col = ir.get_materialized(config.build_attr);
-            if (!mat_col) {
-                std::fprintf(
-                    stderr,
-                    "ERROR: build join key not materialized! build_attr=%zu "
-                    "mat_map_size=%zu num_rows=%zu\n",
-                    config.build_attr, ir.materialized_map.size(), ir.num_rows);
-                std::abort();
+
+            // Use tuple-based build if available and matches build_attr
+            if (ir.has_join_key_tuples() && ir.join_key_idx.has_value() &&
+                *ir.join_key_idx == config.build_attr) {
+                hash_table.emplace(ir.join_key_tuples->row_count());
+                hash_table->build_from_tuples(*ir.join_key_tuples);
+            } else {
+                // Fall back to materialized column build
+                const auto *mat_col = ir.get_materialized(config.build_attr);
+                if (!mat_col) {
+                    std::fprintf(
+                        stderr,
+                        "ERROR: build join key not materialized! "
+                        "build_attr=%zu "
+                        "mat_map_size=%zu num_rows=%zu has_tuples=%d\n",
+                        config.build_attr, ir.materialized_map.size(),
+                        ir.num_rows, ir.has_join_key_tuples() ? 1 : 0);
+                    std::abort();
+                }
+                hash_table.emplace(mat_col->row_count());
+                hash_table->build_intermediate(*mat_col);
             }
-            hash_table.emplace(mat_col->row_count());
-            hash_table->build_intermediate(*mat_col);
         }
         auto build_end = std::chrono::high_resolution_clock::now();
         stats.hashtable_build_ms +=

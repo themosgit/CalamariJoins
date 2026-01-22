@@ -107,3 +107,62 @@ inline MatchCollectionMode determine_collection_mode(
 }
 
 } // namespace Contest::join
+
+namespace Contest {
+
+// Forward declare AnalyzedJoinNode
+struct AnalyzedJoinNode;
+
+/**
+ * @brief Tracking info for one side of a join (build or probe).
+ *
+ * Determines whether to embed base table row IDs or IR indices in the
+ * output tuples for this side.
+ */
+struct SideTrackingInfo {
+    bool track_base_rows =
+        false; ///< True to embed base row IDs, false for IR indices
+    uint8_t base_table_id = 0; ///< Base table to track (if track_base_rows)
+};
+
+/**
+ * @brief Tracking configuration for intermediate construction.
+ *
+ * Determines what row IDs to embed in join key tuples and whether
+ * DeferredTables are needed for non-tracked sides.
+ */
+struct TupleTrackingInfo {
+    SideTrackingInfo build_tracking; ///< Tracking info for build side
+    SideTrackingInfo probe_tracking; ///< Tracking info for probe side
+    bool key_from_build =
+        true; ///< True if parent join key comes from build side
+};
+
+/**
+ * @brief Result of a join execution before intermediate construction.
+ *
+ * Contains match buffers and metadata needed for deferred IR construction.
+ * Allows parent join to decide row ID format based on its cardinality
+ * requirements before constructing the intermediate result.
+ *
+ * @tparam Mode Match collection mode for this join's buffers.
+ */
+template <join::MatchCollectionMode Mode> struct MatchResult {
+    std::vector<join::ThreadLocalMatchBuffer<Mode>> buffers;
+    size_t total_count = 0;
+
+    /// The inputs that were joined (for resolving row IDs during IR
+    /// construction)
+    JoinInput build_input;
+    JoinInput probe_input;
+
+    /// Join configuration
+    const AnalyzedJoinNode *join_node = nullptr;
+    join::BuildProbeConfig config;
+
+    /// Convenience accessors
+    size_t count() const { return total_count; }
+    bool empty() const { return total_count == 0; }
+};
+
+} // namespace Contest
