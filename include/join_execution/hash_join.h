@@ -82,8 +82,7 @@ template <MatchCollectionMode Mode>
 inline std::vector<ThreadLocalMatchBuffer<Mode>>
 probe_intermediate(const UnchainedHashtable &hash_table,
                    const mema::column_t &probe_column) {
-    const auto *keys = hash_table.keys();
-    const auto *row_ids = hash_table.row_ids();
+    const auto *entries = hash_table.entries();
 
     size_t pool_size = THREAD_COUNT;
     std::vector<ThreadLocalMatchBuffer<Mode>> local_buffers(pool_size);
@@ -124,8 +123,8 @@ probe_intermediate(const UnchainedHashtable &hash_table,
                         hash_table.find_indices(key_val);
 
                     for (uint64_t i = start_idx; i < end_idx; ++i) {
-                        if (keys[i] == key_val) {
-                            local_buf.add_match(row_ids[i],
+                        if (entries[i].key == key_val) {
+                            local_buf.add_match(entries[i].row_id,
                                                 static_cast<uint32_t>(idx));
                         }
                     }
@@ -151,8 +150,7 @@ inline std::vector<ThreadLocalMatchBuffer<Mode>>
 probe_columnar(const UnchainedHashtable &hash_table,
                const JoinInput &probe_input, size_t probe_attr) {
 
-    const auto *keys = hash_table.keys();
-    const auto *row_ids = hash_table.row_ids();
+    const auto *entries = hash_table.entries();
 
     auto *table = std::get<const ColumnarTable *>(probe_input.data);
     auto [actual_idx_col, _] = probe_input.node->output_attrs[probe_attr];
@@ -200,8 +198,9 @@ probe_columnar(const UnchainedHashtable &hash_table,
                         hash_table.find_indices(key_val);
 
                     for (uint64_t j = start_idx; j < end_idx; ++j) {
-                        if (keys[j] == key_val) {
-                            local_buf.add_match(row_ids[j], probe_row_id);
+                        if (entries[j].key == key_val) {
+                            local_buf.add_match(entries[j].row_id,
+                                                probe_row_id);
                         }
                     }
                     probe_row_id++;
@@ -222,8 +221,9 @@ probe_columnar(const UnchainedHashtable &hash_table,
                             hash_table.find_indices(key_val);
 
                         for (uint64_t j = start_idx; j < end_idx; ++j) {
-                            if (keys[j] == key_val) {
-                                local_buf.add_match(row_ids[j], probe_row_id);
+                            if (entries[j].key == key_val) {
+                                local_buf.add_match(entries[j].row_id,
+                                                    probe_row_id);
                             }
                         }
                     }
@@ -254,8 +254,7 @@ inline std::vector<ThreadLocalMatchBuffer<Mode>>
 probe_tuples(const UnchainedHashtable &hash_table,
              const mema::key_row_column_t &probe_tuples) {
 
-    const auto *keys = hash_table.keys();
-    const auto *row_ids = hash_table.row_ids();
+    const auto *entries = hash_table.entries();
     const size_t probe_count = probe_tuples.row_count();
     const size_t num_pages = probe_tuples.pages.size();
 
@@ -292,10 +291,11 @@ probe_tuples(const UnchainedHashtable &hash_table,
                         hash_table.find_indices(pair.key);
 
                     for (uint64_t i = start_idx; i < end_idx; ++i) {
-                        if (keys[i] == pair.key) {
-                            // row_ids[i] = build side's row ID (base or IR)
-                            // pair.row_id = probe side's row ID (base or IR)
-                            local_buf.add_match(row_ids[i], pair.row_id);
+                        if (entries[i].key == pair.key) {
+                            // entries[i].row_id = build side's row ID (base or
+                            // IR) pair.row_id = probe side's row ID (base or
+                            // IR)
+                            local_buf.add_match(entries[i].row_id, pair.row_id);
                         }
                     }
                 }

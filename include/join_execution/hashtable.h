@@ -57,8 +57,14 @@ using Contest::join::BLOOM_TAGS;
  */
 class UnchainedHashtable {
   public:
-    /** @brief Key-rowid pair for hash table entries. */
+    /** @brief Key-rowid pair for hash table entries (build phase). */
     struct alignas(4) Tuple {
+        int32_t key;     /**< Join key value. */
+        uint32_t row_id; /**< Row index in source table. */
+    };
+
+    /** @brief Fused key-rowid for cache-friendly probe (8-byte aligned). */
+    struct alignas(8) Entry {
         int32_t key;     /**< Join key value. */
         uint32_t row_id; /**< Row index in source table. */
     };
@@ -126,27 +132,10 @@ class UnchainedHashtable {
         nullptr; /**< Arena for hash table allocations. */
     Contest::platform::ArenaVector<uint64_t>
         directory; /**< Slot entries: (end_offset << 16) | bloom_tag. */
-    Contest::platform::ArenaVector<int32_t>
-        keys_; /**< Contiguous key storage, indexed by directory. */
-    Contest::platform::ArenaVector<uint32_t>
-        row_ids_; /**< Parallel row_id storage, same indexing. */
+    Contest::platform::ArenaVector<Entry>
+        entries_; /**< Fused key+row_id storage, indexed by directory. */
     int shift =
         0; /**< Bit shift for slot calculation: slot = hash >> (64-shift). */
-
-    /**
-     * @brief CRC32-based hash with multiplicative mixing.
-     * @param key INT32 join key.
-     * @return 64-bit hash (upper bits index directory slot).
-     */
-    static uint64_t hash_key(int32_t key) noexcept {
-        constexpr uint64_t k = 0x8648DBDB;
-#if defined(__aarch64__)
-        uint32_t crc = __crc32w(0, static_cast<uint32_t>(key));
-#else
-        uint32_t crc = _mm_crc32_u32(0, static_cast<uint32_t>(key));
-#endif
-        return crc * ((k << 32) + 1);
-    }
 
     /**
      * @brief Returns bloom tag from hash. Uses bits 32-42 to index BLOOM_TAGS.
@@ -231,8 +220,7 @@ class UnchainedHashtable {
                     uint64_t h = hash_key(tup.key);
                     size_t local_slot = slot_for(h) - slot_start;
                     uint32_t idx = offsets[local_slot] + counts[local_slot]++;
-                    keys_[idx] = tup.key;
-                    row_ids_[idx] = tup.row_id;
+                    entries_[idx] = {tup.key, tup.row_id};
                     directory[slot_start + local_slot] |= bloom_tag(h);
                 }
             }
@@ -253,7 +241,7 @@ class UnchainedHashtable {
      */
     explicit UnchainedHashtable(size_t build_size)
         : arena_(&Contest::platform::get_arena(0)), directory(*arena_),
-          keys_(*arena_), row_ids_(*arena_) {
+          entries_(*arena_) {
         size_t pow2 = 2048;
         while (pow2 < build_size)
             pow2 <<= 1;
@@ -262,17 +250,29 @@ class UnchainedHashtable {
         shift = __builtin_ctzll(pow2);
     }
 
-    /** @brief Number of keys in the hash table. */
-    size_t size() const noexcept { return keys_.size(); }
+    /** @brief Number of entries in the hash table. */
+    size_t size() const noexcept { return entries_.size(); }
 
     /** @brief True if hash table is empty. */
-    bool empty() const noexcept { return keys_.empty(); }
+    bool empty() const noexcept { return entries_.empty(); }
 
-    /** @brief Direct access to key array for probe. */
-    const int32_t *keys() const noexcept { return keys_.data(); }
+    /** @brief Direct access to fused entry array for probe. */
+    const Entry *entries() const noexcept { return entries_.data(); }
 
-    /** @brief Direct access to row_id array for probe. */
-    const uint32_t *row_ids() const noexcept { return row_ids_.data(); }
+    /**
+     * @brief CRC32-based hash with multiplicative mixing. Public for pre-hash.
+     * @param key INT32 join key.
+     * @return 64-bit hash (upper bits index directory slot).
+     */
+    static uint64_t hash_key(int32_t key) noexcept {
+        constexpr uint64_t k = 0x8648DBDB;
+#if defined(__aarch64__)
+        uint32_t crc = __crc32w(0, static_cast<uint32_t>(key));
+#else
+        uint32_t crc = _mm_crc32_u32(0, static_cast<uint32_t>(key));
+#endif
+        return crc * ((k << 32) + 1);
+    }
 
     /**
      * @brief Prefetch directory slot for a key to hide memory latency.
@@ -287,15 +287,52 @@ class UnchainedHashtable {
     }
 
     /**
+     * @brief Prefetch directory slot using pre-computed hash.
+     *
+     * Avoids recomputing hash when already computed for another purpose.
+     * @param h Pre-computed hash from hash_key().
+     */
+    void prefetch_slot_prehashed(uint64_t h) const noexcept {
+        size_t slot = slot_for(h);
+        __builtin_prefetch(&directory[slot], 0, 2);
+    }
+
+    /**
      * @brief Find index range for keys matching probe key.
      *
-     * @return [start, end) into keys_/row_ids_; (0,0) if bloom rejects.
+     * @return [start, end) into entries_; (0,0) if bloom rejects.
      */
     std::pair<uint64_t, uint64_t> find_indices(int32_t key) const noexcept {
-        if (keys_.empty())
+        if (entries_.empty())
             return {0, 0};
 
         uint64_t h = hash_key(key);
+        size_t slot = slot_for(h);
+        uint64_t entry = directory[slot];
+        uint16_t tag = bloom_tag(h);
+
+        if ((entry & tag) != tag)
+            return {0, 0};
+
+        uint64_t end = entry >> 16;
+        uint64_t start = (slot == 0) ? 0 : (directory[slot - 1] >> 16);
+        return {start, end};
+    }
+
+    /**
+     * @brief Find index range using pre-computed hash (avoids rehashing).
+     *
+     * Use when hash was already computed for prefetch or bloom filter check.
+     * @param key Original key (for comparison in caller).
+     * @param h Pre-computed hash from hash_key(key).
+     * @return [start, end) into entries_; (0,0) if bloom rejects.
+     */
+    std::pair<uint64_t, uint64_t>
+    find_indices_prehashed(int32_t key, uint64_t h) const noexcept {
+        (void)key; // Key used by caller for comparison, not needed here
+        if (entries_.empty())
+            return {0, 0};
+
         size_t slot = slot_for(h);
         uint64_t entry = directory[slot];
         uint16_t tag = bloom_tag(h);
@@ -376,8 +413,7 @@ class UnchainedHashtable {
         size_t total = global_offsets[num_partitions];
         if (total == 0)
             return;
-        keys_.resize(total);
-        row_ids_.resize(total);
+        entries_.resize(total);
 
         // Build partitions in parallel
         const int nt = num_threads;
@@ -393,54 +429,59 @@ class UnchainedHashtable {
     /**
      * @brief Build hash table from (key, row_id) tuple column.
      *
-     * Consumes tuples directly - row_ids are already in correct format
-     * (base table IDs or IR indices depending on how IR was constructed).
-     * More efficient than build_intermediate() as tuples match internal format.
+     * Radix-partitioned parallel build from key_row_column_t.
+     * Uses page-based work distribution for better cache locality.
+     * Each thread processes whole pages to avoid cross-page access.
      *
      * @param tuples Key-row tuple column from IntermediateResult.
-     * @param num_threads Thread count hint.
+     * @param num_threads Thread count hint (unused, uses pool size).
      */
     void build_from_tuples(const mema::key_row_column_t &tuples,
-                           int num_threads = 4) {
+                           int /*num_threads*/ = 4) {
         const size_t row_count = tuples.row_count();
         if (row_count == 0)
             return;
 
-        static constexpr size_t PARALLEL_BUILD_THRESHOLD = 10000;
-        num_threads = Contest::platform::worker_pool().thread_count();
-        if (row_count < PARALLEL_BUILD_THRESHOLD)
-            num_threads = 1;
-
+        const int pool_threads = Contest::platform::worker_pool().thread_count();
         const size_t num_slots = directory.size();
         const size_t num_partitions =
-            compute_num_partitions(row_count, num_threads);
+            compute_num_partitions(row_count, pool_threads);
         const int partition_bits = __builtin_ctzll(num_partitions);
         const size_t slots_per_partition = num_slots / num_partitions;
 
-        std::vector<ChunkAllocator> allocators(num_threads);
-        for (int t = 0; t < num_threads; ++t)
+        // Thread-local partitions for lock-free parallel partitioning
+        std::vector<ChunkAllocator> allocators(pool_threads);
+        for (int t = 0; t < pool_threads; ++t)
             allocators[t].set_arena(Contest::platform::get_arena(t));
-        std::vector<std::vector<Partition>> thread_parts(num_threads);
+        std::vector<std::vector<Partition>> thread_parts(pool_threads);
         for (auto &tp : thread_parts)
             tp.resize(num_partitions);
 
-        // Partition phase - 8-byte tuple reads, cache-friendly streaming
-        size_t batch = (row_count + num_threads - 1) / num_threads;
-        Contest::platform::worker_pool().execute([&, partition_bits](size_t t) {
-            size_t start = t * batch;
-            size_t end = std::min(start + batch, row_count);
-            if (start >= end)
-                return;
-            const int shift = 64 - partition_bits;
-            for (size_t i = start; i < end; ++i) {
-                mema::KeyRowPair pair = tuples[i];
-                uint64_t h = hash_key(pair.key);
-                size_t p = (partition_bits == 0) ? 0 : (h >> shift);
-                // Direct use of tuple - no conversion needed
-                thread_parts[t][p].append(allocators[t],
-                                          {pair.key, pair.row_id});
-            }
-        });
+        // Page-based partition phase - each thread processes whole pages
+        constexpr size_t PAIRS_PER_PAGE = mema::key_row_column_t::PAIRS_PER_PAGE;
+        const size_t num_pages = tuples.pages.size();
+
+        Contest::platform::worker_pool().execute(
+            [&, partition_bits, pool_threads](size_t t) {
+                const int shift = 64 - partition_bits;
+                const size_t stride = static_cast<size_t>(pool_threads);
+                for (size_t pg = t; pg < num_pages; pg += stride) {
+                    // Prefetch next page
+                    if (pg + stride < num_pages) {
+                        __builtin_prefetch(tuples.pages[pg + stride]->data, 0, 3);
+                    }
+                    const auto *page_data = tuples.pages[pg]->data;
+                    size_t base = pg * PAIRS_PER_PAGE;
+                    size_t count = std::min(PAIRS_PER_PAGE, row_count - base);
+                    for (size_t i = 0; i < count; ++i) {
+                        const auto &pair = page_data[i];
+                        uint64_t h = hash_key(pair.key);
+                        size_t p = (partition_bits == 0) ? 0 : (h >> shift);
+                        thread_parts[t][p].append(allocators[t],
+                                                  {pair.key, pair.row_id});
+                    }
+                }
+            });
 
         // Compute global offsets from per-thread counts
         Contest::platform::ArenaVector<size_t> global_offsets(*arena_);
@@ -448,7 +489,7 @@ class UnchainedHashtable {
         std::memset(global_offsets.data(), 0,
                     (num_partitions + 1) * sizeof(size_t));
         for (size_t p = 0; p < num_partitions; ++p) {
-            for (size_t t = 0; t < num_threads; ++t) {
+            for (int t = 0; t < pool_threads; ++t) {
                 global_offsets[p + 1] += thread_parts[t][p].total_count;
             }
             global_offsets[p + 1] += global_offsets[p];
@@ -457,16 +498,16 @@ class UnchainedHashtable {
         size_t total = global_offsets[num_partitions];
         if (total == 0)
             return;
-        keys_.resize(total);
-        row_ids_.resize(total);
+        entries_.resize(total);
 
         // Build partitions in parallel
-        const int nt = num_threads;
-        Contest::platform::worker_pool().execute([&, nt](size_t t) {
-            for (size_t p = t; p < num_partitions; p += nt) {
-                build_partition(
-                    thread_parts, p, slots_per_partition, global_offsets[p],
-                    global_offsets[p + 1] - global_offsets[p], nt, t);
+        Contest::platform::worker_pool().execute([&, pool_threads](size_t t) {
+            for (size_t p = t; p < num_partitions;
+                 p += static_cast<size_t>(pool_threads)) {
+                build_partition(thread_parts, p, slots_per_partition,
+                                global_offsets[p],
+                                global_offsets[p + 1] - global_offsets[p],
+                                pool_threads, t);
             }
         });
     }
@@ -570,8 +611,7 @@ class UnchainedHashtable {
         size_t total = global_offsets[num_partitions];
         if (total == 0)
             return;
-        keys_.resize(total);
-        row_ids_.resize(total);
+        entries_.resize(total);
 
         const int nt = num_threads;
         Contest::platform::worker_pool().execute([&, nt](size_t t) {

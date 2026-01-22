@@ -138,6 +138,16 @@ struct key_row_column_t {
     size_t row_count() const { return num_values; }
     void set_row_count(size_t count) { num_values = count; }
 
+    /// Release ownership of pages for zero-copy transfer to hashtable.
+    /// After this call, the column is empty (pages cleared, num_values = 0).
+    /// @return Vector of page pointers (caller takes ownership).
+    std::vector<Page *> release_pages() && {
+        std::vector<Page *> released = std::move(pages);
+        pages.clear();
+        num_values = 0;
+        return released;
+    }
+
     /// Pre-allocate pages from arena
     inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
                                         size_t count) {
