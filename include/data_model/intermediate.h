@@ -5,7 +5,7 @@
  * Provides:
  * - mema::value_t: 4-byte value encoding (INT32 direct, VARCHAR as page/offset)
  * - mema::column_t: 16KB-paged column for materialized values
- * - mema::deferred_column_t: 32KB-paged column for 64-bit provenance encoding
+ * - mema::DeferredTable: 16KB-paged 32-bit row ID storage per base table
  * - IntermediateResult: Lightweight result with selective materialization
  * - JoinInput: Unified abstraction over columnar tables and intermediate
  * results
@@ -29,10 +29,11 @@
 
 /**
  * @namespace mema
- * @brief Compact join intermediate: value_t (4B) + column_t (16KB pages).
+ * @brief Compact join intermediate: value_t (4B) + column_t (16KB pages) +
+ * DeferredTable (32-bit row IDs).
  *
  * value_t: INT32 direct or VARCHAR page/offset ref. column_t: arena-allocated
- * pages with write_at().
+ * pages with write_at(). DeferredTable: 32-bit row ID storage per base table.
  *
  * @see Contest::IntermediateResult, plan.h ColumnarTable.
  */
@@ -176,84 +177,85 @@ struct column_t {
 using Columnar = std::vector<column_t>;
 
 /**
- * @brief 64-bit provenance column for deferred materialization.
+ * @brief Per-base-table deferred row ID storage with multi-column tracking.
  *
- * Stores encoded (table_id, column_idx, row_id) for each row using
- * DeferredProvenance encoding. Uses 32KB pages with 4096 entries each.
+ * Stores 32-bit row IDs for a single base table. All columns from this
+ * base table share the same row ID lookup, reducing memory from 8 bytes
+ * per column to 4 bytes per table.
  *
- * @see DeferredProvenance for encoding scheme.
- * @see IntermediateResult for usage.
+ * Uses 16KB pages (reuses IR_PAGE arena chunk) with 4096 uint32_t entries.
  */
-struct deferred_column_t {
-    static constexpr size_t PAGE_SIZE = 1 << 15; // 32KB
+struct DeferredTable {
+    static constexpr size_t PAGE_SIZE = 1 << 14; // 16KB
     static constexpr size_t ENTRIES_PER_PAGE =
-        PAGE_SIZE / sizeof(uint64_t);         // 4096
+        PAGE_SIZE / sizeof(uint32_t);         // 4096
     static constexpr size_t ENTRY_SHIFT = 12; // log2(4096)
     static constexpr size_t ENTRY_MASK = ENTRIES_PER_PAGE - 1;
 
     struct alignas(PAGE_SIZE) Page {
-        uint64_t data[ENTRIES_PER_PAGE];
+        uint32_t data[ENTRIES_PER_PAGE];
     };
 
     std::vector<Page *> pages;
     size_t num_values = 0;
 
-    deferred_column_t() = default;
+    /// Base table ID this deferred table references
+    uint8_t base_table_id = 0;
 
-    deferred_column_t(deferred_column_t &&other) noexcept
-        : pages(std::move(other.pages)), num_values(other.num_values) {
+    /// True if this deferred table comes from build side (vs probe)
+    bool from_build = false;
+
+    /// Column indices from this base table that need deferred resolution
+    std::vector<uint8_t> column_indices;
+
+    DeferredTable() = default;
+
+    DeferredTable(DeferredTable &&other) noexcept
+        : pages(std::move(other.pages)), num_values(other.num_values),
+          base_table_id(other.base_table_id), from_build(other.from_build),
+          column_indices(std::move(other.column_indices)) {
         other.pages.clear();
         other.num_values = 0;
     }
 
-    deferred_column_t &operator=(deferred_column_t &&other) noexcept {
+    DeferredTable &operator=(DeferredTable &&other) noexcept {
         if (this != &other) {
             pages = std::move(other.pages);
             num_values = other.num_values;
+            base_table_id = other.base_table_id;
+            from_build = other.from_build;
+            column_indices = std::move(other.column_indices);
             other.pages.clear();
             other.num_values = 0;
         }
         return *this;
     }
 
-    deferred_column_t(const deferred_column_t &) = delete;
-    deferred_column_t &operator=(const deferred_column_t &) = delete;
+    DeferredTable(const DeferredTable &) = delete;
+    DeferredTable &operator=(const DeferredTable &) = delete;
 
-    ~deferred_column_t() = default;
+    ~DeferredTable() = default;
 
-    /** @brief O(1) read: idx>>12 for page, idx&0xFFF for offset. */
-    inline uint64_t operator[](size_t idx) const {
+    /// O(1) read: idx >> 12 for page, idx & 0xFFF for offset
+    inline uint32_t operator[](size_t idx) const {
         return pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK];
     }
 
-    /** @brief Thread-safe write at idx (requires pages to be set up first). */
-    inline void write_at(size_t idx, uint64_t val) {
-        pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK] = val;
+    /// Thread-safe write at idx (requires pages set up first)
+    inline void write_at(size_t idx, uint32_t row_id) {
+        pages[idx >> ENTRY_SHIFT]->data[idx & ENTRY_MASK] = row_id;
     }
 
-    /** @brief Total value count. */
     size_t row_count() const { return num_values; }
+    void set_row_count(size_t count) { num_values = count; }
 
-    /** @brief Set row count without allocation (for assembly pattern). */
-    inline void set_row_count(size_t count) { num_values = count; }
-
-    /** @brief Pre-allocate pages from arena. */
-    inline void pre_allocate_from_arena(Contest::platform::ThreadArena &arena,
-                                        size_t count) {
-        static_assert(
-            sizeof(Page) ==
-                Contest::platform::ChunkSize<
-                    Contest::platform::ChunkType::DEFERRED_PAGE>::value,
-            "Page size mismatch with DEFERRED_PAGE chunk size");
-        size_t pages_needed = (count + ENTRIES_PER_PAGE - 1) / ENTRIES_PER_PAGE;
-        pages.reserve(pages_needed);
-        for (size_t i = 0; i < pages_needed; ++i) {
-            void *ptr =
-                arena
-                    .alloc_chunk<Contest::platform::ChunkType::DEFERRED_PAGE>();
-            pages.push_back(reinterpret_cast<Page *>(ptr));
+    /// Check if this table tracks a specific base column
+    bool has_column(uint8_t col_idx) const {
+        for (uint8_t c : column_indices) {
+            if (c == col_idx)
+                return true;
         }
-        num_values = count;
+        return false;
     }
 };
 
@@ -262,18 +264,27 @@ struct deferred_column_t {
 namespace Contest {
 
 /**
+ * @brief Reference from a column to its deferred table.
+ */
+struct DeferredColumnRef {
+    uint8_t table_idx; ///< Index into IntermediateResult::deferred_tables
+    uint8_t base_col;  ///< Base column index in Plan::inputs[base_table_id]
+};
+
+/**
  * @brief Lightweight intermediate result with selective materialization.
  *
  * Stores only columns marked MATERIALIZE (typically just the parent's join
- * key). All other columns are resolved at final materialization using
- * per-column 64-bit provenance (table_id, column_idx, row_id).
+ * key). Deferred columns use per-table 32-bit row ID storage instead of
+ * per-column 64-bit provenance, achieving up to 10x memory reduction for
+ * multi-column deferred scenarios.
  *
- * Memory savings: For a join projecting N columns where only 1 is a join key,
- * IntermediateResult uses ~1/N the memory for data columns. Additionally, we
- * only track provenance for deferred columns (not all tables).
+ * Memory savings example: For 5 columns from same base table:
+ * - Old: 5 columns × 8 bytes = 40 bytes per row
+ * - New: 1 DeferredTable × 4 bytes = 4 bytes per row
  *
  * @see AnalyzedColumnInfo for materialization decisions.
- * @see DeferredProvenance for 64-bit encoding scheme.
+ * @see DeferredTable for 32-bit row ID storage.
  */
 struct IntermediateResult {
     /// Only columns marked MATERIALIZE (typically 1 join key).
@@ -283,13 +294,15 @@ struct IntermediateResult {
     /// deferred).
     std::vector<std::optional<size_t>> materialized_map;
 
-    /// Per-deferred-column provenance (64-bit encoded table_id+column_idx+row).
-    /// One deferred_column_t per DEFER column, stores full provenance per row.
-    std::vector<mema::deferred_column_t> deferred_columns;
+    /// Per-base-table deferred row ID storage. One DeferredTable per unique
+    /// (from_build, base_table_id) pair. All columns from same base table share
+    /// the same row ID lookup.
+    std::vector<mema::DeferredTable> deferred_tables;
 
-    /// Map: original column index -> index in deferred_columns (nullopt if
-    /// materialized).
-    std::vector<std::optional<size_t>> deferred_map;
+    /// Map: original column index -> DeferredColumnRef (nullopt if
+    /// materialized). The ref contains table_idx (into deferred_tables) and
+    /// base_col for resolution.
+    std::vector<std::optional<DeferredColumnRef>> deferred_map;
 
     /// Reference to node info for column provenance resolution.
     const AnalyzedJoinNode *node_info = nullptr;
@@ -325,22 +338,36 @@ struct IntermediateResult {
         return &materialized[*materialized_map[orig_idx]];
     }
 
-    /** @brief Get deferred column provenance, or nullptr if materialized. */
-    const mema::deferred_column_t *get_deferred(size_t orig_idx) const {
+    /** @brief Get deferred table for a column, or nullptr if materialized. */
+    const mema::DeferredTable *get_deferred_table(size_t orig_idx) const {
         if (!is_deferred(orig_idx))
             return nullptr;
-        return &deferred_columns[*deferred_map[orig_idx]];
+        return &deferred_tables[deferred_map[orig_idx]->table_idx];
     }
 
-    /** @brief Get mutable deferred column provenance, or nullptr. */
-    mema::deferred_column_t *get_deferred_mut(size_t orig_idx) {
+    /** @brief Get mutable deferred table for a column, or nullptr. */
+    mema::DeferredTable *get_deferred_table_mut(size_t orig_idx) {
         if (!is_deferred(orig_idx))
             return nullptr;
-        return &deferred_columns[*deferred_map[orig_idx]];
+        return &deferred_tables[deferred_map[orig_idx]->table_idx];
     }
 
-    /** @brief Number of deferred columns. */
-    size_t num_deferred() const { return deferred_columns.size(); }
+    /** @brief Get base column index for deferred column. */
+    uint8_t get_deferred_base_col(size_t orig_idx) const {
+        if (!is_deferred(orig_idx))
+            return 0;
+        return deferred_map[orig_idx]->base_col;
+    }
+
+    /** @brief Get full DeferredColumnRef for a column, or nullptr. */
+    const DeferredColumnRef *get_deferred_ref(size_t orig_idx) const {
+        if (!is_deferred(orig_idx))
+            return nullptr;
+        return &(*deferred_map[orig_idx]);
+    }
+
+    /** @brief Number of deferred tables (unique base tables). */
+    size_t num_deferred_tables() const { return deferred_tables.size(); }
 };
 
 /**
@@ -397,15 +424,40 @@ struct JoinInput {
     }
 
     /**
-     * @brief Get deferred column provenance for a column index.
+     * @brief Get deferred table for a column index.
      *
      * For columnar inputs, returns nullptr (caller must encode fresh).
-     * For IntermediateResult inputs, returns existing provenance column.
+     * For IntermediateResult inputs, returns existing deferred table.
      */
-    const mema::deferred_column_t *get_deferred_column(size_t col_idx) const {
+    const mema::DeferredTable *get_deferred_table(size_t col_idx) const {
         if (is_columnar())
             return nullptr;
-        return std::get<IntermediateResult>(data).get_deferred(col_idx);
+        return std::get<IntermediateResult>(data).get_deferred_table(col_idx);
+    }
+
+    /**
+     * @brief Get base column index for a deferred column.
+     *
+     * For columnar inputs, returns 0 (caller must use column metadata).
+     * For IntermediateResult inputs, returns stored base column index.
+     */
+    uint8_t get_deferred_base_col(size_t col_idx) const {
+        if (is_columnar())
+            return 0;
+        return std::get<IntermediateResult>(data).get_deferred_base_col(
+            col_idx);
+    }
+
+    /**
+     * @brief Get full DeferredColumnRef for a column index.
+     *
+     * For columnar inputs, returns nullptr (caller must encode fresh).
+     * For IntermediateResult inputs, returns pointer to DeferredColumnRef.
+     */
+    const DeferredColumnRef *get_deferred_ref(size_t col_idx) const {
+        if (is_columnar())
+            return nullptr;
+        return std::get<IntermediateResult>(data).get_deferred_ref(col_idx);
     }
 };
 

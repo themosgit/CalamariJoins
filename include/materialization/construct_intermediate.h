@@ -3,13 +3,13 @@
  * @brief Constructs intermediate results for multi-way joins.
  *
  * Allocates and populates IntermediateResult with only MATERIALIZE columns
- * (typically just the parent's join key). Deferred columns store 64-bit
- * provenance (table_id, column_idx, row_id) for resolution at final output.
+ * (typically just the parent's join key). Deferred columns use per-table
+ * 32-bit row ID storage for memory efficiency.
  *
  * Optimized with:
  * - Column-major iteration for cache locality
  * - Precomputed source metadata to avoid per-row variant access
- * - SIMD provenance encoding (AVX2/NEON) for deferred columns
+ * - Per-table 32-bit row ID storage (vs per-column 64-bit provenance)
  * - Batch access to match collector chunks
  *
  * @see materialize.h for final resolution of deferred columns.
@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include <data_access/columnar_reader.h>
@@ -26,12 +27,6 @@
 #include <join_execution/match_collector.h>
 #include <platform/arena.h>
 #include <platform/worker_pool.h>
-
-#if defined(__x86_64__)
-#include <immintrin.h>
-#elif defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 
 namespace Contest {
 namespace materialize {
@@ -43,135 +38,60 @@ using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 // ============================================================================
-// SIMD Provenance Encoding
+// Row ID Batch Operations (for 32-bit per-table deferred)
 // ============================================================================
 
-namespace simd_provenance {
-
-#if defined(__x86_64__) && defined(__AVX2__)
-inline constexpr size_t BATCH_SIZE = 4; ///< 4 x uint64_t in AVX2 (256-bit)
-#elif defined(__aarch64__)
-inline constexpr size_t BATCH_SIZE = 2; ///< 2 x uint64_t in NEON (128-bit)
-#else
-inline constexpr size_t BATCH_SIZE = 0; ///< No SIMD available
-#endif
+namespace row_id_ops {
 
 /**
- * @brief Encode provenance for batch of row IDs using SIMD.
+ * @brief Write row IDs directly from columnar input.
  *
- * Encodes (table_id << 56) | (column_idx << 48) | row_id for each row.
- * Uses AVX2 on x86_64 or NEON on aarch64, with scalar fallback.
- *
- * @param dest       Destination deferred column
- * @param start_idx  Starting output index
- * @param row_ids    Pointer to row IDs (from IndexChunk, contiguous)
- * @param count      Number of row IDs to process
- * @param table_id   Base table ID (constant for all rows)
- * @param column_idx Base column index (constant for all rows)
- * @return Number of rows processed (always == count)
+ * For columnar inputs, we just write the row_id directly (it's already
+ * the base table row ID).
  */
-inline size_t encode_provenance_batch(mema::deferred_column_t &dest,
-                                      size_t start_idx, const uint32_t *row_ids,
-                                      size_t count, uint8_t table_id,
-                                      uint8_t column_idx) {
-    // Precompute constant prefix: (table_id << 56) | (column_idx << 48)
-    const uint64_t prefix = DeferredProvenance::encode(table_id, column_idx, 0);
-
-    size_t i = 0;
-
-#if defined(__x86_64__) && defined(__AVX2__)
-    // AVX2: Process 4 x uint64_t at a time
-    // Load 4 x uint32_t, zero-extend to 4 x uint64_t, OR with prefix
-    const __m256i prefix_vec = _mm256_set1_epi64x(static_cast<int64_t>(prefix));
-
-    for (; i + 4 <= count; i += 4) {
-        // Load 4 x uint32_t and zero-extend to 4 x uint64_t
-        __m128i rows_32 =
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(row_ids + i));
-        __m256i rows_64 = _mm256_cvtepu32_epi64(rows_32);
-
-        // OR with prefix to create provenance values
-        __m256i result = _mm256_or_si256(rows_64, prefix_vec);
-
-        // Store to aligned buffer, then write individually (page-safe)
-        alignas(32) uint64_t out[4];
-        _mm256_store_si256(reinterpret_cast<__m256i *>(out), result);
-
-        dest.write_at(start_idx + i, out[0]);
-        dest.write_at(start_idx + i + 1, out[1]);
-        dest.write_at(start_idx + i + 2, out[2]);
-        dest.write_at(start_idx + i + 3, out[3]);
+inline size_t write_row_ids_direct(mema::DeferredTable &dest, size_t start_idx,
+                                   const uint32_t *row_ids, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        dest.write_at(start_idx + i, row_ids[i]);
     }
-#elif defined(__aarch64__)
-    // NEON: Process 2 x uint64_t at a time
-    const uint64x2_t prefix_vec = vdupq_n_u64(prefix);
-
-    for (; i + 2 <= count; i += 2) {
-        // Load 2 x uint32_t and zero-extend to 2 x uint64_t
-        uint32x2_t rows_32 = vld1_u32(row_ids + i);
-        uint64x2_t rows_64 = vmovl_u32(rows_32);
-
-        // OR with prefix
-        uint64x2_t result = vorrq_u64(rows_64, prefix_vec);
-
-        // Store individually (page boundary safe)
-        dest.write_at(start_idx + i, vgetq_lane_u64(result, 0));
-        dest.write_at(start_idx + i + 1, vgetq_lane_u64(result, 1));
-    }
-#endif
-
-    // Scalar remainder
-    for (; i < count; ++i) {
-        dest.write_at(start_idx + i,
-                      prefix | static_cast<uint64_t>(row_ids[i]));
-    }
-
     return count;
 }
 
 /**
- * @brief Copy provenance from source column using batch reads.
+ * @brief Copy row IDs from child deferred table.
  *
- * Copies existing 64-bit provenance values from child intermediate.
- * Uses contiguous batch access for better cache behavior.
- *
- * @param dest       Destination deferred column
- * @param start_idx  Starting output index
- * @param src        Source deferred column (from child)
- * @param row_ids    Row indices into source column
- * @param count      Number of rows to copy
- * @return Number of rows processed (always == count)
+ * For intermediate inputs, we look up the base table row ID from the
+ * child's deferred table and copy it to the parent's deferred table.
  */
-inline size_t copy_provenance_batch(mema::deferred_column_t &dest,
-                                    size_t start_idx,
-                                    const mema::deferred_column_t &src,
-                                    const uint32_t *row_ids, size_t count) {
+inline size_t copy_row_ids_from_child(mema::DeferredTable &dest,
+                                      size_t start_idx,
+                                      const mema::DeferredTable &src,
+                                      const uint32_t *row_ids, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         dest.write_at(start_idx + i, src[row_ids[i]]);
     }
     return count;
 }
 
-} // namespace simd_provenance
+} // namespace row_id_ops
 
 // ============================================================================
 // Source Precomputation Structures
 // ============================================================================
 
 /**
- * @brief Precomputed metadata for deferred column sources.
+ * @brief Precomputed metadata for a deferred table source.
  *
- * Tracks where each deferred column's provenance comes from:
- * - For columnar inputs: encode fresh (table_id, column_idx, row_id)
- * - For IntermediateResult inputs: copy existing provenance from child
+ * Groups columns by (from_build, base_table_id) so we only store 32-bit
+ * row IDs once per unique base table instead of 64-bit provenance per column.
  */
-struct DeferredColumnSource {
-    const mema::deferred_column_t *source_col =
-        nullptr;                 ///< Source if from intermediate.
-    uint8_t base_table_id = 0;   ///< Base table ID for encoding.
-    uint8_t base_column_idx = 0; ///< Base column index for encoding.
-    bool from_build = false;     ///< True if from build side.
-    bool needs_encode = false;   ///< True if columnar (needs fresh encode).
+struct DeferredTableSource {
+    const mema::DeferredTable *child_table =
+        nullptr;                ///< Source deferred table from child (if any).
+    uint8_t base_table_id = 0;  ///< Base table ID.
+    uint8_t dest_table_idx = 0; ///< Index in result.deferred_tables[].
+    bool from_build = false;    ///< True if from build side.
+    bool needs_direct = false;  ///< True if columnar (write row IDs directly).
 };
 
 /**
@@ -183,8 +103,8 @@ struct alignas(8) MaterializedColumnSource {
     const mema::column_t *intermediate_col =
         nullptr; ///< Source if from IntermediateResult materialized
     const Column *columnar_col = nullptr; ///< Source if from ColumnarTable
-    const mema::deferred_column_t *deferred_resolve_col =
-        nullptr;                 ///< Source if needs deferred resolution
+    const mema::DeferredTable *deferred_table =
+        nullptr;                 ///< Source deferred table if needs resolution
     size_t child_output_idx = 0; ///< Index in child's output
     size_t mat_col_idx = 0;      ///< Index in result.materialized[]
     DataType type = DataType::INT32;
@@ -294,57 +214,93 @@ create_empty_intermediate_result(const AnalyzedJoinNode &node) {
     result.deferred_map.resize(node.columns.size(), std::nullopt);
 
     size_t mat_count = 0;
-    size_t def_count = 0;
     for (const auto &col : node.columns) {
         if (col.resolution == ColumnResolution::MATERIALIZE) {
             result.materialized_map[col.original_idx] = mat_count++;
-        } else {
-            result.deferred_map[col.original_idx] = def_count++;
         }
+        // For empty result, we don't need to set up deferred tables
     }
     result.materialized.resize(mat_count);
-    result.deferred_columns.resize(def_count);
 
     return result;
 }
 
 /**
- * @brief Prepare deferred column sources for intermediate construction.
+ * @brief Prepare deferred table sources for intermediate construction.
+ *
+ * Groups deferred columns by (from_build, base_table_id) to create
+ * DeferredTable entries. Returns list of sources for populating the tables.
  */
-inline std::vector<DeferredColumnSource>
-prepare_deferred_sources(const AnalyzedJoinNode &join_node,
-                         const JoinInput &build_input,
-                         const JoinInput &probe_input, bool build_is_left) {
-    std::vector<DeferredColumnSource> sources;
-    sources.reserve(join_node.num_deferred_columns);
+inline std::vector<DeferredTableSource>
+prepare_deferred_table_sources(const AnalyzedJoinNode &join_node,
+                               const JoinInput &build_input,
+                               const JoinInput &probe_input, bool build_is_left,
+                               IntermediateResult &out_result) {
+    // Map from (from_build << 8 | base_table_id) -> dest_table_idx
+    std::unordered_map<uint16_t, uint8_t> table_key_to_idx;
+    std::vector<DeferredTableSource> sources;
 
     for (const auto &col : join_node.columns) {
         if (col.resolution != ColumnResolution::DEFER)
             continue;
 
-        DeferredColumnSource src;
-        src.base_table_id = col.provenance.base_table_id;
-        src.base_column_idx = col.provenance.base_column_idx;
-        src.from_build = (col.from_left == build_is_left);
+        bool from_build = (col.from_left == build_is_left);
+        uint16_t key = (static_cast<uint16_t>(from_build) << 8) |
+                       col.provenance.base_table_id;
 
-        const auto &src_input = src.from_build ? build_input : probe_input;
+        auto it = table_key_to_idx.find(key);
+        uint8_t dest_idx;
 
-        if (src_input.is_columnar()) {
-            src.needs_encode = true;
-            src.source_col = nullptr;
-        } else {
-            const auto *child_def =
-                src_input.get_deferred_column(col.child_output_idx);
-            if (child_def) {
-                src.needs_encode = false;
-                src.source_col = child_def;
+        if (it == table_key_to_idx.end()) {
+            // New deferred table needed
+            dest_idx = static_cast<uint8_t>(out_result.deferred_tables.size());
+            table_key_to_idx[key] = dest_idx;
+
+            mema::DeferredTable dt;
+            dt.base_table_id = col.provenance.base_table_id;
+            dt.from_build = from_build;
+            out_result.deferred_tables.push_back(std::move(dt));
+
+            // Create source entry
+            DeferredTableSource src;
+            src.base_table_id = col.provenance.base_table_id;
+            src.dest_table_idx = dest_idx;
+            src.from_build = from_build;
+
+            const auto &src_input = from_build ? build_input : probe_input;
+            if (src_input.is_columnar()) {
+                src.needs_direct = true;
+                src.child_table = nullptr;
             } else {
-                src.needs_encode = true;
-                src.source_col = nullptr;
+                // Find child's deferred table for this base table
+                const auto *child_ref =
+                    src_input.get_deferred_ref(col.child_output_idx);
+                if (child_ref) {
+                    src.needs_direct = false;
+                    src.child_table =
+                        src_input.get_deferred_table(col.child_output_idx);
+                } else {
+                    // Child materialized this, shouldn't happen for DEFER cols
+                    src.needs_direct = true;
+                    src.child_table = nullptr;
+                }
             }
+            sources.push_back(src);
+        } else {
+            dest_idx = it->second;
         }
-        sources.push_back(src);
+
+        // Add column to deferred table's column list
+        out_result.deferred_tables[dest_idx].column_indices.push_back(
+            col.provenance.base_column_idx);
+
+        // Set up deferred_map entry
+        DeferredColumnRef ref;
+        ref.table_idx = dest_idx;
+        ref.base_col = col.provenance.base_column_idx;
+        out_result.deferred_map[col.original_idx] = ref;
     }
+
     return sources;
 }
 
@@ -391,8 +347,9 @@ prepare_materialized_sources(const AnalyzedJoinNode &join_node,
                     ir.get_materialized(col.child_output_idx);
             } else if (ir.is_deferred(col.child_output_idx)) {
                 src.needs_deferred_resolve = true;
-                src.deferred_resolve_col =
-                    ir.get_deferred(col.child_output_idx);
+                src.deferred_table =
+                    ir.get_deferred_table(col.child_output_idx);
+                // base_column_idx is already set from col.provenance
             }
         }
         sources.push_back(src);
@@ -408,10 +365,9 @@ prepare_materialized_sources(const AnalyzedJoinNode &join_node,
 /**
  * @brief Constructs intermediate result from thread-local buffers.
  *
- * Optimized with column-major iteration and SIMD provenance encoding.
+ * Optimized with column-major iteration and per-table 32-bit row ID storage.
  * Only materializes columns marked MATERIALIZE in the AnalyzedJoinNode.
- * Deferred columns store 64-bit provenance encoding for resolution at final
- * output.
+ * Deferred columns share row ID storage per unique base table.
  *
  * @tparam Mode            Collection mode for compile-time specialization.
  * @param buffers          Thread-local match buffers from probe.
@@ -454,30 +410,31 @@ void construct_intermediate_from_buffers(
     out_result.materialized_map.resize(join_node.columns.size(), std::nullopt);
     out_result.deferred_map.resize(join_node.columns.size(), std::nullopt);
 
+    // Count materialized columns and set up maps
     size_t mat_count = 0;
-    size_t def_count = 0;
     for (const auto &col : join_node.columns) {
         if (col.resolution == ColumnResolution::MATERIALIZE) {
             out_result.materialized_map[col.original_idx] = mat_count++;
-        } else {
-            out_result.deferred_map[col.original_idx] = def_count++;
         }
     }
 
-    // Precompute sources for column-major iteration
+    // Prepare deferred table sources (this populates deferred_tables and
+    // deferred_map)
+    auto deferred_sources = prepare_deferred_table_sources(
+        join_node, build_input, probe_input, build_is_left, out_result);
+
+    // Precompute materialized sources
     auto mat_sources = prepare_materialized_sources(join_node, build_input,
                                                     probe_input, build_is_left);
-    auto deferred_sources = prepare_deferred_sources(
-        join_node, build_input, probe_input, build_is_left);
 
     // Pre-allocate pages
     using Page = mema::column_t::Page;
-    using DeferredPage = mema::deferred_column_t::Page;
+    using DeferredPage = mema::DeferredTable::Page;
     size_t mat_pages_needed =
         (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
     size_t def_pages_needed =
-        (total_matches + mema::deferred_column_t::ENTRIES_PER_PAGE - 1) /
-        mema::deferred_column_t::ENTRIES_PER_PAGE;
+        (total_matches + mema::DeferredTable::ENTRIES_PER_PAGE - 1) /
+        mema::DeferredTable::ENTRIES_PER_PAGE;
 
     out_result.materialized.resize(mat_count);
     for (size_t c = 0; c < mat_count; ++c) {
@@ -485,10 +442,9 @@ void construct_intermediate_from_buffers(
         out_result.materialized[c].set_row_count(total_matches);
     }
 
-    out_result.deferred_columns.resize(def_count);
-    for (size_t d = 0; d < def_count; ++d) {
-        out_result.deferred_columns[d].pages.resize(def_pages_needed);
-        out_result.deferred_columns[d].set_row_count(total_matches);
+    for (auto &dt : out_result.deferred_tables) {
+        dt.pages.resize(def_pages_needed);
+        dt.set_row_count(total_matches);
     }
 
     // Set source metadata for materialized columns
@@ -500,6 +456,7 @@ void construct_intermediate_from_buffers(
     }
 
     const size_t num_threads = THREAD_COUNT;
+    const size_t num_deferred_tables = out_result.deferred_tables.size();
 
     // Parallel page allocation
     worker_pool().execute([&](size_t t) {
@@ -512,14 +469,14 @@ void construct_intermediate_from_buffers(
                 col.pages[p] = reinterpret_cast<Page *>(ptr);
             }
         }
-        for (size_t d = 0; d < def_count; ++d) {
-            auto &def_col = out_result.deferred_columns[d];
+        for (size_t d = 0; d < num_deferred_tables; ++d) {
+            auto &dt = out_result.deferred_tables[d];
             for (size_t p = t; p < def_pages_needed; p += num_threads) {
+                // Use IR_PAGE (16KB) for DeferredTable pages
                 void *ptr =
                     Contest::platform::get_arena(t)
-                        .alloc_chunk<
-                            Contest::platform::ChunkType::DEFERRED_PAGE>();
-                def_col.pages[p] = reinterpret_cast<DeferredPage *>(ptr);
+                        .alloc_chunk<Contest::platform::ChunkType::IR_PAGE>();
+                dt.pages[p] = reinterpret_cast<DeferredPage *>(ptr);
             }
         }
     });
@@ -564,23 +521,21 @@ void construct_intermediate_from_buffers(
                 for (uint32_t rid : range) {
                     dest_col.write_at(k++, vec[rid]);
                 }
-            } else if (src.needs_deferred_resolve && src.deferred_resolve_col) {
-                // Deferred in child - resolve via provenance
-                const auto &def_col = *src.deferred_resolve_col;
+            } else if (src.needs_deferred_resolve && src.deferred_table) {
+                // Deferred in child - resolve via deferred table + base table
+                const auto &def_table = *src.deferred_table;
                 size_t k = start;
                 for (uint32_t rid : range) {
-                    uint64_t prov = def_col[rid];
-                    uint8_t base_tid = DeferredProvenance::table(prov);
-                    uint8_t base_col = DeferredProvenance::column(prov);
-                    uint64_t base_row = DeferredProvenance::row(prov);
+                    uint32_t base_row = def_table[rid];
 
                     if (analyzed_plan.original_plan) [[likely]] {
                         const auto &base_table =
-                            analyzed_plan.original_plan->inputs[base_tid];
+                            analyzed_plan.original_plan
+                                ->inputs[src.base_table_id];
                         mema::value_t val =
                             columnar_reader.read_value_direct_public(
-                                base_table.columns[base_col],
-                                static_cast<uint32_t>(base_row), src.type);
+                                base_table.columns[src.base_column_idx],
+                                base_row, src.type);
                         dest_col.write_at(k++, val);
                     } else {
                         dest_col.write_at(
@@ -591,52 +546,33 @@ void construct_intermediate_from_buffers(
         }
 
         // ====================================================================
-        // Process DEFERRED columns (column-major with SIMD batch encoding)
+        // Process DEFERRED tables (one pass per unique base table)
         // ====================================================================
-        for (size_t d = 0; d < deferred_sources.size(); ++d) {
-            const auto &def_src = deferred_sources[d];
-            auto &dest_def_col = out_result.deferred_columns[d];
+        for (const auto &def_src : deferred_sources) {
+            auto &dest_table =
+                out_result.deferred_tables[def_src.dest_table_idx];
 
-            if (def_src.needs_encode) {
-                // Fresh encoding from columnar input - use SIMD batch
-                auto batch_reader = def_src.from_build
-                                        ? buf.left_batch_reader()
-                                        : buf.right_batch_reader();
+            auto batch_reader = def_src.from_build ? buf.left_batch_reader()
+                                                   : buf.right_batch_reader();
 
-                size_t k = start;
-                while (batch_reader.has_more()) {
-                    size_t batch_count;
-                    // Request larger batches for SIMD efficiency
-                    constexpr size_t MAX_BATCH =
-                        simd_provenance::BATCH_SIZE > 0 ? 64 : 256;
-                    const uint32_t *row_ids =
-                        batch_reader.get_batch(MAX_BATCH, batch_count);
+            size_t k = start;
+            while (batch_reader.has_more()) {
+                size_t batch_count;
+                const uint32_t *row_ids =
+                    batch_reader.get_batch(256, batch_count);
 
-                    if (batch_count > 0) {
-                        simd_provenance::encode_provenance_batch(
-                            dest_def_col, k, row_ids, batch_count,
-                            def_src.base_table_id, def_src.base_column_idx);
-                        k += batch_count;
-                    }
-                }
-            } else if (def_src.source_col) {
-                // Copy existing provenance from child intermediate
-                auto batch_reader = def_src.from_build
-                                        ? buf.left_batch_reader()
-                                        : buf.right_batch_reader();
-
-                size_t k = start;
-                while (batch_reader.has_more()) {
-                    size_t batch_count;
-                    const uint32_t *row_ids =
-                        batch_reader.get_batch(256, batch_count);
-
-                    if (batch_count > 0) {
-                        simd_provenance::copy_provenance_batch(
-                            dest_def_col, k, *def_src.source_col, row_ids,
+                if (batch_count > 0) {
+                    if (def_src.needs_direct) {
+                        // Columnar input: write row IDs directly
+                        row_id_ops::write_row_ids_direct(dest_table, k, row_ids,
+                                                         batch_count);
+                    } else if (def_src.child_table) {
+                        // Intermediate input: copy from child's deferred table
+                        row_id_ops::copy_row_ids_from_child(
+                            dest_table, k, *def_src.child_table, row_ids,
                             batch_count);
-                        k += batch_count;
                     }
+                    k += batch_count;
                 }
             }
         }
