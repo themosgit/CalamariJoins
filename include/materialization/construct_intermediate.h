@@ -48,10 +48,25 @@ namespace row_id_ops {
  * @brief Write row IDs directly from columnar input.
  *
  * For columnar inputs, we just write the row_id directly (it's already
- * the base table row ID).
+ * the base table row ID). Optimized with memcpy when batch fits in one page.
  */
 inline size_t write_row_ids_direct(mema::DeferredTable &dest, size_t start_idx,
                                    const uint32_t *row_ids, size_t count) {
+    // Constants for DeferredTable layout
+    constexpr size_t ENTRY_SHIFT = mema::DeferredTable::ENTRY_SHIFT;
+    constexpr size_t ENTRY_MASK = mema::DeferredTable::ENTRY_MASK;
+
+    size_t page_idx = start_idx >> ENTRY_SHIFT;
+    size_t offset = start_idx & ENTRY_MASK;
+
+    // Fast path: entire batch fits in current page
+    if (offset + count <= mema::DeferredTable::ENTRIES_PER_PAGE) {
+        std::memcpy(&dest.pages[page_idx]->data[offset], row_ids,
+                    count * sizeof(uint32_t));
+        return count;
+    }
+
+    // Slow path: batch spans pages
     for (size_t i = 0; i < count; ++i) {
         dest.write_at(start_idx + i, row_ids[i]);
     }
@@ -227,6 +242,50 @@ inline void prepare_intermediate_columns(
 }
 
 /**
+ * @brief Prepare page indices for base table columns used in deferred
+ * resolution.
+ *
+ * Called before constructing intermediate results to enable O(log P) page
+ * lookup instead of O(P) linear scan when resolving deferred columns that need
+ * to materialize values from base tables.
+ *
+ * @param reader ColumnarReader to prepare page indices in.
+ * @param mat_sources Precomputed materialized column sources.
+ * @param analyzed_plan Full analyzed plan containing base tables.
+ */
+inline void prepare_deferred_base_tables(
+    ColumnarReader &reader,
+    const std::vector<MaterializedColumnSource> &mat_sources,
+    const AnalyzedPlan &analyzed_plan) {
+    if (!analyzed_plan.original_plan)
+        return;
+
+    // NOTE: We do NOT reset base tables here - they persist across joins
+    // within the same query since the base tables don't change.
+    // reset_base_tables() should only be called once per query, externally.
+
+    // Prepare page indices for each base table column that needs deferred
+    // resolve
+    for (const auto &src : mat_sources) {
+        if (src.needs_deferred_resolve) {
+            uint8_t table_id = src.base_table_id;
+            uint8_t col_idx = src.base_column_idx;
+
+            if (!reader.is_base_column_prepared(table_id, col_idx)) {
+                if (table_id < analyzed_plan.original_plan->inputs.size()) {
+                    const auto &base_table =
+                        analyzed_plan.original_plan->inputs[table_id];
+                    if (col_idx < base_table.columns.size()) {
+                        reader.prepare_base_column(table_id, col_idx,
+                                                   base_table.columns[col_idx]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
  * @brief Create empty intermediate result with proper schema.
  */
 inline IntermediateResult
@@ -310,10 +369,12 @@ prepare_deferred_table_sources(const AnalyzedJoinNode &join_node,
                     // is an IR index, but we need base table row IDs for
                     // deferred resolution. This shouldn't happen if the
                     // join key column is properly excluded from DEFER.
+#ifndef NDEBUG
                     std::fprintf(stderr,
                                  "[BUG] DEFER column %zu is child's "
                                  "join key - this is unexpected!\n",
                                  col.child_output_idx);
+#endif
                     src.needs_direct = true;
                     src.child_table = nullptr;
                 } else {
@@ -472,6 +533,9 @@ void construct_intermediate_from_buffers(
     auto mat_sources = prepare_materialized_sources(join_node, build_input,
                                                     probe_input, build_is_left);
 
+    // Prepare page indices for base tables used in deferred resolution
+    prepare_deferred_base_tables(columnar_reader, mat_sources, analyzed_plan);
+
     // Pre-allocate pages
     using Page = mema::column_t::Page;
     using DeferredPage = mema::DeferredTable::Page;
@@ -539,6 +603,7 @@ void construct_intermediate_from_buffers(
 
         size_t start = buffer_starts[t];
         ColumnarReader::Cursor cursor;
+        ColumnarReader::Cursor base_cursor; // For deferred resolution reads
 
         // ====================================================================
         // Process MATERIALIZED columns (column-major for cache locality)
@@ -586,9 +651,10 @@ void construct_intermediate_from_buffers(
                             analyzed_plan.original_plan
                                 ->inputs[src.base_table_id];
                         mema::value_t val =
-                            columnar_reader.read_value_direct_public(
+                            columnar_reader.read_base_table_value(
                                 base_table.columns[src.base_column_idx],
-                                base_row, src.type);
+                                src.base_table_id, src.base_column_idx,
+                                base_row, src.type, base_cursor);
                         dest_col.write_at(k++, val);
                     } else {
                         dest_col.write_at(
@@ -912,6 +978,9 @@ void construct_intermediate_with_tuples(
         mat_sources.push_back(src);
     }
 
+    // Prepare page indices for base tables used in deferred resolution
+    prepare_deferred_base_tables(columnar_reader, mat_sources, analyzed_plan);
+
     // Pre-allocate pages
     using Page = mema::column_t::Page;
     using DeferredPage = mema::DeferredTable::Page;
@@ -982,6 +1051,7 @@ void construct_intermediate_with_tuples(
 
         size_t start = buffer_starts[t];
         ColumnarReader::Cursor cursor;
+        ColumnarReader::Cursor base_cursor; // For deferred resolution reads
 
         // Process MATERIALIZED columns (excluding join key)
         for (const auto &src : mat_sources) {
@@ -1024,9 +1094,10 @@ void construct_intermediate_with_tuples(
                             analyzed_plan.original_plan
                                 ->inputs[src.base_table_id];
                         mema::value_t val =
-                            columnar_reader.read_value_direct_public(
+                            columnar_reader.read_base_table_value(
                                 base_table.columns[src.base_column_idx],
-                                base_row, src.type);
+                                src.base_table_id, src.base_column_idx,
+                                base_row, src.type, base_cursor);
                         dest_col.write_at(k++, val);
                     } else {
                         dest_col.write_at(

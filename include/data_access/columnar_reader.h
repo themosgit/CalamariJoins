@@ -8,6 +8,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -264,6 +265,127 @@ class ColumnarReader {
             }
         }
         global_probe_version.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // ========================================================================
+    // Base Table Page Index Methods (for O(1) deferred column resolution)
+    // ========================================================================
+
+    /** @brief Reset base table prepared flags for new query. */
+    inline void reset_base_tables() {
+        base_table_prepared_.fill(false);
+        base_table_version_++;
+    }
+
+    /**
+     * @brief Prepare page index for a base table column.
+     *
+     * Called once per unique (table_id, col_idx) before deferred resolution.
+     * Enables O(log P) page lookup instead of O(P) linear scan per read.
+     *
+     * @param table_id Base table ID (0-15).
+     * @param col_idx Column index within base table (0-15).
+     * @param column The Column to build page index for.
+     */
+    inline void prepare_base_column(uint8_t table_id, uint8_t col_idx,
+                                    const Column &column) {
+        size_t idx = (static_cast<size_t>(table_id) << BASE_TABLE_SHIFT) |
+                     static_cast<size_t>(col_idx);
+        if (idx >= MAX_BASE_TABLE_INDICES)
+            return;
+
+        if (!base_table_prepared_[idx]) {
+            auto &arena = platform::get_arena(0);
+            base_table_indices_[idx] = PageIndex(arena);
+            base_table_indices_[idx].build(column);
+            base_table_prepared_[idx] = true;
+        }
+    }
+
+    /** @brief Check if base column page index is prepared. */
+    inline bool is_base_column_prepared(uint8_t table_id,
+                                        uint8_t col_idx) const {
+        size_t idx = (static_cast<size_t>(table_id) << BASE_TABLE_SHIFT) |
+                     static_cast<size_t>(col_idx);
+        return idx < MAX_BASE_TABLE_INDICES && base_table_prepared_[idx];
+    }
+
+    /**
+     * @brief Read value from base table using prepared page index.
+     *
+     * O(1) with cursor caching for sequential access, O(log P) on cache miss.
+     * Falls back to O(P) linear scan if page index not prepared.
+     *
+     * @param column The base table column.
+     * @param table_id Base table ID.
+     * @param col_idx Column index within base table.
+     * @param row_id Row ID within the column.
+     * @param data_type Data type of the column.
+     * @param cursor Thread-local cursor for caching.
+     * @return The value at the specified row.
+     */
+    inline mema::value_t read_base_table_value(const Column &column,
+                                               uint8_t table_id,
+                                               uint8_t col_idx, uint32_t row_id,
+                                               DataType data_type,
+                                               Cursor &cursor) const {
+        size_t idx = (static_cast<size_t>(table_id) << BASE_TABLE_SHIFT) |
+                     static_cast<size_t>(col_idx);
+
+        if (idx >= MAX_BASE_TABLE_INDICES || !base_table_prepared_[idx]) {
+            // Fallback to O(P) linear scan
+            return read_value_direct(column, row_id, data_type);
+        }
+
+        const PageIndex &page_index = base_table_indices_[idx];
+
+        // Dense INT32 fast path: O(1) arithmetic lookup
+        if (data_type == DataType::INT32 && page_index.is_dense_int32) {
+            return mema::value_t{read_dense_int32(page_index, row_id)};
+        }
+
+        // Check cursor cache (version uses base_table_version_ + idx for
+        // uniqueness)
+        uint64_t effective_version = base_table_version_ + idx;
+        bool cache_hit =
+            cursor.version == effective_version && cursor.cached_col == idx &&
+            row_id >= cursor.cached_start && row_id < cursor.cached_end;
+
+        if (!cache_hit) {
+            // Check sequential access optimization
+            if (cursor.version == effective_version &&
+                cursor.cached_col == idx && row_id == cursor.cached_end) {
+                size_t next_page = cursor.cached_page + 1;
+                if (next_page < page_index.cumulative_rows.size()) {
+                    load_page_into_cursor_base(column, page_index, next_page,
+                                               idx, effective_version, cursor);
+                } else {
+                    // Past end of data
+                    return mema::value_t{mema::value_t::NULL_VALUE};
+                }
+            } else {
+                // Binary search for page
+                size_t page_num = page_index.find_page(row_id);
+                load_page_into_cursor_base(column, page_index, page_num, idx,
+                                           effective_version, cursor);
+            }
+        }
+
+        // Now cursor is loaded for the correct page
+        uint32_t local_row = row_id - cursor.cached_start;
+        if (SPC_LIKELY(cursor.is_dense)) {
+            if (data_type == DataType::INT32) {
+                return mema::value_t{cursor.data_ptr[local_row]};
+            } else {
+                return mema::value_t::encode_string(
+                    cursor.page_idx_val, static_cast<int32_t>(local_row));
+            }
+        }
+        if (SPC_UNLIKELY(cursor.is_special)) {
+            return mema::value_t::encode_string(
+                cursor.page_idx_val, mema::value_t::LONG_STRING_OFFSET);
+        }
+        return read_sparse(local_row, data_type, cursor);
     }
 
     /** @brief Fast path: check cursor cache, dispatch to appropriate handler.
@@ -560,8 +682,48 @@ class ColumnarReader {
                                                 static_cast<int32_t>(data_idx));
         }
     }
+
+    /** @brief Load page into cursor for base table access. */
+    inline void load_page_into_cursor_base(const Column &column,
+                                           const PageIndex &page_index,
+                                           size_t page_num, size_t col_idx,
+                                           uint64_t version,
+                                           Cursor &cursor) const {
+        cursor.version = version;
+        cursor.cached_col = col_idx;
+        cursor.cached_page = page_num;
+        cursor.cached_start = page_index.page_start_row(page_num);
+        cursor.cached_end = page_index.cumulative_rows[page_num];
+        cursor.page_idx_val = static_cast<int32_t>(page_num);
+        cursor.col_all_dense = page_index.all_dense;
+
+        auto *page_data = column.pages[page_num]->data;
+        auto num_rows = *reinterpret_cast<const uint16_t *>(page_data);
+        auto num_values = *reinterpret_cast<const uint16_t *>(page_data + 2);
+
+        cursor.is_special = (num_rows == 0xffff);
+        cursor.is_dense = (num_rows == num_values);
+        cursor.data_ptr = reinterpret_cast<const int32_t *>(page_data + 4);
+
+        if (!cursor.is_dense && !cursor.is_special) {
+            size_t bitmap_size = (num_rows + 7) / 8;
+            cursor.bitmap_ptr = reinterpret_cast<const uint8_t *>(
+                page_data + PAGE_SIZE - bitmap_size);
+            cursor.prefix_sum_ptr =
+                page_index.page_prefix_sums[page_num].data();
+        }
+    }
+
     std::vector<PageIndex> build_page_indices;
     std::vector<PageIndex> probe_page_indices;
+
+    // Base table page indices for deferred column resolution.
+    // Index = (table_id << 4) | col_idx, supports 16 tables × 16 cols = 256.
+    static constexpr size_t BASE_TABLE_SHIFT = 4;
+    static constexpr size_t MAX_BASE_TABLE_INDICES = 256;
+    std::array<PageIndex, MAX_BASE_TABLE_INDICES> base_table_indices_;
+    std::array<bool, MAX_BASE_TABLE_INDICES> base_table_prepared_{};
+    uint64_t base_table_version_ = 0;
 };
 } // namespace Contest::io
 
