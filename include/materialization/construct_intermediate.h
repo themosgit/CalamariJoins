@@ -154,12 +154,15 @@ collect_input_columns(const JoinInput &input,
  * @brief Prepare ColumnarReader for intermediate construction.
  *
  * Sets up page indices for columns that need to be read from columnar inputs.
+ * If parent_key_idx is provided, also prepares the join key column for tuple
+ * population.
  */
 inline void prepare_intermediate_columns(
     ColumnarReader &reader, const JoinInput &build_input,
     const JoinInput &probe_input, const AnalyzedJoinNode &join_node,
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
-    size_t build_size, bool build_is_left) {
+    size_t build_size, bool build_is_left,
+    std::optional<size_t> parent_key_idx = std::nullopt) {
 
     bool build_is_columnar = build_input.is_columnar();
     bool probe_is_columnar = probe_input.is_columnar();
@@ -191,6 +194,23 @@ inline void prepare_intermediate_columns(
             } else if (!from_build &&
                        col.child_output_idx < probe_needed.size()) {
                 probe_needed[col.child_output_idx] = 1;
+            }
+        }
+    }
+
+    // If parent needs a join key via tuples, mark that column as needed too
+    // This ensures page indices are prepared for efficient tuple population
+    if (parent_key_idx.has_value()) {
+        for (const auto &col : join_node.columns) {
+            if (col.original_idx == *parent_key_idx) {
+                bool from_build = (col.from_left == build_is_left);
+                if (from_build && col.child_output_idx < build_needed.size()) {
+                    build_needed[col.child_output_idx] = 1;
+                } else if (!from_build &&
+                           col.child_output_idx < probe_needed.size()) {
+                    probe_needed[col.child_output_idx] = 1;
+                }
+                break;
             }
         }
     }
@@ -695,19 +715,22 @@ void populate_join_key_tuples(
         auto range = key_from_build ? buf.left_range() : buf.right_range();
 
         if (key_input.is_columnar()) {
-            // Columnar source - read key from base table, but store OUTPUT IR
-            // index (write_pos) so parent can use it to index into this IR
+            // Columnar source - read key from base table using prepared page
+            // index Store OUTPUT IR index (write_pos) so parent can use it to
+            // index into this IR
             auto *table = std::get<const ColumnarTable *>(key_input.data);
             auto [actual_col_idx, _] = key_input.node->output_attrs[key_attr];
             const Column &col = table->columns[actual_col_idx];
 
+            // Use cursor for efficient sequential/near-sequential access
+            ColumnarReader::Cursor cursor;
             for (uint32_t row_id : range) {
-                // Use read_value_direct_public since page indices may not be
-                // prepared for the join key column (it's stored in tuples,
-                // not as a MATERIALIZE column)
+                // Use read_value with prepared page index (O(1) amortized)
+                // instead of read_value_direct_public (O(n) per read)
                 int32_t key =
                     columnar_reader
-                        .read_value_direct_public(col, row_id, DataType::INT32)
+                        .read_value(col, key_attr, row_id, DataType::INT32,
+                                    cursor, key_from_build)
                         .value;
                 // Store OUTPUT IR index (write_pos), not base table row_id
                 // Parent needs IR index to access other columns in this IR

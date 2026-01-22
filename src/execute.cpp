@@ -213,10 +213,12 @@ JoinResult execute_join_with_mode(
         IntermediateResult result;
         if (total_matches > 0) {
             // Prepare page indices for intermediate construction
+            // Pass parent_join_key_idx so the key column is prepared for tuple
+            // population
             materialize::prepare_intermediate_columns(
                 columnar_reader, build_input, probe_input, join_node,
                 config.remapped_attrs, build_input.output_size(),
-                config.build_left);
+                config.build_left, join_node.parent_join_key_idx);
 
             // Use tuple-based construction if parent needs a join key
             if (join_node.parent_join_key_idx.has_value()) {
