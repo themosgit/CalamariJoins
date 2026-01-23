@@ -12,8 +12,7 @@ on:
 
 jobs:
   build_and_test:
-    runs-on: 
-      group: k23a
+    runs-on: self-hosted
 
     steps:
     - name: Checkout repository code
