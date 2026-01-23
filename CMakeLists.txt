@@ -59,33 +59,6 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     set(SKIP_EXTENSIONS jemalloc)
 endif()
 
-# Detect Xeon E5-2680 v3 CPU for benchmark VM hardware configuration
-# Requires both: correct CPU AND at least 32GB RAM (benchmark VM has 64GB, CI has 4GB)
-set(IS_BENCHMARK_VM_HARDWARE OFF)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/cpuinfo")
-    file(READ "/proc/cpuinfo" CPUINFO_CONTENT)
-    if(CPUINFO_CONTENT MATCHES "E5-2680 v3")
-        # Check available memory to distinguish benchmark VM from CI VM
-        if(EXISTS "/proc/meminfo")
-            file(READ "/proc/meminfo" MEMINFO_CONTENT)
-            string(REGEX MATCH "MemTotal:[ \t]+([0-9]+)" MEM_MATCH "${MEMINFO_CONTENT}")
-            if(MEM_MATCH)
-                set(MEM_TOTAL_KB "${CMAKE_MATCH_1}")
-                math(EXPR MEM_TOTAL_GB "${MEM_TOTAL_KB} / 1024 / 1024")
-                if(MEM_TOTAL_GB GREATER_EQUAL 32)
-                    message(STATUS "Detected Intel Xeon E5-2680 v3 CPU with ${MEM_TOTAL_GB}GB RAM - using benchmark VM hardware configuration")
-                    add_compile_definitions(SPC__USE_BENCHMARKVM_HARDWARE)
-                    set(IS_BENCHMARK_VM_HARDWARE ON)
-                else()
-                    message(STATUS "Detected Intel Xeon E5-2680 v3 CPU but only ${MEM_TOTAL_GB}GB RAM (need >=32GB) - using generic hardware configuration")
-                endif()
-            endif()
-        endif()
-    endif()
-endif()
-
-# Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
-# Try re-running cmake in case changes are not recognized.
 file(GLOB ALL_SRC
     CONFIGURE_DEPENDS
     "src/*.cpp"
@@ -110,13 +83,6 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(faster PRIVATE)
     target_link_libraries(faster PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(faster PRIVATE include)
-
-    if(IS_BENCHMARK_VM_HARDWARE)
-        add_executable(leaderboard ${MANOLATES_SRC} tests/read_sql.cpp)
-        target_compile_definitions(leaderboard PRIVATE)
-        target_link_libraries(leaderboard PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-        target_include_directories(leaderboard PRIVATE include)
-    endif()
 endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
