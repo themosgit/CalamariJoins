@@ -16,7 +16,13 @@
  *
  * @see plan.h, match_collector.h, materialize.h, construct_intermediate.h
  */
+#include <cassert>
 #include <foundation/attribute.h>
+#include <functional>
+#include <ostream>
+#include <queue>
+#include <string>
+#include <utility>
 #if defined(__APPLE__) && defined(__aarch64__)
 #include <platform/hardware_darwin.h>
 #elif defined(SPC__USE_BENCHMARKVM_HARDWARE)
@@ -45,7 +51,6 @@ namespace Contest {
 
 using namespace join;
 
-using materialize::construct_intermediate_from_buffers;
 using materialize::construct_intermediate_with_tuples;
 using materialize::create_empty_intermediate_result;
 using materialize::materialize_from_buffers;
@@ -212,26 +217,15 @@ JoinResult execute_join_with_mode(
         auto inter_start = std::chrono::high_resolution_clock::now();
         IntermediateResult result;
         if (total_matches > 0) {
-            // Prepare page indices for intermediate construction
-            // Pass parent_join_key_idx so the key column is prepared for tuple
-            // population
             materialize::prepare_intermediate_columns(
                 columnar_reader, build_input, probe_input, join_node,
                 config.remapped_attrs, build_input.output_size(),
                 config.build_left, join_node.parent_join_key_idx);
 
-            // Use tuple-based construction if parent needs a join key
-            if (join_node.parent_join_key_idx.has_value()) {
-                construct_intermediate_with_tuples<Mode>(
-                    match_buffers, build_input, probe_input, join_node, config,
-                    config.build_left, *join_node.parent_join_key_idx,
-                    columnar_reader, result, plan);
-            } else {
-                construct_intermediate_from_buffers<Mode>(
-                    match_buffers, build_input, probe_input, join_node,
-                    config.remapped_attrs, build_input.output_size(),
-                    config.build_left, columnar_reader, result, plan);
-            }
+            construct_intermediate_with_tuples<Mode>(
+                match_buffers, build_input, probe_input, join_node, config,
+                config.build_left, *join_node.parent_join_key_idx,
+                columnar_reader, result, plan);
         } else {
             result = create_empty_intermediate_result(join_node);
         }
@@ -357,6 +351,43 @@ JoinResult execute_impl(const AnalyzedPlan &plan, size_t node_idx, bool is_root,
 }
 
 /**
+ *
+ * @brief Prints the plan tree with metadata.
+ *
+ * @param the query plan itself.
+ * @param queue that should contain the root node.
+ *
+ **/
+static std::function<void(const Plan&, std::queue<std::tuple<int, int>>)> 
+print_plan = [](const Plan& plan, std::queue<std::tuple<int, int>> q) {
+    if (q.empty()) return;
+    int initial_size = q.size();
+    for (int i = 0; i < initial_size; i++) {
+        auto [parent_idx, node_idx] = q.front();
+        q.pop();
+        const auto& node = plan.nodes[node_idx];
+        std::cout << "parent: " << parent_idx << ", node: "<< node_idx << " size: "
+            << node.output_attrs.size() << " pairs: { ";
+        for (int i = 0; i < node.output_attrs.size(); i++) {
+            auto [col, type] = node.output_attrs[i];
+            if (DataType::INT32 == type)
+                std::cout << "(" << col << ", INT32)-";
+            else
+                std::cout << "(" << col << ", STR)-";
+        }
+        if (const auto* join = std::get_if<JoinNode>(&node.data)) {
+            std::cout << "left_key: " << join->left_attr;
+            std::cout << " right_key: " << join->right_attr;
+            q.emplace(node_idx ,join->left);
+            q.emplace(node_idx, join->right);
+        }
+        std::cout << "}\n";
+    }
+    std::cout << std::endl << std::endl << std::endl << std::endl ;
+    print_plan(plan, std::move(q));
+};
+
+/**
  * @brief Public entry point: execute plan from root, return ColumnarTable.
  * @param plan Query plan with nodes and base tables.
  * @param context Reserved (unused).
@@ -381,9 +412,13 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
         std::chrono::duration_cast<std::chrono::milliseconds>(analyze_end -
                                                               analyze_start)
             .count();
-
+    /*
     auto result = execute_impl(analyzed_plan, plan.root, true, stats);
     ColumnarTable final_result = std::get<ColumnarTable>(std::move(result));
+    */
+    std::queue<std::tuple<int,int>> q;
+    q.emplace(0, plan.root);
+    print_plan(plan, q);
 
     auto total_end = std::chrono::high_resolution_clock::now();
     auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -417,7 +452,7 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
         *stats_out = stats;
     }
 
-    return std::move(final_result);
+    return ColumnarTable(); 
 }
 
 void *build_context() { return nullptr; }
