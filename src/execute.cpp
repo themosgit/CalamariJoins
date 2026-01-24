@@ -16,6 +16,7 @@
  *
  * @see plan.h, match_collector.h, materialize.h, construct_intermediate.h
  */
+#include "data_model/plan.h"
 #include <cassert>
 #include <foundation/attribute.h>
 #include <functional>
@@ -350,6 +351,7 @@ JoinResult execute_impl(const AnalyzedPlan &plan, size_t node_idx, bool is_root,
     return IntermediateResult{};
 }
 
+
 /**
  *
  * @brief Prints the plan tree with metadata.
@@ -358,34 +360,57 @@ JoinResult execute_impl(const AnalyzedPlan &plan, size_t node_idx, bool is_root,
  * @param queue that should contain the root node.
  *
  **/
-static std::function<void(const Plan&, std::queue<std::tuple<int, int>>)> 
-print_plan = [](const Plan& plan, std::queue<std::tuple<int, int>> q) {
+static std::function<void(const Plan&, std::queue<std::tuple<int, int>>, int)> 
+print_plan = [](const Plan& plan, std::queue<std::tuple<int, int>> q, int table_id) {
     if (q.empty()) return;
     int initial_size = q.size();
     for (int i = 0; i < initial_size; i++) {
-        auto [parent_idx, node_idx] = q.front();
+        auto [node_idx, parent_attr] = q.front();
         q.pop();
         const auto& node = plan.nodes[node_idx];
-        std::cout << "parent: " << parent_idx << ", node: "<< node_idx << " size: "
-            << node.output_attrs.size() << " pairs: { ";
+        if (std::holds_alternative<ScanNode>(node.data)) {
+            continue;
+        }
+        const auto data = std::get<JoinNode>(node.data);
+
+        std::cout << " node: "<< node_idx << " size: "
+            << node.output_attrs.size() << std::endl; 
+
+        bool match_left = false;
+        bool match_right = false;
         for (int i = 0; i < node.output_attrs.size(); i++) {
             auto [col, type] = node.output_attrs[i];
-            if (DataType::INT32 == type)
-                std::cout << "(" << col << ", INT32)-";
-            else
-                std::cout << "(" << col << ", STR)-";
+            if (node_idx != plan.root) {
+                if (i == parent_attr) std::cout << "build->";
+                else std::cout << "defer->";
+            }
+            if (col < plan.nodes[data.left].output_attrs.size()) {
+                std::cout << "left->";
+                match_left = true;
+            } else {
+                std::cout << "right->";
+                match_right = true;
+            }
+            if (DataType::INT32 == type) std::cout << "(" << col << ", INT32)";
+            else std::cout << "(" << col << ", STR)";
+            std::cout << std::endl;
+
         }
-        if (const auto* join = std::get_if<JoinNode>(&node.data)) {
-            std::cout << "left_key: " << join->left_attr;
-            std::cout << " right_key: " << join->right_attr;
-            q.emplace(node_idx ,join->left);
-            q.emplace(node_idx, join->right);
-        }
-        std::cout << "}\n";
+        std::cout << "====";
+        if (match_left && match_right) std::cout << "Match both";
+        else if (match_left) std::cout << "Match left";
+        else std::cout << "Match right";
+        std::cout << "====" << std::endl;
+
+        std::cout << "left_key: " << data.left_attr << " left child: " << data.left;
+        std::cout << "\nright_key: " << data.right_attr << " right child: " << data.right;
+        q.emplace(data.left, data.left_attr);
+        q.emplace(data.right, data.right_attr);
+        std::cout << "\n\n\n\n\n";
     }
-    std::cout << std::endl << std::endl << std::endl << std::endl ;
     print_plan(plan, std::move(q));
 };
+
 
 /**
  * @brief Public entry point: execute plan from root, return ColumnarTable.
@@ -416,8 +441,8 @@ ColumnarTable execute(const Plan &plan, void *context, TimingStats *stats_out,
     auto result = execute_impl(analyzed_plan, plan.root, true, stats);
     ColumnarTable final_result = std::get<ColumnarTable>(std::move(result));
     */
-    std::queue<std::tuple<int,int>> q;
-    q.emplace(0, plan.root);
+    std::queue<std::tuple<int, int>> q;
+    q.emplace(plan.root, 0);
     print_plan(plan, q);
 
     auto total_end = std::chrono::high_resolution_clock::now();

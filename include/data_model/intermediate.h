@@ -55,6 +55,7 @@ struct alignas(8) KeyRowPair {
 };
 
 /**
+ *
  * @brief Column of (key, row_id) tuples for join key storage.
  *
  * Enables accelerated hashtable build (tuples match internal format) and
@@ -62,7 +63,8 @@ struct alignas(8) KeyRowPair {
  * separate column_t for join key columns.
  *
  * Memory layout: 16KB pages containing 2048 KeyRowPair entries each.
- */
+ *
+ **/
 struct key_row_column_t {
     static constexpr size_t PAGE_SIZE = 1 << 14; // 16KB
     static constexpr size_t PAIRS_PER_PAGE =
