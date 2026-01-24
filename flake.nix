@@ -23,19 +23,19 @@
           buildInputs = with pkgs; [
             llvmPackages.libcxxClang
             llvmPackages.libllvm
+            ccache
             doxygen
             curl
             git
             cmake
             typst
           ] ++ lib.optionals (system == "x86_64-linux") [
-            linuxPackages.perf
+            perf
             gef
           ];
           shellHook = ''
             CLANGD_FILE=".clangd"
             CPP_STANDARD="c++20"
-
             echo "Generating $CLANGD_FILE from \$ clang++ -v output..."
 
             INCLUDE_PATHS=$(
@@ -57,9 +57,10 @@
                 echo "    - -I$CLEAN_PATH" >> $CLANGD_FILE
             done <<< "$INCLUDE_PATHS"
 
-            echo "    - -O2" >> $CLANGD_FILE
-
-            echo "Generation of $CLANGD_FILE complete."                
+            echo "exporting ccache paths..."
+            export CCACHE_DIR="$PWD/.ccache"
+            export PATH="${pkgs.ccache}/bin:$PATH"
+            echo "done."
 
             if command -v fish &> /dev/null; then
                 exec fish

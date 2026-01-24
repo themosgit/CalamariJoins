@@ -12,6 +12,8 @@
 /docs/html
 /docs/xml
 .clangd
+.cache
+.ccache
 compile_commands.json
 /env/
 script.py
