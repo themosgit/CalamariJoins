@@ -7,24 +7,40 @@ on:
   pull_request:
     branches:
       - main
-
-  workflow_dispatch:
-
 jobs:
   build_and_test:
-    runs-on: 
-      group: k23a
+    runs-on: self-hosted
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
     - name: Checkout repository code
       uses: actions/checkout@v4
+
+    - name: Setup cache
+      uses: actions/cache@v4
+      with:
+        path: .ccache
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
       
     - name: Configure initial build with CMake
       run: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
+        nix develop -c \
+        cmake -S . -B build -Wno-dev \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build all targets
-      run: cmake --build build -- -j $(nproc) unit_tests
+      run: |
+        nix develop -c \
+        cmake --build build -- -j $(nproc) unit_tests
 
     - name: Run unit tests
       run: ./build/unit_tests
+
+    - name: Cache stats
+      run: nix develop -c ccache -s
