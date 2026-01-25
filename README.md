@@ -2,9 +2,9 @@
 
 [Visit the project website](https://manolates.gl4dos.com)
 
-# SIGMOD Contest 2025
+## SIGMOD Contest 2025
 
-## Task
+### Task
 
 Given the joining pipeline and the pre-filtered input data, your task is to implement an efficient joining algorithm to accelerate the execution time of the joining pipeline. Specifically, you need to implement the following function in `src/execute.cpp`:
 
@@ -101,7 +101,7 @@ A `ColumnarTable` first stores how many rows the table has in the `num_rows` mem
 
 **Long string**: When the length of a string is longer than `PAGE_SIZE - 7`, it can not fit in a normal page. Special pages will be used to store such string. If $n_r$ `== 0xffff` or $n_r$ `== 0xfffe`, the `Page` is a special page for long string. `0xffff` means the page is the first page of a long string and `0xfffe` means the page is the following page of a long string. The following 2 bytes is a `uint16_t` indicating the number of chars in the page, beginning at `data + 4`.
 
-## Requirement
+### Requirement
 
 - You can only modify the file `src/execute.cpp` in the project.
 - You must not use any third-party libraries. If you are using libraries for development (e.g., for logging), ensure to remove them before the final submission.
@@ -109,7 +109,7 @@ A `ColumnarTable` first stores how many rows the table has in the `num_rows` mem
 - For any struct listed above, all of there members are public. You can manipulate them in free functions as desired as long as the original files are not changed and the manipulated objects can be destructed properly.
 - Your program will be evaluated on an unpublished benchmark sampled from the original JOB benchmark. You will not be able to access the test benchmark.
 
-## Quick start
+### Quick start
 
 Create the cash containing the join tables and
 result of each query and mmap them for faster loading times and getting rid of duckdb.
