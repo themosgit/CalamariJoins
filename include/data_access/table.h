@@ -1,11 +1,3 @@
-/**
- * @file table.h
- * @brief Row-oriented Table and format conversions.
- *
- * Table: row-major vector<vector<Data>>. DumpTable: binary cache (TableMeta +
- * pages). @see ColumnarTable, CSVParser
- */
-
 #pragma once
 
 #include <filesystem>
@@ -20,14 +12,10 @@
 #include <duckdb.hpp>
 #endif
 
-/** @namespace FNVHash @brief FNV-1a hash: XOR-then-multiply. @see Contest::FNVHash in hashtable.h for typed overloads. */
 namespace FNVHash {
-/// FNV-1a prime multiplier for 64-bit hashes.
 constexpr uint64_t FNV_prime = 1099511628211u;
-/// FNV-1a initial hash value (offset basis).
 constexpr uint64_t offset_basis = 14695981039346656037u;
 
-/** @brief Compute FNV-1a hash of byte sequence. */
 inline uint64_t hash(const void *key, size_t len) {
     uint64_t h = offset_basis;
     const unsigned char *p = static_cast<const unsigned char *>(key);
@@ -39,73 +27,42 @@ inline uint64_t hash(const void *key, size_t len) {
 }
 }; // namespace FNVHash
 
-/** @struct TableMeta @brief Binary cache header (padded to PAGE_SIZE). Max 16 columns. */
 struct TableMeta {
-    uint64_t num_rows;      ///< Total number of rows in the table.
-    uint64_t num_cols;      ///< Number of columns (max 16).
-    DataType types[16];     ///< Data type for each column.
-    uint64_t num_pages[16]; ///< Number of pages per column.
+    uint64_t num_rows;
+    uint64_t num_cols;
+    DataType types[16];
+    uint64_t num_pages[16];
 };
 
-/// Padding size to align TableMeta to PAGE_SIZE boundary.
 #define FILLER_SIZE (PAGE_SIZE - sizeof(struct TableMeta))
 
-/**
- * @class Table
- * @brief Row-oriented table: vector<vector<Data>>. For result output and format conversion.
- * @see ColumnarTable, DumpTable
- */
 struct Table {
   public:
     Table() = default;
 
-    /** @brief Construct from row-major data and column types. */
     Table(std::vector<std::vector<Data>> data, std::vector<DataType> types)
         : types_(types), data_(data) {}
 
-    /** @brief Load ColumnarTable from binary cache. @see DumpTable::dump() */
     static ColumnarTable from_cache(const std::filesystem::path &path);
 
-    /** @brief Parse CSV to ColumnarTable with optional filter. @see CSVParser */
     static ColumnarTable from_csv(const std::vector<Attribute> &attributes,
                                   const std::filesystem::path &path,
                                   Statement *filter, bool header = false);
 
-    /** @brief Convert ColumnarTable to row-oriented Table. */
     static Table from_columnar(const ColumnarTable &input);
 
-    /** @brief Extract selected columns as row data (projection during scan). */
     static std::vector<std::vector<Data>>
     copy_scan(const ColumnarTable &table,
               const std::vector<std::tuple<size_t, DataType>> &output_attrs);
 
-    /**
-     * @brief Convert this row-oriented table to columnar format.
-     * @return ColumnarTable with the same data.
-     */
     ColumnarTable to_columnar() const;
 
-    /// @name Accessors
-    /// @{
-
-    /// Get read-only access to row data.
     const std::vector<std::vector<Data>> &table() const { return data_; }
-
-    /// Get mutable access to row data.
     std::vector<std::vector<Data>> &table() { return data_; }
-
-    /// Get column types.
     const std::vector<DataType> &types() const { return types_; }
-
-    /// Get number of rows.
     size_t number_rows() const { return this->data_.size(); }
-
-    /// Get number of columns.
     size_t number_cols() const { return this->types_.size(); }
 
-    /// @}
-
-    /** @brief Print pipe-delimited rows. NULL → "NULL", strings quoted, escapes handled. */
     static void print(const std::vector<std::vector<Data>> &data) {
         namespace views = ranges::views;
 
@@ -165,10 +122,9 @@ struct Table {
     }
 
   private:
-    std::vector<DataType> types_;         ///< Column types in order.
-    std::vector<std::vector<Data>> data_; ///< Row-major table data.
+    std::vector<DataType> types_;
+    std::vector<std::vector<Data>> data_;
 
-    /** @brief Set column types from attribute list. */
     void set_attributes(const std::vector<Attribute> &attributes) {
         this->types_.clear();
         for (auto &attr : attributes) {
@@ -177,18 +133,12 @@ struct Table {
     }
 };
 
-/**
- * @class DumpTable
- * @brief Serialize tables to binary cache. Format: TableMeta + padding + column pages.
- * @see Table::from_cache()
- */
 class DumpTable {
   private:
-    TableMeta tablemeta = {0}; ///< Metadata to write at file start.
-    ColumnarTable *table;      ///< Table to serialize (owned externally).
+    TableMeta tablemeta = {0};
+    ColumnarTable *table;
 
   public:
-    /** @brief Construct from ColumnarTable. Table must remain valid until dump(). */
     DumpTable(ColumnarTable *table) : table(table) {
         tablemeta.num_rows = table->num_rows;
         tablemeta.num_cols = table->columns.size();
@@ -198,7 +148,6 @@ class DumpTable {
         }
     }
 #ifdef TEAMOPT_USE_DUCKDB
-    /** @brief Construct from DuckDB results. Sorts rows. INT32/VARCHAR only. Requires TEAMOPT_USE_DUCKDB. */
     DumpTable(duckdb::MaterializedQueryResult &duckdb_results) {
         std::vector<std::vector<Data>> data;
         std::vector<DataType> types;
@@ -256,7 +205,6 @@ class DumpTable {
     }
 #endif
 
-    /** @brief Write binary cache: metadata + padding + column pages. Stream must be binary mode. */
     void dump(std::ostream &out) {
         out.write(reinterpret_cast<const char *>(&tablemeta),
                   sizeof(struct TableMeta));

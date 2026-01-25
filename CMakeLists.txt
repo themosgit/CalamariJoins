@@ -54,40 +54,18 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(fmtlib)
 
+FetchContent_Declare(
+    duckdb
+    URL https://github.com/duckdb/duckdb/archive/refs/tags/v1.2.1.tar.gz
+)
 set(ENABLE_SANITIZER OFF)
 set(ENABLE_UBSAN OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc|powerpc|ppc64|ppc64le")
     message("Disabling jemalloc extension of DuckDB on Power.")
     set(SKIP_EXTENSIONS jemalloc)
 endif()
+FetchContent_MakeAvailable(duckdb)
 
-# Detect Xeon E5-2680 v3 CPU for benchmark VM hardware configuration
-# Requires both: correct CPU AND at least 32GB RAM (benchmark VM has 64GB, CI has 4GB)
-set(IS_BENCHMARK_VM_HARDWARE OFF)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/proc/cpuinfo")
-    file(READ "/proc/cpuinfo" CPUINFO_CONTENT)
-    if(CPUINFO_CONTENT MATCHES "E5-2680 v3")
-        # Check available memory to distinguish benchmark VM from CI VM
-        if(EXISTS "/proc/meminfo")
-            file(READ "/proc/meminfo" MEMINFO_CONTENT)
-            string(REGEX MATCH "MemTotal:[ \t]+([0-9]+)" MEM_MATCH "${MEMINFO_CONTENT}")
-            if(MEM_MATCH)
-                set(MEM_TOTAL_KB "${CMAKE_MATCH_1}")
-                math(EXPR MEM_TOTAL_GB "${MEM_TOTAL_KB} / 1024 / 1024")
-                if(MEM_TOTAL_GB GREATER_EQUAL 32)
-                    message(STATUS "Detected Intel Xeon E5-2680 v3 CPU with ${MEM_TOTAL_GB}GB RAM - using benchmark VM hardware configuration")
-                    add_compile_definitions(SPC__USE_BENCHMARKVM_HARDWARE)
-                    set(IS_BENCHMARK_VM_HARDWARE ON)
-                else()
-                    message(STATUS "Detected Intel Xeon E5-2680 v3 CPU but only ${MEM_TOTAL_GB}GB RAM (need >=32GB) - using generic hardware configuration")
-                endif()
-            endif()
-        endif()
-    endif()
-endif()
-
-# Include all sources from /src directory. CONFIGURE_DEPENDS can be unreliable.
-# Try re-running cmake in case changes are not recognized.
 file(GLOB ALL_SRC
     CONFIGURE_DEPENDS
     "src/*.cpp"
@@ -100,7 +78,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
     add_compile_options(-O3 -mcpu=apple-m1 -flto)
 else()
-    add_compile_options(-O3 -march=native -m64 -mcrc32 -fpermissive -flto)
+    add_compile_options(-O3 -march=skylake -m64 -mcrc32 -fpermissive -flto)
 endif()
 
 add_link_options(-flto)
@@ -113,18 +91,16 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(faster PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
     target_include_directories(faster PRIVATE include)
 
-    if(IS_BENCHMARK_VM_HARDWARE)
-        add_executable(leaderboard ${MANOLATES_SRC} tests/read_sql.cpp)
-        target_compile_definitions(leaderboard PRIVATE)
-        target_link_libraries(leaderboard PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-        target_include_directories(leaderboard PRIVATE include)
-    endif()
+    add_executable(build_cache ${MANOLATES_SRC} tests/read_sql.cpp)
+    target_link_libraries(build_cache PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
+    target_compile_definitions(build_cache PRIVATE TEAMOPT_USE_DUCKDB TEAMOPT_BUILD_CACHE)
+    target_include_directories(build_cache PRIVATE include)
 endif()
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
     target_compile_options(unit_tests PRIVATE -O3 -mcpu=apple-m1 -flto)
 else()
-    target_compile_options(unit_tests PRIVATE -O3 -march=native -m64 -fpermissive -flto)
+    target_compile_options(unit_tests PRIVATE -O3 -march=skylake -m64 -fpermissive -flto)
 endif()
 
 target_compile_definitions(unit_tests PRIVATE)

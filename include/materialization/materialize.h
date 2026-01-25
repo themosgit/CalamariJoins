@@ -1,10 +1,12 @@
 /**
+ *
  * @file materialize.h
  * @brief Materialization of join results into ColumnarTable format.
  *
  * Parallel materialization using per-thread page builders and mmap allocation.
  * Templated on MatchCollectionMode for zero-overhead mode selection.
- */
+ *
+ **/
 #pragma once
 
 #include <algorithm>
@@ -17,11 +19,11 @@
 #include <join_execution/match_collector.h>
 #include <materialization/construct_intermediate.h>
 #include <materialization/page_builders.h>
+#include <platform/arena.h>
 #include <platform/worker_pool.h>
-#include <sys/mman.h>
 #include <vector>
 
-/** @namespace Contest::materialize @brief Join result materialization. */
+/* @namespace Contest::materialize @brief Join result materialization. */
 namespace Contest::materialize {
 
 using Contest::ExecuteResult;
@@ -33,8 +35,29 @@ using Contest::join::ThreadLocalMatchBuffer;
 using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
-/** @brief Creates empty ColumnarTable with correct column types for zero-match
- * case. */
+/**
+ * @brief Kolpo no-op MappedMemory for arena-allocated pages.
+ *
+ * Points to nullptr with length 0, so munmap is a no-op.
+ * Heap-allocated with high initial ref count to prevent deletion.
+ *
+ **/
+inline MappedMemory *get_arena_mapped_memory() {
+    static MappedMemory *instance = []() {
+        auto *p = new MappedMemory(nullptr, 0);
+        /* high ref count to prevent destruction */
+        p->refs = 1000000;
+        return p;
+    }();
+    return instance;
+}
+
+/** 
+ *
+ * @brief Creates empty ColumnarTable with correct column types
+ * for zero-match case.
+ *
+ **/
 inline ColumnarTable create_empty_result(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs) {
     ColumnarTable empty_result;
@@ -46,8 +69,9 @@ inline ColumnarTable create_empty_result(
 }
 
 /**
- * @brief Parallel materialization of a single output column from thread-local
- * buffers.
+ *
+ * @brief Parallel materialization of a single output column,
+ * from thread-local buffers.
  *
  * Each thread processes its own buffer directly without merge overhead.
  *
@@ -55,9 +79,9 @@ inline ColumnarTable create_empty_result(
  * @tparam BuilderType     Int32PageBuilder or VarcharPageBuilder.
  * @tparam ReaderFunc      Callable: (row_id, cursor) -> value_t.
  * @tparam InitBuilderFunc Callable: (page_allocator) -> BuilderType.
- * @param est_bytes_per_row Average bytes per row (4 for INT32, ~35 for
- * VARCHAR).
- */
+ * @param est_bytes_per_row Average bytes per row (4 for INT32, ~35 VARCHAR).
+ *
+ **/
 template <MatchCollectionMode Mode, typename BuilderType, typename ReaderFunc,
           typename InitBuilderFunc>
 inline void materialize_column_from_buffers(
@@ -75,19 +99,14 @@ inline void materialize_column_from_buffers(
     size_t rows_per_page = std::max(1ul, usable_per_page / est_bytes_per_row);
     size_t pages_per_thread =
         (matches_per_thread + rows_per_page - 1) / rows_per_page + 10;
-    size_t total_pages = pages_per_thread * num_threads;
-
-    void *page_memory =
-        mmap(nullptr, total_pages * PAGE_SIZE, PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page_memory == MAP_FAILED)
-        throw std::bad_alloc();
 
     std::vector<Column> thread_columns;
     thread_columns.reserve(num_threads);
     for (int i = 0; i < num_threads; ++i) {
         thread_columns.emplace_back(dest_col.type);
     }
+
+    std::vector<char *> thread_page_memory(num_threads, nullptr);
 
     worker_pool().execute([&](size_t t) {
         if (t >= buffers.size())
@@ -97,23 +116,24 @@ inline void materialize_column_from_buffers(
         if (my_count == 0)
             return;
 
-        Column &local_col = thread_columns[t];
+        auto &arena = platform::get_arena(t);
+        size_t alloc_size = pages_per_thread * PAGE_SIZE;
+        thread_page_memory[t] =
+            static_cast<char *>(arena.alloc(alloc_size, PAGE_SIZE));
 
-        size_t thread_page_start = t * pages_per_thread;
-        size_t thread_page_limit = pages_per_thread;
+        Column &local_col = thread_columns[t];
         size_t used_pages = 0;
 
         ColumnarReader::Cursor cursor;
 
         auto page_allocator = [&]() -> Page * {
             Page *p;
-            if (used_pages < thread_page_limit) {
-                p = reinterpret_cast<Page *>(static_cast<char *>(page_memory) +
-                                             (thread_page_start + used_pages) *
-                                                 PAGE_SIZE);
+            if (used_pages < pages_per_thread) {
+                p = reinterpret_cast<Page *>(thread_page_memory[t] +
+                                             used_pages * PAGE_SIZE);
                 used_pages++;
             } else {
-                p = new Page();
+                p = static_cast<Page *>(arena.alloc(PAGE_SIZE, PAGE_SIZE));
             }
             local_col.pages.push_back(p);
             return p;
@@ -156,21 +176,29 @@ inline void materialize_column_from_buffers(
         }
         thread_col.pages.clear();
     }
-
-    auto *mapped_mem = new MappedMemory(page_memory, total_pages * PAGE_SIZE);
-    dest_col.assign_mapped_memory(mapped_mem);
+    /**
+     *
+     * Use shared no-op MappedMemory
+     * to prevent Column destructor from deleting pages
+     *
+     **/
+    dest_col.assign_mapped_memory(get_arena_mapped_memory());
 }
 
 /**
+ *
  * @brief Materializes a single output column from thread-local buffers.
  *
- * Dispatcher that determines source location (columnar/intermediate,
- * build/probe), selects page builder type, and invokes
- * materialize_column_from_buffers<>. VARCHAR handling requires source Column
+ * Dispatcher that determines source location:
+ * (columnar/intermediate, build/probe) -> selects page builder type
+ * and invokes materialize_column_from_buffers<>.
+ *
+ * VARCHAR handling requires source Column
  * pointer for string dereferencing.
  *
  * @tparam Mode Collection mode for compile-time specialization.
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline void materialize_single_column_from_buffers(
     Column &dest_col, size_t col_idx, size_t build_size,
@@ -236,6 +264,7 @@ inline void materialize_single_column_from_buffers(
 }
 
 /**
+ *
  * @brief Materializes all output columns from thread-local buffers into
  * ColumnarTable.
  *
@@ -255,7 +284,8 @@ inline void materialize_single_column_from_buffers(
  *
  * @see construct_intermediate.h for creating intermediate ExecuteResult.
  * @see page_builders.h for Int32PageBuilder and VarcharPageBuilder.
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline ColumnarTable materialize_from_buffers(
     std::vector<ThreadLocalMatchBuffer<Mode>> &buffers,
@@ -264,7 +294,6 @@ inline ColumnarTable materialize_from_buffers(
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, const Plan &plan) {
 
-    // Compute total_matches
     size_t total_matches = 0;
     for (const auto &buf : buffers) {
         total_matches += buf.count();

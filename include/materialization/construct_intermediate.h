@@ -1,10 +1,12 @@
 /**
+ *
  * @file construct_intermediate.h
  * @brief Constructs intermediate results for multi-way joins.
  *
  * Allocates and populates ExecuteResult (column_t) from match collectors.
  * Templated on MatchCollectionMode for zero-overhead mode selection.
- */
+ *
+ **/
 #pragma once
 
 #include <data_access/columnar_reader.h>
@@ -16,11 +18,13 @@
 #include <platform/worker_pool.h>
 #include <vector>
 /**
+ *
  * @namespace Contest::materialize
  * @brief Materialization of join results into columnar format.
  *
  * @see intermediate.h for column_t/value_t format details.
- */
+ *
+ **/
 namespace Contest::materialize {
 
 using Contest::ExecuteResult;
@@ -32,13 +36,15 @@ using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 /**
+ *
  * @brief Precomputed metadata for resolving an output column's source.
  *
  * Avoids per-value std::variant accesses and tuple lookups in hot loop.
  * 8-byte alignment optimizes struct packing for vector iteration.
  *
  * @see prepare_sources() for precomputation logic.
- */
+ *
+ **/
 struct alignas(8) SourceInfo {
     const mema::column_t *intermediate_col =
         nullptr;                          /**< Source if intermediate. */
@@ -49,6 +55,7 @@ struct alignas(8) SourceInfo {
 };
 
 /**
+ *
  * @brief Builds SourceInfo for each output column for fast hot-loop lookup.
  *
  * @param remapped_attrs Output column specifications (global indexing).
@@ -61,6 +68,7 @@ struct alignas(8) SourceInfo {
  *
  * @see SourceInfo for field documentation.
  * @see construct_intermediate() for consumption in hot loop.
+ *
  */
 inline std::vector<SourceInfo>
 prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
@@ -94,9 +102,10 @@ prepare_sources(const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
 /**
  * @brief Constructs intermediate results directly from thread-local buffers.
  *
- * Each thread iterates its own buffer, avoiding the merge step. Total matches
- * computed by summing buffer counts. Each thread writes its contiguous portion
- * of output pages.
+ * Each thread iterates its own buffer, avoiding the merge step.
+ * Total matches computed by summing buffer counts.
+ *
+ * Each thread writes its contiguous portion of output pages.
  *
  * @tparam Mode            Collection mode for compile-time specialization.
  * @param buffers          Vector of ThreadLocalMatchBuffer from probe.
@@ -117,7 +126,6 @@ inline void construct_intermediate_from_buffers(
     const PlanNode &build_node, const PlanNode &probe_node, size_t build_size,
     ColumnarReader &columnar_reader, ExecuteResult &results) {
 
-    // Compute total matches and per-buffer start offsets
     size_t total_matches = 0;
     std::vector<size_t> buffer_starts(buffers.size());
     for (size_t i = 0; i < buffers.size(); ++i) {
@@ -134,7 +142,6 @@ inline void construct_intermediate_from_buffers(
     const size_t num_threads = THREAD_COUNT;
     const size_t num_cols = sources.size();
 
-    // Pre-size page vectors for each column
     using Page = mema::column_t::Page;
     size_t total_pages_needed =
         (total_matches + mema::CAP_PER_PAGE - 1) / mema::CAP_PER_PAGE;
@@ -145,7 +152,6 @@ inline void construct_intermediate_from_buffers(
         col.set_row_count(total_matches);
     }
 
-    // Parallel page allocation - each thread allocates its own pages
     worker_pool().execute([&](size_t t) {
         for (size_t c = 0; c < num_cols; ++c) {
             auto &col = results[c];
@@ -158,7 +164,6 @@ inline void construct_intermediate_from_buffers(
         }
     });
 
-    // Parallel: each thread processes its own buffer
     worker_pool().execute([&](size_t t) {
         if (t >= buffers.size())
             return;
@@ -213,5 +218,4 @@ inline void construct_intermediate_from_buffers(
         }
     });
 }
-
 } // namespace Contest::materialize

@@ -1,13 +1,16 @@
 /**
+ *
  * @file columnar_reader.h
- * @brief Columnar random access: O(log P) PageIndex + O(1) cursor caching.
+ * @brief ColumnarTable random access: O(log P) PageIndex + O(1) cursor caching.
  *
  * Dense/sparse pages, long strings. Version counters invalidate cursors on
- * prepare_build/probe. @see PageIndex, Cursor
- */
+ * prepare. @see PageIndex, Cursor
+ *
+ **/
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -18,57 +21,69 @@
 #include <platform/arena_vector.h>
 #include <vector>
 
-/** @brief Branch prediction hint for likely paths. */
+/* @brief Branch prediction hint for likely paths. */
 #define SPC_LIKELY(x) __builtin_expect(!!(x), 1)
-/** @brief Branch prediction hint for unlikely paths. */
+/* @brief Branch prediction hint for unlikely paths. */
 #define SPC_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 /**
+ *
  * @namespace Contest::io
  * @brief Columnar I/O: ColumnarReader (cursor caching) + PageIndex (O(log P)
  * lookup).
  * @see Plan, mema
- */
+ *
+ **/
 namespace Contest::io {
 
-inline std::atomic<uint64_t> global_build_version{0};
-inline std::atomic<uint64_t> global_probe_version{0};
+/* @brief Build/probe side indicator for index selection. */
+enum class Side : uint8_t { BUILD = 0, PROBE = 1 };
 
-/** @brief Pre-computed page index for O(log P) row lookup in ColumnarTable. */
+/* @brief Global version counter - incremented on any prepare call. */
+inline std::atomic<uint64_t> global_version{0};
+
+/* @brief Pre-computed page index for O(log P) row lookup in ColumnarTable. */
 struct alignas(8) PageIndex {
-    /** Cumulative row counts: upper_bound(row_id) yields containing page. */
+    /* Cumulative row counts: upper_bound(row_id) yields containing page. */
     platform::ArenaVector<uint32_t> cumulative_rows;
 
-    /** Per-page prefix sums of bitmap popcount for sparse pages.
-     * O(1) value index: prefix_sum[chunk] + popcount(word & mask). Empty for
-     * dense. */
+    /**
+     *
+     * Per-page prefix sums of bitmap popcount for sparse pages.
+     * O(1) value index: prefix_sum[chunk] + popcount(word & mask).
+     * Empty for dense.
+     *
+     **/
     std::vector<platform::ArenaVector<uint32_t>> page_prefix_sums;
 
-    /** All pages dense (no NULLs) → skip bitmap checks. */
+    /* All pages dense (no NULLs) → skip bitmap checks. */
     bool all_dense = true;
 
-    /** Dense INT32 optimization: all pages dense AND column is INT32.
-     * Enables O(1) arithmetic-based page lookup instead of binary search. */
+    /**
+     *
+     * Dense INT32 optimization: all pages dense AND column is INT32.
+     * Enables O(1) arithmetic-based page lookup instead of binary search.
+     *
+     **/
     bool is_dense_int32 = false;
 
-    /** Rows per full page for dense INT32 columns (last page may have fewer).
-     */
+    /* Rows per full page for dense INT32 columns (last page may have fewer). */
     uint16_t rows_per_full_page = 0;
 
-    /** Direct pointer to pages vector for O(1) dense INT32 access. */
+    /* Direct pointer to pages vector for O(1) dense INT32 access. */
     std::vector<Page *> const *pages_ptr = nullptr;
 
-    /** Arena for allocation. */
+    /* Arena for allocation. */
     platform::ThreadArena *arena_ = nullptr;
 
-    /** Default constructor - must call set_arena before build(). */
+    /* Default constructor - must call set_arena before build(). */
     PageIndex() = default;
 
-    /** Constructor with arena. */
+    /* Constructor with arena. */
     explicit PageIndex(platform::ThreadArena &arena)
         : cumulative_rows(arena), arena_(&arena) {}
 
-    /** Move constructor. */
+    /* Move constructor. */
     PageIndex(PageIndex &&other) noexcept
         : cumulative_rows(std::move(other.cumulative_rows)),
           page_prefix_sums(std::move(other.page_prefix_sums)),
@@ -76,7 +91,7 @@ struct alignas(8) PageIndex {
           rows_per_full_page(other.rows_per_full_page),
           pages_ptr(other.pages_ptr), arena_(other.arena_) {}
 
-    /** Move assignment. */
+    /* Move assignment. */
     PageIndex &operator=(PageIndex &&other) noexcept {
         if (this != &other) {
             cumulative_rows = std::move(other.cumulative_rows);
@@ -90,16 +105,18 @@ struct alignas(8) PageIndex {
         return *this;
     }
 
-    /** Deleted copy operations. */
+    /* Deleted copy operations. */
     PageIndex(const PageIndex &) = delete;
     PageIndex &operator=(const PageIndex &) = delete;
 
     /**
+     *
      * @brief Builds page index for a column, computing cumulative row counts.
      *
      * For INT32 columns where all pages are dense (num_rows == num_values),
      * enables O(1) arithmetic-based page lookup instead of binary search.
-     */
+     *
+     **/
     inline void build(const Column &column) {
         uint32_t total = 0;
         cumulative_rows.reserve(column.pages.size());
@@ -183,33 +200,45 @@ struct alignas(8) PageIndex {
         }
     }
 
-    /** @brief Finds the page containing row_id via binary search. */
+    /* @brief Finds the page containing row_id via binary search. */
     inline size_t find_page(uint32_t row_id) const {
         auto it = std::upper_bound(cumulative_rows.begin(),
                                    cumulative_rows.end(), row_id);
         return static_cast<size_t>(it - cumulative_rows.begin());
     }
 
-    /** @brief Returns the starting row number for a given page. */
+    /* @brief Returns the starting row number for a given page. */
     inline uint32_t page_start_row(size_t page_num) const {
         return page_num == 0 ? 0 : cumulative_rows[page_num - 1];
     }
 };
 
-/** @brief Random access reader: O(log P) page lookup + O(1) cursor caching.
- * Separate build/probe indices. */
+/**
+ *
+ * @brief Random access reader:
+ * O(log P) page lookup,
+ * O(1) cursor caching.
+ * Unified build/probe indices via Side enum.
+ *
+ **/
 class ColumnarReader {
   public:
     ColumnarReader() = default;
 
-    /** @brief Cache-aligned cursor: caches page metadata for O(1) sequential
-     * access. Thread-local. */
+    /**
+     *
+     * @brief Cache-aligned cursor:
+     * caches page metadata for O(1) sequential access.
+     * Thread-local.
+     *
+     **/
     struct alignas(64) Cursor {
         uint64_t version = 0;
         size_t cached_col = ~0u;
         uint32_t cached_start = 0;
         uint32_t cached_end = 0;
         size_t cached_page = ~0u;
+        Side cached_side = Side::BUILD;
 
         const int32_t *data_ptr = nullptr;
         const uint8_t *bitmap_ptr = nullptr;
@@ -224,74 +253,69 @@ class ColumnarReader {
         uint8_t _padding = 0;
     };
 
-    /** @brief Build page indices for build-side columns. Increments
-     * global_build_version to invalidate cursors. */
+    /**
+     *
+     * @brief Build page indices for specified side.
+     * Increments global_version to invalidate all cursors.
+     *
+     **/
+    inline void
+    prepare(Side side, const platform::ArenaVector<const Column *> &columns) {
+        auto &arena = platform::get_arena(0);
+        auto &indices = page_indices_[static_cast<size_t>(side)];
+        indices.clear();
+        indices.reserve(columns.size());
+        for (size_t i = 0; i < columns.size(); ++i) {
+            const auto *column = columns[i];
+            if (column) {
+                PageIndex page_idx(arena);
+                page_idx.build(*column);
+                indices.push_back(std::move(page_idx));
+            } else {
+                PageIndex empty_idx(arena);
+                indices.push_back(std::move(empty_idx));
+            }
+        }
+        global_version.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /* @brief Convenience: prepare build side. */
     inline void
     prepare_build(const platform::ArenaVector<const Column *> &columns) {
-        auto &arena = platform::get_arena(0);
-        build_page_indices.clear();
-        build_page_indices.reserve(columns.size());
-        for (size_t i = 0; i < columns.size(); ++i) {
-            const auto *column = columns[i];
-            if (column) {
-                PageIndex page_idx(arena);
-                page_idx.build(*column);
-                build_page_indices.push_back(std::move(page_idx));
-            } else {
-                PageIndex empty_idx(arena);
-                build_page_indices.push_back(std::move(empty_idx));
-            }
-        }
-        global_build_version.fetch_add(1, std::memory_order_relaxed);
+        prepare(Side::BUILD, columns);
     }
 
-    /** @brief Build page indices for probe-side columns. Increments
-     * global_probe_version to invalidate cursors. */
+    /* @brief Convenience: prepare probe side. */
     inline void
     prepare_probe(const platform::ArenaVector<const Column *> &columns) {
-        auto &arena = platform::get_arena(0);
-        probe_page_indices.clear();
-        probe_page_indices.reserve(columns.size());
-        for (size_t i = 0; i < columns.size(); ++i) {
-            const auto *column = columns[i];
-            if (column) {
-                PageIndex page_idx(arena);
-                page_idx.build(*column);
-                probe_page_indices.push_back(std::move(page_idx));
-            } else {
-                PageIndex empty_idx(arena);
-                probe_page_indices.push_back(std::move(empty_idx));
-            }
-        }
-        global_probe_version.fetch_add(1, std::memory_order_relaxed);
+        prepare(Side::PROBE, columns);
     }
 
-    /** @brief Fast path: check cursor cache, dispatch to appropriate handler.
-     */
-    template <bool IsBuild>
-    inline mema::value_t
-    read_value_internal(const Column &column, size_t col_idx, uint32_t row_id,
-                        DataType data_type, Cursor &cursor) const {
+    /**
+     *
+     * @brief Read value with cursor caching.
+     * O(1) cursor hit, O(log P) miss. Sequential → O(1), sparse → popcount.
+     *
+     **/
+    inline mema::value_t read_value(const Column &column, size_t col_idx,
+                                    uint32_t row_id, DataType data_type,
+                                    Cursor &cursor, Side side) const {
+        const auto &page_index =
+            page_indices_[static_cast<size_t>(side)][col_idx];
 
         /* Dense INT32 fast path: O(1) arithmetic lookup, bypasses cursor */
         if (data_type == DataType::INT32) {
-            const PageIndex &page_index = IsBuild ? build_page_indices[col_idx]
-                                                  : probe_page_indices[col_idx];
             if (SPC_LIKELY(page_index.is_dense_int32)) {
                 return mema::value_t{read_dense_int32(page_index, row_id)};
             }
         }
 
-        uint64_t current_version;
-        if constexpr (IsBuild) {
-            current_version =
-                global_build_version.load(std::memory_order_relaxed);
-        } else {
-            current_version =
-                global_probe_version.load(std::memory_order_relaxed);
-        }
+        uint64_t current_version =
+            global_version.load(std::memory_order_relaxed);
 
+        /* Cursor hit: same version, same side, same column, row in range */
         if (SPC_LIKELY(cursor.version == current_version &&
+                       cursor.cached_side == side &&
                        col_idx == cursor.cached_col &&
                        row_id >= cursor.cached_start &&
                        row_id < cursor.cached_end)) {
@@ -312,31 +336,73 @@ class ColumnarReader {
             return read_sparse(local_row, data_type, cursor);
         }
 
-        /* sequential access optimization: skip binary search for next page */
+        /* Sequential access optimization: skip binary search for next page */
         if (SPC_LIKELY(cursor.version == current_version &&
+                       cursor.cached_side == side &&
                        col_idx == cursor.cached_col &&
                        row_id == cursor.cached_end)) {
-            const PageIndex &page_index = IsBuild ? build_page_indices[col_idx]
-                                                  : probe_page_indices[col_idx];
             size_t next_page = cursor.cached_page + 1;
             if (SPC_LIKELY(next_page < page_index.cumulative_rows.size())) {
-                return read_value_load_page<IsBuild>(
-                    column, col_idx, row_id, data_type, cursor, current_version,
-                    page_index, next_page);
+                load_page_into_cursor(column, page_index, next_page, col_idx,
+                                      current_version, side, cursor);
+                return read_value(column, col_idx, row_id, data_type, cursor,
+                                  side);
             }
         }
 
-        return read_value_slow<IsBuild>(column, col_idx, row_id, data_type,
-                                        cursor, current_version);
+        /* Slow path: O(log P) binary search */
+        return read_value_slow(column, col_idx, row_id, data_type, cursor, side,
+                               current_version);
     }
 
-    /** @brief Load page metadata into cursor. Caches bounds, pointers, flags
-     * for fast-path access. */
-    template <bool IsBuild>
-    inline void
-    load_page_into_cursor(const Column &column, const PageIndex &page_index,
-                          size_t page_num, size_t col_idx,
-                          uint64_t current_version, Cursor &cursor) const {
+    /* @brief Overload for bool from_build (backwards compatibility). */
+    inline mema::value_t read_value(const Column &column, size_t col_idx,
+                                    uint32_t row_id, DataType data_type,
+                                    Cursor &cursor, bool from_build) const {
+        return read_value(column, col_idx, row_id, data_type, cursor,
+                          from_build ? Side::BUILD : Side::PROBE);
+    }
+
+    inline const PageIndex &get_page_index(Side side, size_t col_idx) const {
+        return page_indices_[static_cast<size_t>(side)][col_idx];
+    }
+
+    inline const PageIndex &get_build_page_index(size_t col_idx) const {
+        return get_page_index(Side::BUILD, col_idx);
+    }
+
+    inline const PageIndex &get_probe_page_index(size_t col_idx) const {
+        return get_page_index(Side::PROBE, col_idx);
+    }
+
+  private:
+    /**
+     *
+     * @brief O(1) direct read for dense INT32 columns.
+     * No cursor, no binary search.
+     *
+     **/
+    inline int32_t read_dense_int32(const PageIndex &page_index,
+                                    uint32_t row_id) const {
+        uint32_t page_num = row_id / page_index.rows_per_full_page;
+        uint32_t local_row =
+            row_id - (page_num * page_index.rows_per_full_page);
+
+        auto *page_data = (*page_index.pages_ptr)[page_num]->data;
+        return reinterpret_cast<const int32_t *>(page_data + 4)[local_row];
+    }
+
+    /**
+     *
+     * @brief Load page metadata into cursor.
+     * Caches bounds, pointers, flags for fast-path access.
+     *
+     ***/
+    inline void load_page_into_cursor(const Column &column,
+                                      const PageIndex &page_index,
+                                      size_t page_num, size_t col_idx,
+                                      uint64_t current_version, Side side,
+                                      Cursor &cursor) const {
         cursor.version = current_version;
         cursor.cached_col = col_idx;
         cursor.cached_page = page_num;
@@ -344,6 +410,7 @@ class ColumnarReader {
         cursor.cached_end = page_index.cumulative_rows[page_num];
         cursor.page_idx_val = static_cast<int32_t>(page_num);
         cursor.col_all_dense = page_index.all_dense;
+        cursor.cached_side = side;
 
         auto *page_data = column.pages[page_num]->data;
         auto num_rows = *reinterpret_cast<const uint16_t *>(page_data);
@@ -362,73 +429,26 @@ class ColumnarReader {
         }
     }
 
-    /** @brief O(1) sequential optimization: load next page directly when row_id
-     * == cursor.cached_end. */
-    template <bool IsBuild>
-    inline mema::value_t
-    read_value_load_page(const Column &column, size_t col_idx, uint32_t row_id,
-                         DataType data_type, Cursor &cursor,
-                         uint64_t current_version, const PageIndex &page_index,
-                         size_t page_num) const {
-        load_page_into_cursor<IsBuild>(column, page_index, page_num, col_idx,
-                                       current_version, cursor);
-        return read_value_internal<IsBuild>(column, col_idx, row_id, data_type,
-                                            cursor);
-    }
-
-    /** @brief Slow path: O(log P) binary search on cursor miss, then load page
-     * into cursor. */
-    template <bool IsBuild>
+    /**
+     *
+     * @brief Slow path:
+     * O(log P) binary search on cursor miss,
+     * then load page into cursor.
+     *
+     **/
     inline mema::value_t read_value_slow(const Column &column, size_t col_idx,
                                          uint32_t row_id, DataType data_type,
-                                         Cursor &cursor,
+                                         Cursor &cursor, Side side,
                                          uint64_t current_version) const {
-
-        const PageIndex &page_index =
-            IsBuild ? build_page_indices[col_idx] : probe_page_indices[col_idx];
+        const auto &page_index =
+            page_indices_[static_cast<size_t>(side)][col_idx];
         size_t page_num = page_index.find_page(row_id);
-        load_page_into_cursor<IsBuild>(column, page_index, page_num, col_idx,
-                                       current_version, cursor);
-        return read_value_internal<IsBuild>(column, col_idx, row_id, data_type,
-                                            cursor);
+        load_page_into_cursor(column, page_index, page_num, col_idx,
+                              current_version, side, cursor);
+        return read_value(column, col_idx, row_id, data_type, cursor, side);
     }
 
-    /** @brief Read value: O(1) cursor hit, O(log P) miss. Sequential → O(1)
-     * amortized, sparse → popcount. */
-    inline mema::value_t read_value(const Column &column, size_t col_idx,
-                                    uint32_t row_id, DataType data_type,
-                                    Cursor &cursor, bool from_build) const {
-        if (from_build) {
-            return read_value_internal<true>(column, col_idx, row_id, data_type,
-                                             cursor);
-        } else {
-            return read_value_internal<false>(column, col_idx, row_id,
-                                              data_type, cursor);
-        }
-    }
-
-    inline const PageIndex &get_build_page_index(size_t col_idx) const {
-        return build_page_indices[col_idx];
-    }
-
-    inline const PageIndex &get_probe_page_index(size_t col_idx) const {
-        return probe_page_indices[col_idx];
-    }
-
-  private:
-    /** @brief O(1) direct read for dense INT32 columns. No cursor, no binary
-     * search. */
-    inline int32_t read_dense_int32(const PageIndex &page_index,
-                                    uint32_t row_id) const {
-        uint32_t page_num = row_id / page_index.rows_per_full_page;
-        uint32_t local_row =
-            row_id - (page_num * page_index.rows_per_full_page);
-
-        auto *page_data = (*page_index.pages_ptr)[page_num]->data;
-        return reinterpret_cast<const int32_t *>(page_data + 4)[local_row];
-    }
-
-    /** @brief Reads from sparse pages using bitmap and popcount. */
+    /* @brief Reads from sparse pages using bitmap and popcount. */
     inline mema::value_t read_sparse(uint32_t local_row, DataType data_type,
                                      const Cursor &cursor) const {
         bool is_valid =
@@ -452,14 +472,16 @@ class ColumnarReader {
                                                 static_cast<int32_t>(data_idx));
         }
     }
-    std::vector<PageIndex> build_page_indices;
-    std::vector<PageIndex> probe_page_indices;
+
+    /* @brief Page indices: [0] = BUILD, [1] = PROBE */
+    std::array<std::vector<PageIndex>, 2> page_indices_;
 };
+
 } // namespace Contest::io
 
 namespace Contest {
 using Contest::io::ColumnarReader;
-using Contest::io::global_build_version;
-using Contest::io::global_probe_version;
+using Contest::io::global_version;
 using Contest::io::PageIndex;
+using Contest::io::Side;
 } // namespace Contest

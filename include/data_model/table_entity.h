@@ -1,9 +1,4 @@
-/**
- * @file table_entity.h
- * @brief TableEntity: composite key (table + column index) for query plans.
- *
- * Hashable, comparable, fmt-formattable.
- */
+ 
 
 #pragma once
 
@@ -12,15 +7,10 @@
 
 #include <foundation/common.h>
 
-/**
- * @struct TableEntity
- * @brief Column reference: (table name, column index).
- *
- * Supports comparison (ordered containers), hashing (unordered containers).
- */
+ 
 struct TableEntity {
-    std::string table; ///< Table name/alias.
-    int id;            ///< 0-based column index.
+    std::string table;  
+    int id;             
 
     friend bool operator==(const TableEntity &left, const TableEntity &right);
     friend bool operator!=(const TableEntity &left, const TableEntity &right);
@@ -45,7 +35,7 @@ inline bool operator<(const TableEntity &left, const TableEntity &right) {
     }
 }
 
-/** @brief std::hash for TableEntity (uses hash_combine). */
+ 
 namespace std {
 template <> struct hash<TableEntity> {
     size_t operator()(const TableEntity &te) const noexcept {
@@ -56,9 +46,9 @@ template <> struct hash<TableEntity> {
     }
 };
 
-} // namespace std
+}  
 
-/** @brief fmt formatter: outputs "(table, id)". */
+ 
 template <> struct fmt::formatter<TableEntity> {
     template <class ParseContext> constexpr auto parse(ParseContext &ctx) {
         return ctx.begin();

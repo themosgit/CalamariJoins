@@ -1,14 +1,18 @@
 /**
+ *
  * @file nested_loop.h
  * @brief Nested loop join for small build tables (<8 rows).
  *
- * Fallback when build fits in L1 cache. Parallel work-stealing probe.
- * Outperforms hash join for tiny tables due to cache locality.
+ * Fallback when build fits vector register. 
+ * Parallel work-stealing probe.
+ *
+ * Outperforms hash join for tiny tables (duh).
  *
  * Templated on MatchCollectionMode for zero-overhead mode selection.
  *
  * @see execute.cpp HASH_TABLE_THRESHOLD = 8
- */
+ *
+ **/
 #pragma once
 
 #include <atomic>
@@ -23,9 +27,11 @@
 #include <vector>
 
 /**
+ *
  * @namespace Contest::join
  * @brief visit_rows() iterator, nested_loop_join() for tiny build tables.
- */
+ *
+ **/
 namespace Contest::join {
 
 using Contest::ExecuteResult;
@@ -33,12 +39,14 @@ using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 /**
+ *
  * @brief Iterates over non-NULL values in a join input column.
  *
  * Abstracts columnar vs intermediate input. Handles NULL bitmaps.
  *
  * @tparam Func void(uint32_t row_id, int32_t value).
- */
+ *
+ **/
 template <typename Func>
 inline void visit_rows(const JoinInput &input, size_t attr_idx,
                        Func &&visitor) {
@@ -82,16 +90,20 @@ inline void visit_rows(const JoinInput &input, size_t attr_idx,
 }
 
 /**
+ *
  * @brief Nested loop join for small build tables (<=8 rows).
  *
- * Build keys/IDs in SIMD registers (AVX2/NEON). Parallel probe via
- * work-stealing. Beats hash join for <8 rows due to no hash overhead
- * and register-resident comparison.
+ * Build keys/IDs in SIMD registers (AVX2/NEON).
+ * Parallel probe via work-stealing.
+ *
+ * if i had a machine with AVX512 i would support it :)
+ *
  *
  * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
  *              specialization of match buffer operations.
  * @return Thread-local match buffers for direct iteration.
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline std::vector<ThreadLocalMatchBuffer<Mode>>
 nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
@@ -168,12 +180,10 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                 uint32_t row_id = page_offsets[i];
 
                 if (num_rows == num_values) {
-                    // SIMD batch: process multiple probe values at a time
                     uint16_t j = simd::eq_batch_columnar<Mode>(
                         data, num_rows, row_id, b_vals, b_ids, b_count,
                         local_buffer);
                     row_id += j;
-                    // Handle remaining elements with scalar
                     for (; j < num_rows; j++) {
                         process_value(row_id++, data[j]);
                     }
@@ -200,19 +210,16 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
             size_t i = start;
 
             if constexpr (BATCH_SIZE > 0) {
-                // SIMD batch processing
                 for (; i + BATCH_SIZE <= end; i += BATCH_SIZE) {
                     size_t page_idx = i >> 12;
                     size_t offset = i & 0xFFF;
 
-                    // Only use SIMD if all values are on same page
                     if (offset + BATCH_SIZE <= mema::CAP_PER_PAGE) {
                         const int32_t *vals = reinterpret_cast<const int32_t *>(
                             &col.pages[page_idx]->data[offset]);
                         simd::eq_batch_intermediate<Mode>(
                             vals, i, b_vals, b_ids, b_count, local_buffer);
                     } else {
-                        // Cross-page boundary: fall back to scalar
                         for (size_t j = i; j < i + BATCH_SIZE; j++) {
                             const mema::value_t &val = col[j];
                             if (!val.is_null()) {
@@ -224,7 +231,6 @@ nested_loop_join(const JoinInput &build_input, const JoinInput &probe_input,
                 }
             }
 
-            // Handle remaining elements (or all elements if no SIMD)
             for (; i < end; i++) {
                 const mema::value_t &val = col[i];
                 if (!val.is_null()) {

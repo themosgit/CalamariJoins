@@ -1,13 +1,3 @@
-/**
- * @file statement.h
- * @brief Filter predicate AST for SQL WHERE evaluation.
- *
- * Statement (base) → Comparison (leaf: column op literal) or LogicalOperation
- * (AND/OR/NOT). Two eval modes: row-at-a-time or columnar batch (bitmap, parallel).
- *
- * @see InnerColumn (parallel filter), CSVParser (predicate application)
- */
-
 #pragma once
 
 #include <memory>
@@ -20,14 +10,11 @@
 #include <fmt/core.h>
 #include <re2/re2.h>
 
-/** @brief Field variant: int32_t, int64_t, double, string, or monostate (NULL). */
 using Data =
     std::variant<int32_t, int64_t, double, std::string, std::monostate>;
-
-/** @brief Literal variant: int64_t, double, string, or monostate (NULL). */
+ 
 using Literal = std::variant<int64_t, double, std::string, std::monostate>;
 
-/** @brief fmt formatter for Data. NULL prints as "NULL". */
 template <> struct fmt::formatter<Data> {
     template <class ParseContext> constexpr auto parse(ParseContext &ctx) {
         return ctx.begin();
@@ -54,39 +41,25 @@ struct Comparison;
 struct LogicalOperation;
 struct InnerColumnBase;
 
-/**
- * @struct Statement
- * @brief Abstract predicate AST base. Subclasses: Comparison, LogicalOperation.
- */
 struct Statement {
     virtual ~Statement() = default;
 
-    /** @brief Pretty-print AST for debugging. */
     virtual std::string pretty_print(int indent = 0) const = 0;
 
-    /** @brief Evaluate against single row. @return true if satisfied. */
     virtual bool eval(const std::vector<Data> &record) const = 0;
 
-    /** @brief Columnar eval via FilterThreadPool. @return bitmap (bit i=1 → row i matches). */
     virtual std::vector<uint8_t>
     eval(const std::vector<const InnerColumnBase *> &table) const = 0;
 };
 
-/**
- * @struct Comparison
- * @brief Leaf: column op literal. Ops: EQ/NEQ/LT/GT/LEQ/GEQ/LIKE/IS_NULL etc.
- * @see like_match() for LIKE implementation.
- */
+ 
 struct Comparison : Statement {
-    size_t column; ///< Column index to compare.
-
-    /** @brief Comparison operators. */
+    size_t column;  
+     
     enum Op { EQ, NEQ, LT, GT, LEQ, GEQ, LIKE, NOT_LIKE, IS_NULL, IS_NOT_NULL };
 
-    Op op;         ///< The comparison operator.
-    Literal value; ///< The literal value to compare against.
-
-    /** @brief Construct comparison. val ignored for IS_NULL/IS_NOT_NULL. */
+    Op op;          
+    Literal value;  
     Comparison(size_t col, Op o, Literal val)
         : column(col), op(o), value(std::move(val)) {}
 
@@ -98,8 +71,6 @@ struct Comparison : Statement {
     bool eval(const std::vector<Data> &record) const override;
     std::vector<uint8_t>
     eval(const std::vector<const InnerColumnBase *> &table) const override;
-
-    /** @brief Op to string. */
     std::string opToString() const {
         switch (op) {
         case EQ:
@@ -127,7 +98,6 @@ struct Comparison : Statement {
         }
     }
 
-    /** @brief Literal to string. */
     std::string valueToString() const {
         if (op == IS_NULL || op == IS_NOT_NULL) {
             return "";
@@ -146,7 +116,7 @@ struct Comparison : Statement {
             value);
     }
 
-    /** @brief LIKE pattern match (% → .*, _ → .). Thread-local regex cache. */
+     
     static bool like_match(std::string_view str, const std::string &pattern) {
         thread_local auto regex_cache =
             std::unordered_map<std::string, std::unique_ptr<RE2>>{};
@@ -176,7 +146,6 @@ struct Comparison : Statement {
             }
 
             RE2::Options options;
-
             auto new_re = std::make_unique<RE2>(regex_str, options);
             if (!new_re->ok()) {
                 return false;
@@ -189,7 +158,7 @@ struct Comparison : Statement {
         return RE2::FullMatch(str, *re);
     }
 
-    /** @brief Extract numeric from Data as double, or nullopt. */
+     
     static std::optional<double> get_numeric_value(const Data &data) {
         if (auto *i32 = std::get_if<int32_t>(&data)) {
             return *i32;
@@ -202,7 +171,7 @@ struct Comparison : Statement {
         }
     }
 
-    /** @brief Extract numeric from Literal as double, or nullopt. */
+     
     static std::optional<double> get_numeric_value(const Literal &value) {
         if (auto *i = std::get_if<int64_t>(&value)) {
             return *i;
@@ -214,18 +183,12 @@ struct Comparison : Statement {
     }
 };
 
-/**
- * @struct LogicalOperation
- * @brief AND/OR/NOT combining child Statements. Row: short-circuit; columnar: bitwise.
- */
+ 
 struct LogicalOperation : Statement {
-    /** @brief Logical operation type. */
     enum Type { AND, OR, NOT };
-
-    Type op_type; ///< The logical operation type.
-    std::vector<std::unique_ptr<Statement>> children; ///< Child predicates.
-
-    /** @brief Create AND node. */
+    Type op_type;  
+    std::vector<std::unique_ptr<Statement>> children;  
+     
     static std::unique_ptr<LogicalOperation>
     makeAnd(std::unique_ptr<Statement> l, std::unique_ptr<Statement> r) {
         auto node = std::make_unique<LogicalOperation>();
@@ -235,7 +198,6 @@ struct LogicalOperation : Statement {
         return node;
     }
 
-    /** @brief Create OR node. */
     static std::unique_ptr<LogicalOperation>
     makeOr(std::unique_ptr<Statement> l, std::unique_ptr<Statement> r) {
         auto node = std::make_unique<LogicalOperation>();
@@ -244,8 +206,7 @@ struct LogicalOperation : Statement {
         node->children.push_back(std::move(r));
         return node;
     }
-
-    /** @brief Create NOT node. */
+     
     static std::unique_ptr<LogicalOperation>
     makeNot(std::unique_ptr<Statement> child) {
         auto node = std::make_unique<LogicalOperation>();

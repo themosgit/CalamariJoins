@@ -1367,8 +1367,7 @@ run(const std::unordered_map<std::string, std::vector<std::string>>
     duckdb::Connection &conn,
 #endif
     [[maybe_unused]] void *context,
-    Contest::TimingStats *cumulative_stats = nullptr,
-    bool show_detailed_timing = false) {
+    Contest::TimingStats *cumulative_stats = nullptr) {
     ParsedSQL parsed_sql(column_to_tables);
     parsed_sql.parse_sql(sql, name);
 
@@ -1378,7 +1377,7 @@ run(const std::unordered_map<std::string, std::vector<std::string>>
     auto start = std::chrono::steady_clock::now();
 #ifndef TEAMOPT_BUILD_CACHE
     Contest::TimingStats query_stats;
-    auto results = Contest::execute(plan, context, &query_stats, show_detailed_timing);
+    auto results = Contest::execute(plan, context, &query_stats);
 
     // Accumulate into cumulative stats
     if (cumulative_stats) {
@@ -1519,11 +1518,11 @@ int main(int argc, char *argv[]) {
 #ifdef TEAMOPT_USE_DUCKDB
                 const auto [result_is_correct, query_runtime] =
                     run(column_to_tables, name, std::move(sql), plan_json, conn,
-                        context, &cumulative_stats, show_detailed_timing);
+                        context, &cumulative_stats);
 #else
                 const auto [result_is_correct, query_runtime] = run(
                     column_to_tables, name, std::move(sql), plan_json, context,
-                    &cumulative_stats, show_detailed_timing);
+                    &cumulative_stats);
 #endif
                 runtime += query_runtime;
                 all_queries_succeeded &= result_is_correct;

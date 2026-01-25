@@ -1,13 +1,18 @@
 /**
+ *
  * @file simd_compare.h
  * @brief SIMD comparison helpers for nested loop join operations.
  *
  * Platform-specific (AVX2/NEON) vectorized comparison primitives.
- * All functions are inline and templated on MatchCollectionMode for zero
- * overhead.
+ *
+ * AVX512 not supported for zen 4+ friends :)
+ *
+ * All functions are inline and templated
+ * on MatchCollectionMode for zero overhead.
  *
  * @see nested_loop.h
- */
+ *
+ **/
 #pragma once
 
 #include <cstdint>
@@ -23,6 +28,7 @@
 namespace Contest::join::simd {
 
 /**
+ *
  * @brief Compare single probe value against 8 register-resident build values.
  *
  * Used by nested loop join where build side fits in SIMD registers.
@@ -35,7 +41,8 @@ namespace Contest::join::simd {
  * @param build_ids    Pointer to build row IDs
  * @param build_count  Actual number of valid build values (<=8)
  * @param buffer       Thread-local match buffer
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline void eq_scan_build(uint32_t probe_id, int32_t probe_val,
                           const int32_t *build_vals, const uint32_t *build_ids,
@@ -89,6 +96,7 @@ inline void eq_scan_build(uint32_t probe_id, int32_t probe_val,
 }
 
 /**
+ *
  * @brief Batch compare columnar probe values against all build values.
  *
  * Processes 8 (AVX2) or 4 (NEON) probe values per iteration.
@@ -103,7 +111,8 @@ inline void eq_scan_build(uint32_t probe_id, int32_t probe_val,
  * @param build_count  Actual build count (<=8)
  * @param buffer       Thread-local match buffer
  * @return Number of rows processed with SIMD
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline uint16_t
 eq_batch_columnar(const int32_t *data, uint16_t num_rows, uint32_t base_row_id,
@@ -163,6 +172,7 @@ inline constexpr size_t INTERMEDIATE_BATCH_SIZE = 0; // No SIMD batching
 #endif
 
 /**
+ *
  * @brief Batch compare intermediate values against all build values.
  *
  * Handles NULL values (mema::value_t::NULL_VALUE). Caller ensures all
@@ -175,7 +185,8 @@ inline constexpr size_t INTERMEDIATE_BATCH_SIZE = 0; // No SIMD batching
  * @param build_ids    Pointer to build row IDs
  * @param build_count  Actual build count (<=8)
  * @param buffer       Thread-local match buffer
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline void eq_batch_intermediate(const int32_t *vals, size_t base_idx,
                                   const int32_t *build_vals,
@@ -185,7 +196,6 @@ inline void eq_batch_intermediate(const int32_t *vals, size_t base_idx,
     __m256i probe_batch =
         _mm256_loadu_si256(reinterpret_cast<const __m256i *>(vals));
 
-    // Check for NULLs
     __m256i null_val = _mm256_set1_epi32(mema::value_t::NULL_VALUE);
     __m256i null_mask = _mm256_cmpeq_epi32(probe_batch, null_val);
     int nulls = _mm256_movemask_ps(_mm256_castsi256_ps(null_mask));
@@ -209,7 +219,6 @@ inline void eq_batch_intermediate(const int32_t *vals, size_t base_idx,
     static constexpr uint32_t mask_bits[4] = {1, 2, 4, 8};
     const uint32x4_t bit_mask = vld1q_u32(mask_bits);
 
-    // Check for NULLs
     int32x4_t null_val = vdupq_n_s32(mema::value_t::NULL_VALUE);
     uint32x4_t null_cmp = vceqq_s32(probe_batch, null_val);
     uint32_t nulls = vaddvq_u32(vandq_u32(null_cmp, bit_mask));
@@ -228,7 +237,6 @@ inline void eq_batch_intermediate(const int32_t *vals, size_t base_idx,
         }
     }
 #else
-    // Scalar fallback - should not be called when INTERMEDIATE_BATCH_SIZE == 0
     (void)vals;
     (void)base_idx;
     (void)build_vals;

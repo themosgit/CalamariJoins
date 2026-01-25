@@ -8,23 +8,30 @@
 #include <platform/worker_pool.h>
 
 /**
+ *
  * @file hash_join.h
  * @brief Hash join build and probe operations.
  *
- * Supports ColumnarTable and intermediate (column_t) inputs. Probe uses
- * parallel work-stealing; thread-local match buffers merged after processing.
+ * Supports ColumnarTable and intermediate (column_t) inputs.
  *
- * Probe functions are templated on MatchCollectionMode for zero-overhead
- * mode selection at compile time.
+ * Probe uses parallel work-stealing;
+ * thread-local match buffers merged after processing.
+ *
+ * Probe functions are templated on MatchCollectionMode
+ * for zero-overhead mode selection at compile time.
  *
  * @see hashtable.h, match_collector.h
- */
+ *
+ **/
 
 /**
+ *
  * @namespace Contest::join
- * @brief Hash join build/probe: build_from_columnar(), probe_intermediate(),
- * probe_columnar().
- */
+ * @brief Hash join build/probe:
+ * build_from_columnar(), build_from_intermediate(),
+ * probe_intermediate(), probe_columnar().
+ *
+ **/
 namespace Contest::join {
 
 using Contest::ExecuteResult;
@@ -32,49 +39,51 @@ using Contest::platform::THREAD_COUNT;
 using Contest::platform::worker_pool;
 
 /**
+ *
  * @brief Build hash table from ColumnarTable input.
  *
  * Maps logical attr index to physical column, delegates to build_columnar().
- */
+ *
+ **/
 inline UnchainedHashtable build_from_columnar(const JoinInput &input,
                                               size_t attr_idx) {
     auto *table = std::get<const ColumnarTable *>(input.data);
     auto [actual_col_idx, _] = input.node->output_attrs[attr_idx];
     const Column &column = table->columns[actual_col_idx];
-
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
     hash_table.build_columnar(column, 8);
-
     return hash_table;
 }
 
 /**
+ *
  * @brief Build hash table from intermediate results (column_t).
  *
  * Uses join key column from ExecuteResult produced by prior pipeline stages.
- */
+ *
+ **/
 inline UnchainedHashtable build_from_intermediate(const JoinInput &input,
                                                   size_t attr_idx) {
     const auto &result = std::get<ExecuteResult>(input.data);
     const auto &column = result[attr_idx];
-
     size_t row_count = input.row_count(attr_idx);
     UnchainedHashtable hash_table(row_count);
     hash_table.build_intermediate(column, 8);
-
     return hash_table;
 }
 
 /**
- * @brief Probe hash table with intermediate input, returning thread-local
- * buffers.
+ *
+ * @brief Probe hash table with intermediate input,
+ * returning thread-local buffers.
  *
  * Each thread keeps its buffer for direct iteration without merge overhead.
  *
  * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY) for compile-time
  *              specialization of match buffer operations.
- */
+ *
+ **/
 template <MatchCollectionMode Mode>
 inline std::vector<ThreadLocalMatchBuffer<Mode>>
 probe_intermediate(const UnchainedHashtable &hash_table,
@@ -135,8 +144,9 @@ probe_intermediate(const UnchainedHashtable &hash_table,
 }
 
 /**
- * @brief Probe hash table with ColumnarTable input, returning thread-local
- * buffers.
+ *
+ * @brief Probe hash table with ColumnarTable input,
+ * returning thread-local buffers.
  *
  * Each thread keeps its buffer for direct iteration without merge overhead.
  *

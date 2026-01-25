@@ -1,10 +1,12 @@
 /**
+ *
  * @file join_setup.h
  * @brief Join configuration and input abstraction.
  *
  * Provides JoinInput to abstract over columnar and intermediate data sources,
  * and utilities for selecting build/probe sides and preparing output columns.
- */
+ *
+ **/
 #pragma once
 
 #include <data_access/columnar_reader.h>
@@ -16,34 +18,40 @@
 #include <vector>
 
 /**
+ *
  * @namespace Contest::join
  * @brief JoinInput abstraction, build/probe selection, output column setup.
- */
+ *
+ **/
 namespace Contest::join {
 
 using Contest::ExecuteResult;
 using Contest::io::ColumnarReader;
 
 /**
+ *
  * @brief Unified abstraction over columnar tables and intermediate results.
  *
- * Stores ColumnarTable* (base scans) or ExecuteResult (child joins). Node
- * provides output_attrs mapping for column resolution.
- */
+ * Stores ColumnarTable* (base scans) or ExecuteResult (child joins).
+ * Node provides output_attrs mapping for column resolution.
+ *
+ **/
 struct JoinInput {
     std::variant<ExecuteResult, const ColumnarTable *> data;
     const PlanNode *node; /**< Provides output_attrs for column mapping. */
     uint8_t table_id;     /**< Source table ID for provenance tracking. */
 
-    /** @brief True if data is columnar (base table), false if intermediate. */
+    /* @brief True if data is columnar (base table), false if intermediate. */
     bool is_columnar() const {
         return std::holds_alternative<const ColumnarTable *>(data);
     }
 
     /**
+     *
      * @brief Row count for a given output column.
      * @param col_idx Index into node->output_attrs.
-     */
+     *
+     **/
     size_t row_count(size_t col_idx) const {
         if (is_columnar()) {
             auto *table = std::get<const ColumnarTable *>(data);
@@ -54,7 +62,7 @@ struct JoinInput {
         }
     }
 
-    /** @brief Number of output columns. */
+    /* @brief Number of output columns. */
     size_t output_size() const { return node->output_attrs.size(); }
 };
 
@@ -62,20 +70,23 @@ struct JoinInput {
  * @brief Configuration for build/probe side assignment.
  *
  * Smaller table becomes build side. Contains remapped attribute indices.
- */
+ *
+ **/
 struct BuildProbeConfig {
     bool build_left; /**< True if left input is build side. */
     /**
+     *
      * Output attributes with indices remapped to (build_cols...,
      * probe_cols...). When build_left=false, left indices shift right by
      * build_size, right indices shift left by left_size to swap the ordering.
-     */
+     *
+     **/
     std::vector<std::tuple<size_t, DataType>> remapped_attrs;
     size_t build_attr; /**< Join key index in build's output_attrs. */
     size_t probe_attr; /**< Join key index in probe's output_attrs. */
 };
 
-/** @brief Resolves global output column index to source input. */
+/* @brief Resolves global output column index to source input. */
 inline std::tuple<const JoinInput &, const PlanNode &, size_t>
 resolve_input_source(size_t global_idx, size_t split_point,
                      const JoinInput &input_a, const PlanNode &node_a,
@@ -87,10 +98,13 @@ resolve_input_source(size_t global_idx, size_t split_point,
 }
 
 /**
+ *
  * @brief Chooses build/probe sides based on cardinality.
  *
- * Smaller table becomes build. When flipped, remaps indices to (build, probe).
- */
+ * Smaller table becomes build. When flipped,
+ * remaps indices to (build, probe).
+ *
+ **/
 inline BuildProbeConfig select_build_probe_side(
     const JoinNode &join, const JoinInput &left_input,
     const JoinInput &right_input,
@@ -122,11 +136,13 @@ inline BuildProbeConfig select_build_probe_side(
 }
 
 /**
+ *
  * @brief Determines which row IDs needed based on output columns.
  *
- * Returns LEFT_ONLY, RIGHT_ONLY, or BOTH. Saves ~50% match storage when
- * only one side is projected.
- */
+ * Returns LEFT_ONLY, RIGHT_ONLY, or BOTH.
+ * Saves match storage when only one side is projected.
+ *
+ **/
 inline MatchCollectionMode determine_collection_mode(
     const std::vector<std::tuple<size_t, DataType>> &remapped_attrs,
     size_t build_size) {
@@ -157,8 +173,10 @@ inline MatchCollectionMode determine_collection_mode(
 }
 
 /**
+ *
  * @brief Creates output columns with provenance metadata from inputs.
- */
+ *
+ **/
 inline ExecuteResult initialize_output_columns(
     const std::vector<std::tuple<size_t, DataType>> &output_attrs,
     const PlanNode &left_node, const PlanNode &right_node,
@@ -198,24 +216,24 @@ inline ExecuteResult initialize_output_columns(
  * @brief Join output state and columnar reader.
  *
  * prepared flag implements lazy PageIndex construction.
- */
+ *
+ **/
 struct JoinSetup {
     ExecuteResult results; /**< Output columns being populated. */
-    ColumnarReader
-        columnar_reader; /**< Page cursor caching for columnar access. */
-    /**
-     * True after prepare_output_columns called.
-     */
+    ColumnarReader columnar_reader; /**< Page cursor for columnar access. */
     bool prepared;
 
     JoinSetup() : prepared(false) {}
 };
 
 /**
- * @brief Initializes JoinSetup with output columns; call before join execution.
+ *
+ * @brief Initializes JoinSetup with output columns;
+ * call before join execution.
  *
  * PageIndex construction deferred to prepare_output_columns().
- */
+ *
+ **/
 inline JoinSetup
 setup_join(const JoinInput &build_input, const JoinInput &probe_input,
            const PlanNode &build_node, const PlanNode &probe_node,
@@ -235,11 +253,13 @@ setup_join(const JoinInput &build_input, const JoinInput &probe_input,
 }
 
 /**
+ * 
  * @brief Collects Column pointers for needed output columns from columnar
  * input.
  *
  * Unused columns get nullptr to skip PageIndex construction.
- */
+ *
+ **/
 inline platform::ArenaVector<const Column *>
 collect_needed_columns(const JoinInput &input, const PlanNode &node,
                        const platform::ArenaVector<uint8_t> &needed,
@@ -257,10 +277,12 @@ collect_needed_columns(const JoinInput &input, const PlanNode &node,
 }
 
 /**
+ *
  * @brief Prepares ColumnarReader with columns needed for materialization.
  *
  * Triggers lazy PageIndex construction only for projected columns.
- */
+ *
+ **/
 inline void prepare_output_columns(
     ColumnarReader &reader, const JoinInput &build_input,
     const JoinInput &probe_input, const PlanNode &build_node,

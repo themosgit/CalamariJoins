@@ -1,15 +1,19 @@
 /**
+ *
  * @file match_collector.h
  * @brief Lock-free parallel match collection for joins.
  *
- * Collects (build_row_id, probe_row_id) pairs using chunk-chains for O(1)
- * merge. Thread-local buffers avoid contention; chains linked without copying.
+ * Collects (build_row_id, probe_row_id)
+ * pairs using chunk-chains for O(1) merge.
+ *
+ * Thread-local buffers avoid contention; chains linked without copying.
  *
  * Template parameter Mode enables compile-time specialization for different
  * collection modes, eliminating runtime branching in hot loops.
  *
  * @see ThreadLocalMatchBuffer, materialize.h, construct_intermediate.h
- */
+ *
+ **/
 #pragma once
 
 #include <cstdint>
@@ -18,23 +22,22 @@
 #include <platform/worker_pool.h>
 #include <vector>
 
-/** @namespace Contest::join @brief Parallel hash join implementation. */
+/* @namespace Contest::join @brief Parallel hash join implementation. */
 namespace Contest::join {
 
 using Contest::platform::worker_pool;
 
-/** @brief Specifies which side's row IDs to collect. Saves 50% when one side
- * unused. */
+/* @brief Specifies which side's row IDs to collect. */
 enum class MatchCollectionMode : uint8_t {
     BOTH = 0,      /**< Collect both left and right row IDs. */
     LEFT_ONLY = 1, /**< Only left (build) side IDs needed. */
     RIGHT_ONLY = 2 /**< Only right (probe) side IDs needed. */
 };
 
-/** @brief Capacity per IndexChunk; sized to fit in INDEX_CHUNK arena region. */
+/* @brief Capacity per IndexChunk; sized to fit in INDEX_CHUNK arena region. */
 static constexpr size_t MATCH_CHUNK_CAP = 8184;
 
-/** @brief Fixed-size chunk of row IDs forming a singly-linked list. */
+/* @brief Fixed-size chunk of row IDs forming a singly-linked list. */
 struct IndexChunk {
     uint32_t ids[MATCH_CHUNK_CAP]; /**< Row ID storage. */
     uint32_t count = 0;            /**< Valid entries in ids[0..count-1]. */
@@ -47,16 +50,19 @@ static_assert(sizeof(IndexChunk) <=
               "IndexChunk too large for INDEX_CHUNK region");
 
 /**
+ *
  * @brief Per-thread buffer for collecting join matches without contention.
  *
- * Maintains separate left/right chunk chains based on Mode. Uses arena
- * allocation for chunks. After probe, buffers are iterated directly without
- * merging.
+ * Maintains separate left/right chunk chains based on Mode.
+ * Uses arena allocation for chunks.
+ *
+ * After probe, buffers are iterated directly without merging.
  *
  * @tparam Mode Collection mode (BOTH, LEFT_ONLY, RIGHT_ONLY). Determines which
  *              chains are allocated and which code path is used in add_match().
  *              Using if constexpr eliminates runtime branching.
- */
+ *
+ **/
 template <MatchCollectionMode Mode = MatchCollectionMode::BOTH>
 class ThreadLocalMatchBuffer {
 
@@ -66,7 +72,7 @@ class ThreadLocalMatchBuffer {
     IndexChunk *right_tail = nullptr;
     Contest::platform::ThreadArena *arena_ = nullptr;
 
-    /** @brief Allocate IndexChunk from arena. */
+    /* @brief Allocate IndexChunk from arena. */
     IndexChunk *alloc_chunk() {
         void *ptr =
             arena_->alloc_chunk<Contest::platform::ChunkType::INDEX_CHUNK>();
@@ -115,9 +121,7 @@ class ThreadLocalMatchBuffer {
         return *this;
     }
 
-    // No destructor needed - arena manages memory
-
-    /** @brief Forward iterator over row IDs in a thread-local chunk chain. */
+    /* @brief Forward iterator over row IDs in a thread-local chunk chain. */
     class ChainIterator {
         IndexChunk *current_chunk;
         uint32_t offset;
@@ -149,7 +153,7 @@ class ThreadLocalMatchBuffer {
         }
     };
 
-    /** @brief Range adapter for iterating a thread-local chain. */
+    /* @brief Range adapter for iterating a thread-local chain. */
     class ChainRange {
         IndexChunk *head;
         size_t count;
@@ -160,25 +164,27 @@ class ThreadLocalMatchBuffer {
         ChainIterator end() const { return ChainIterator(nullptr, 0); }
     };
 
-    /** @brief Returns range for iterating left (build) row IDs. */
+    /* @brief Returns range for iterating left (build) row IDs. */
     inline ChainRange left_range() const {
         return ChainRange(left_head, total_count);
     }
 
-    /** @brief Returns range for iterating right (probe) row IDs. */
+    /* @brief Returns range for iterating right (probe) row IDs. */
     inline ChainRange right_range() const {
         return ChainRange(right_head, total_count);
     }
 
-    /** @brief Returns match count in this buffer. */
+    /* @brief Returns match count in this buffer. */
     size_t count() const { return total_count; }
 
     /**
+     *
      * @brief Records a match. Allocates new chunks as needed.
      *
      * Uses if constexpr for zero-overhead mode selection at compile time.
      * Each mode specialization only includes code for the chains it uses.
-     */
+     *
+     **/
     inline void add_match(uint32_t left, uint32_t right) {
         if constexpr (Mode == MatchCollectionMode::BOTH) {
             if (left_tail->count == MATCH_CHUNK_CAP) [[unlikely]] {

@@ -1,6 +1,8 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/gjaw_qSU)
-# SIGMOD Contest 2025
+# System Architecture & Performance
 
+[Visit the project website](https://manolates.gl4dos.com)
+
+# SIGMOD Contest 2025
 
 ## Task
 
@@ -109,52 +111,13 @@ A `ColumnarTable` first stores how many rows the table has in the `num_rows` mem
 
 ## Quick start
 
-> [!TIP]
-> Run all the following commands in the root directory of this project.
-
-First, download the imdb dataset.
-
-```bash
-./download_imdb.sh
-```
-
-Second, build the project.
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
-cmake --build build -- -j $(nproc)
-```
-
-Third, prepare the DuckDB database for correctness checking.
-
-```bash
-./build/build_database imdb.db
-```
-
-Now, you can run the tests:
-```bash
-./build/run plans.json
-```
-> [!TIP]
-> If you want to use `Ninja Multi-Config` as the generator. The commands will look like:
-> 
->```bash
-> cmake -S . -B build -Wno-dev -G "Ninja Multi-Config"
-> cmake --build build --config Release -- -j $(nproc)
-> ./build/Release/build_database imdb.db
-> ./build/Release/run plans.json
-> ```
-
-# Cache
-## This section is only for UNIX users
-There are 2 new executables with this repository. They cache the join tables and
+Create the cash containing the join tables and
 result of each query and mmap them for faster loading times and getting rid of duckdb.
 
 To build the cache you need to run:
 ```bash
 ./build/build_cache plans.json
 ```
-
 > [!TIP] 
 > If you are using `Linux x86_64` you can download our prebuilt cache with:
 > ```
