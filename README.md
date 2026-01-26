@@ -1,6 +1,6 @@
 # System Architecture & Performance
-
-[Visit the project website](https://manolates.gl4dos.com)
+For Documentation [visit](https://manolates.gl4dos.com/docs/index.html)
+For benchmarks [visit](https://manolates.gl4dos.com)
 
 ## SIGMOD Contest 2025
 
