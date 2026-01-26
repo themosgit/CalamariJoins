@@ -287,3 +287,4 @@ When the optimizer's `build_left` hint is overridden based on actual cardinality
 ```
 
 The `remapped_attrs` vector reflects this new mapping for correct materialization.
+
