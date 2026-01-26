@@ -8,7 +8,7 @@
  * (bits 32-42, independent from slot bits).
  *
  * Tags OR'd into directory during build;
- * probe checks `(entry & tag) == tag` for early rejection.
+ * probe checks `(entry & tag) == tag` for early rejection.!
  *
  * @see hashtable.h for bloom_tag(), find_indices(), build_partition()
  *
